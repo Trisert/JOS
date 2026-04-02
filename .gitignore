@@ -1,0 +1,29 @@
+# Build outputs
+Debug/
+Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+
+# CubeIDE workspace metadata
+.settings/
+.mxproject
+*.launch
+
+# Compiled objects
+*.o
+*.d
+*.su
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives
+*.zip
