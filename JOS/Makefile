@@ -29,6 +29,7 @@ MCU   := $(CPU) -mthumb $(FPU) $(FLOAT)
 ##############################################################################
 BUILD_DIR   := build
 SRC_DIRS    := Core/Src Drivers/STM32L4xx_HAL_Driver/Src Middlewares/Third_Party/FreeRTOS/Source
+CXX_SRC_DIRS := Core/Inc/RadioLib/src
 ASM_SRC     := Core/Startup/startup_stm32l496vgtx.s
 LINKER_SCRIPT := STM32L496VGTX_FLASH.ld
 
@@ -37,6 +38,7 @@ LINKER_SCRIPT := STM32L496VGTX_FLASH.ld
 ##############################################################################
 INCLUDES := \
   -ICore/Inc \
+  -ICore/Inc/RadioLib/src \
   -IDrivers/STM32L4xx_HAL_Driver/Inc \
   -IDrivers/STM32L4xx_HAL_Driver/Inc/Legacy \
   -IMiddlewares/Third_Party/FreeRTOS/Source/include \
@@ -49,6 +51,7 @@ INCLUDES := \
 # Defines
 ##############################################################################
 C_DEFS  := -DDEBUG -DUSE_HAL_DRIVER -DSTM32L496xx
+CXX_DEFS := -DDEBUG -DUSE_HAL_DRIVER -DSTM32L496xx -DRADIOLIB_STATIC_ONLY=1
 ASM_DEFS := -DDEBUG
 
 ##############################################################################
@@ -58,6 +61,14 @@ CFLAGS  := $(MCU) $(C_DEFS)
 CFLAGS += -std=gnu11 -g3 -O0
 CFLAGS += -Wall -ffunction-sections -fdata-sections
 CFLAGS += $(INCLUDES)
+
+##############################################################################
+# C++ Flags
+##############################################################################
+CXXFLAGS  := $(MCU) $(CXX_DEFS)
+CXXFLAGS += -std=gnu++14 -g3 -O0
+CXXFLAGS += -Wall -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti
+CXXFLAGS += $(INCLUDES)
 
 ##############################################################################
 # ASM Flags
@@ -80,18 +91,21 @@ LDFLAGS += -Wl,--start-group -lc -lm -Wl,--end-group
 # Source & Object files
 ##############################################################################
 C_SOURCES := $(shell find $(SRC_DIRS) -name '*.c' -not -path '*/CMSIS_RTOS_V1/*')
+CXX_SOURCES := $(shell find $(CXX_SRC_DIRS) -name '*.cpp' -not -path '*/hal/Arduino/*' -not -path '*/hal/RPi/*' -not -path '*/hal/RPiPico/*' -not -path '*/STM32WLx*')
 ASM_SOURCES := $(ASM_SRC)
 
 C_OBJECTS   := $(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES))
+CXX_OBJECTS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CXX_SOURCES))
 ASM_OBJECTS := $(patsubst %.s,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
-OBJECTS     := $(C_OBJECTS) $(ASM_OBJECTS)
+OBJECTS     := $(C_OBJECTS) $(CXX_OBJECTS) $(ASM_OBJECTS)
 
 ##############################################################################
 # Dependencies
 ##############################################################################
 C_DEPS := $(C_OBJECTS:.o=.d)
+CXX_DEPS := $(CXX_OBJECTS:.o=.d)
 ASM_DEPS := $(ASM_OBJECTS:.o=.d)
-DEPS := $(C_DEPS) $(ASM_DEPS)
+DEPS := $(C_DEPS) $(CXX_DEPS) $(ASM_DEPS)
 
 -include $(DEPS)
 
@@ -117,6 +131,13 @@ $(BUILD_DIR)/$(PROJECT_NAME).elf: $(OBJECTS)
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c -MMD -MP -MF"$(@:.o=.d)" $< -o $@
+
+##############################################################################
+# Compile C++ files
+##############################################################################
+$(BUILD_DIR)/%.o: %.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c -MMD -MP -MF"$(@:.o=.d)" $< -o $@
 
 ##############################################################################
 # Assemble
