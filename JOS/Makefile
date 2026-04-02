@@ -28,7 +28,7 @@ MCU   := $(CPU) -mthumb $(FPU) $(FLOAT)
 # Directories
 ##############################################################################
 BUILD_DIR   := build
-SRC_DIRS    := Core/Src Drivers/STM32L4xx_HAL_Driver/Src Middlewares/Third_Party/FreeRTOS/Source
+SRC_DIRS    := Core/Src Drivers/STM32L4xx_HAL_Driver/Src Middlewares/Third_Party/FreeRTOS/Source App/obsw App/bms App/memory App/comms App/aocs
 CXX_SRC_DIRS := Core/Inc/RadioLib/src
 ASM_SRC     := Core/Startup/startup_stm32l496vgtx.s
 LINKER_SCRIPT := STM32L496VGTX_FLASH.ld
@@ -39,6 +39,12 @@ LINKER_SCRIPT := STM32L496VGTX_FLASH.ld
 INCLUDES := \
   -ICore/Inc \
   -ICore/Inc/RadioLib/src \
+  -IApp \
+  -IApp/obsw \
+  -IApp/bms \
+  -IApp/memory \
+  -IApp/comms \
+  -IApp/aocs \
   -IDrivers/STM32L4xx_HAL_Driver/Inc \
   -IDrivers/STM32L4xx_HAL_Driver/Inc/Legacy \
   -IMiddlewares/Third_Party/FreeRTOS/Source/include \

@@ -22,7 +22,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "state_machine.h"
+#include "watchdog.h"
+#include "bms.h"
+#include "memory.h"
+#include "comms.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -118,7 +122,13 @@ int main(void)
   MX_SPI2_Init();
   MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
-
+  bms_init();
+  fram_init();
+  cyclic_buffer_init();
+  laststates_init();
+  lora_init();
+  state_machine_init();
+  watchdog_monitor_init();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -145,7 +155,10 @@ int main(void)
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  state_machine_task_create();
+  watchdog_task_create();
+  lora_beacon_task_create();
+  lora_rx_task_create();
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
