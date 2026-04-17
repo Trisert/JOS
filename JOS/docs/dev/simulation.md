@@ -239,10 +239,113 @@ The OBSW code uses STM32 HAL and CMSIS-RTOS APIs. These are mapped to ESP-IDF eq
 | `osDelay` | `vTaskDelay` |
 | `NVIC_SystemReset` | `esp_restart()` |
 
+## Building in STM32CubeIDE
+
+### Importing the Simulator ESP32 Project
+
+STM32CubeIDE can build and flash the ESP32-Simulator natively using its internal ESP-IDF integration (available since CubeIDE 1.14+).
+
+1. **Install ESP-IDF** if not already done:
+   - Download from [espressif.com](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/)
+   - On Windows: use the installer which bundles CubeIDE-compatible tools
+   - Set `IDF_PATH` environment variable
+
+2. **Import the project into a new workspace** (separate from the STM32 workspace):
+   - `File` → `Import` → `General` → `Existing Projects into Workspace`
+   - Select `simulation/esp32-simulator/` as the root directory
+   - The project will be detected as a CMake project
+   - Alternatively: `File` → `Open Projects from File System` → `Directory` → browse to `simulation/esp32-simulator/`
+
+3. **Build the simulator:**
+   - Right-click the project → `Build Project`
+   - Or use the hammer icon (`Ctrl+B`)
+
+4. **Flash to ESP32:**
+   - Connect the simulator ESP32 via USB
+   - `Run` → `Run Configurations` → `C/C++ Application`
+   - Select the `.elf` in `build/jos-simulator.elf`
+   - On the `Debugger` tab, select `ESP32 JTAG` or `ESP-IDF Serial`
+   - Click `Run`
+
+### Using CubeIDE External Tools for Both Boards
+
+If you prefer to build the ESP32-OBC from CubeIDE's terminal:
+
+1. **Open a terminal** inside CubeIDE: `Window` → `Show View` → `Terminal`
+2. **Activate ESP-IDF:**
+   ```
+   %IDF_PATH%\export.bat
+   ```
+3. **Build and flash:**
+   ```
+   cd simulation/esp32-obc
+   idf.py -p COM3 flash monitor
+   ```
+4. Open a second terminal for the simulator:
+   ```
+   cd simulation/esp32-simulator
+   idf.py -p COM4 flash monitor
+   ```
+
+### Running the STM32 Target + ESP32 Simulator Together
+
+You can debug the STM32 firmware in CubeIDE while the ESP32-Simulator feeds it data via serial/SPI:
+
+1. **Flash the ESP32-Simulator** from the command line first:
+   ```bash
+   make sim-flash BOARD=sim SIM_PORT=COM4
+   ```
+
+2. **Open a serial monitor** for the simulator (use a separate terminal or PuTTY):
+   ```
+   idf.py -p COM4 monitor
+   ```
+
+3. **In CubeIDE**, open the STM32 project and:
+   - Connect ST-Link to the STM32 board
+   - Connect a USB-TTL adapter from the STM32 UART1 (PA9/PA10) to your PC
+   - Wire the ESP32-Simulator UART TX (GPIO17) to STM32 UART RX
+   - Wire the ESP32-Simulator UART RX (GPIO16) to STM32 UART TX
+   - Connect grounds
+
+4. **Note:** The current STM32 firmware has UART disabled (`HAL_UART_MODULE_ENABLED` is commented out). To receive simulator data on the STM32, enable UART in CubeMX:
+   - Open `JOS.ioc` in CubeIDE
+   - Enable `USART1` at 115200 baud
+   - Map PA9 to USART1_TX, PA10 to USART1_RX
+   - Generate code (`Ctrl+Shift+G`)
+   - Add a UART receive task in `main.c`
+
+### External Build Configurations
+
+You can register `make sim` as an external build target in CubeIDE:
+
+1. `Run` → `External Tools` → `External Tools Configurations`
+2. Create a new configuration:
+   - **Name:** `Build ESP32 Sim`
+   - **Location:** `${system_path:make}`
+   - **Working Directory:** `${project_loc}`
+   - **Arguments:** `sim OBC_PORT=COM3 SIM_PORT=COM4`
+3. Click `Run` to build and flash both ESP32s in one click
+
 ## Troubleshooting
 
 ### "idf.py: command not found"
 ESP-IDF environment not activated. Run the export script for your platform.
+
+### "Project does not have a CMakeLists.txt"
+Ensure you imported `simulation/esp32-simulator/` or `simulation/esp32-obc/` directly, not the parent `simulation/` directory.
+
+### "ESP32 not found in CubeIDE target selection"
+Install the ESP-IDF CubeIDE extension:
+- `Help` → `Install New Software`
+- Add the Espressif update site (bundled with ESP-IDF installer)
+- Install `ESP-IDF Tools for CubeIDE`
+
+### CubeIDE cannot flash ESP32
+CubeIDE uses a different debugger backend for ESP32. Use the ESP-IDF flash method instead:
+- `Run` → `Run Configurations` → select the `.elf`
+- On the **Debugger** tab, change to `ESP-IDF Serial Flasher`
+- Set the serial port
 
 ### Simulator not responding
 1. Check UART wiring (TX↔RX crossover)

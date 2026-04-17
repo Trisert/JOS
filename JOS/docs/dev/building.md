@@ -97,4 +97,14 @@ For hardware-in-the-loop testing without real satellite hardware, use the dual E
 make sim OBC_PORT=COM3 SIM_PORT=COM4
 ```
 
-See [simulation.md](simulation.md) for full documentation.
+### Building in STM32CubeIDE
+
+The STM32 firmware and the ESP32 simulator projects can both be managed from CubeIDE:
+
+1. **STM32 project:** `File` → `Open Projects from File System` → select the JOS root directory. The `.project` and `.cproject` files will be detected automatically.
+
+2. **ESP32 simulator:** `File` → `Open Projects from File System` → select `simulation/esp32-simulator/`. Requires ESP-IDF tools installed (see [simulation.md](simulation.md) for setup).
+
+3. **Build all:** Use the hammer icon on each project, or register `make sim` as an external tool (`Run` → `External Tools Configurations`).
+
+See [simulation.md](simulation.md) for full documentation including CubeIDE-specific instructions.
