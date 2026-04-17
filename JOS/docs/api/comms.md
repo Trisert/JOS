@@ -126,6 +126,22 @@ Dispatch a decoded telecommand.
 | 0x03 | SET_CONFIG | Apply configuration |
 | 0x04 | SEND_DATA | Read FRAM and send chunked |
 | 0x05 | ACTIVATE_PAYLOAD | Transition to ACTIVE state |
+| 0x06 | SET_BEACON_INTERVAL | Override beacon transmission interval |
+
+### SET_BEACON_INTERVAL (0x06)
+
+Override the default per-state beacon interval.
+
+**Payload:** 4 bytes, big-endian (interval in milliseconds)
+
+**Behavior:**
+- Sets a custom beacon interval that overrides the state-dependent defaults
+- Sending `0x00000000` (0 ms) clears the override and reverts to the default per-state intervals defined in `obsw_types.h`:
+  - `BEACON_INTERVAL_CRIT` — 16 min (960 000 ms)
+  - `BEACON_INTERVAL_READY` — 4 min (240 000 ms)
+  - `BEACON_INTERVAL_ACTIVE` — 1 min (60 000 ms)
+
+**Example:** To set a 16-minute beacon interval, send payload `0x000EA600`.
 
 ---
 

@@ -5,6 +5,7 @@
 
 /* ---------- Private variables ---------- */
 static obw_state_t current_state = STATE_OFF;
+static uint32_t beacon_interval_override = 0;
 static osMutexId_t state_mutex;
 static osThreadId_t sm_task_handle;
 
@@ -196,11 +197,26 @@ int state_machine_request_transition(obw_state_t target, uint8_t trigger)
 
 uint32_t state_machine_get_beacon_interval(void)
 {
-    obw_state_t s = state_machine_get_state();
-    switch (s) {
-    case STATE_CRIT:   return BEACON_INTERVAL_CRIT;
-    case STATE_ACTIVE: return BEACON_INTERVAL_ACTIVE;
-    case STATE_READY:  return BEACON_INTERVAL_READY;
-    default:           return BEACON_INTERVAL_CRIT;
+    uint32_t interval;
+    osMutexAcquire(state_mutex, osWaitForever);
+    if (beacon_interval_override != 0) {
+        interval = beacon_interval_override;
+    } else {
+        obw_state_t s = current_state;
+        switch (s) {
+        case STATE_CRIT:   interval = BEACON_INTERVAL_CRIT;   break;
+        case STATE_ACTIVE: interval = BEACON_INTERVAL_ACTIVE;  break;
+        case STATE_READY:  interval = BEACON_INTERVAL_READY;   break;
+        default:           interval = BEACON_INTERVAL_CRIT;     break;
+        }
     }
+    osMutexRelease(state_mutex);
+    return interval;
+}
+
+void state_machine_set_beacon_interval(uint32_t interval_ms)
+{
+    osMutexAcquire(state_mutex, osWaitForever);
+    beacon_interval_override = interval_ms;
+    osMutexRelease(state_mutex);
 }

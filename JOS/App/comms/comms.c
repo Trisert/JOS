@@ -9,6 +9,8 @@
 #define LORA_MAX_PACKET  64
 #define BEACON_SIZE      128
 
+#define CMD_SET_BEACON_INTERVAL  0x06
+
 extern SPI_HandleTypeDef hspi1;
 
 /* ---------- Stub implementations ---------- */
@@ -47,6 +49,15 @@ void comms_dispatch_command(uint8_t cmd_id, const uint8_t *payload, size_t len)
         break;
     case 0x05:  /* ACTIVATE_PAYLOAD */
         state_machine_request_transition(STATE_ACTIVE, TRIGGER_GROUND_CMD);
+        break;
+    case CMD_SET_BEACON_INTERVAL:  /* SET_BEACON_INTERVAL */
+        if (len >= 4) {
+            uint32_t interval_ms = ((uint32_t)payload[0] << 24) |
+                                   ((uint32_t)payload[1] << 16) |
+                                   ((uint32_t)payload[2] << 8)  |
+                                    (uint32_t)payload[3];
+            state_machine_set_beacon_interval(interval_ms);
+        }
         break;
     default:
         break;
