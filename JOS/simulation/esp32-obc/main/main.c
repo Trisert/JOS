@@ -72,7 +72,7 @@ int sim_bridge_send_recv(const uint8_t *tx, uint8_t *rx, size_t len)
     return (rc == ESP_OK) ? 0 : -1;
 }
 
-void sim_bridge_notify_gpio(const sim_gpio_state_t *gpio)
+void sim_bridge_notify_gpio(const sim_payload_gpio_t *gpio)
 {
     if (!gpio) return;
 
@@ -81,9 +81,9 @@ void sim_bridge_notify_gpio(const sim_gpio_state_t *gpio)
     pkt.hdr.magic = SIM_MAGIC;
     pkt.hdr.version = SIM_VERSION;
     pkt.hdr.cmd = SIM_CMD_NOTIFY_GPIO;
-    pkt.hdr.len = sizeof(sim_gpio_state_t);
+    pkt.hdr.len = sizeof(sim_payload_gpio_t);
 
-    memcpy(pkt.payload, gpio, sizeof(sim_gpio_state_t));
+    memcpy(pkt.payload, gpio, sizeof(sim_payload_gpio_t));
 
     sim_bridge_send((uint8_t *)&pkt, SIM_PKT_SIZE(&pkt));
 }
@@ -116,35 +116,58 @@ static void sim_process_task(void *arg)
             if (hdr->len > SIM_MAX_PAYLOAD) continue;
 
             switch (hdr->cmd) {
-            case SIM_RESP_DATA:
-                if (hdr->len >= sizeof(sim_bms_data_t)) {
-                    sim_bms_data_t *bms = (sim_bms_data_t *)(buf + sizeof(sim_header_t));
-                    bms_set_soc_stub(bms->soc);
-                    hal_compat_set_adc_value(4, 2048);
-                    hal_compat_set_adc_value(5, 2048);
-                    ESP_LOGI(TAG, "BMS updated: SoC=%d%% T=%d V=%dmV",
-                             bms->soc, bms->temp_c, bms->voltage_mv);
+            case SIM_CMD_SUBSYS_QUERY_EPS:
+                if (hdr->len >= sizeof(sim_eps_telemetry_t)) {
+                    sim_eps_telemetry_t *eps = (sim_eps_telemetry_t *)(buf + sizeof(sim_header_t));
+                    bms_set_soc_stub(eps->soc);
+                    ESP_LOGI(TAG, "EPS: SoC=%u%% SoH=%u%% T=%d V=%umV I=%dmA flags=0x%04x",
+                             eps->soc, eps->soh, eps->temp_c, eps->voltage_mv,
+                             eps->current_ma, eps->flags);
                 }
                 break;
 
-            case SIM_RESP_DATA + 1:
-                if (hdr->len >= sizeof(sim_adc_data_t)) {
-                    sim_adc_data_t *adc = (sim_adc_data_t *)(buf + sizeof(sim_header_t));
-                    hal_compat_set_adc_value(4, adc->ch4_mv);
-                    hal_compat_set_adc_value(5, adc->ch5_mv);
-                    hal_compat_set_adc_value(8, adc->ch8_mv);
-                    hal_compat_set_adc_value(9, adc->ch9_mv);
+            case SIM_CMD_SUBSYS_QUERY_AOCS:
+                if (hdr->len >= sizeof(sim_aocs_telemetry_t)) {
+                    sim_aocs_telemetry_t *aocs = (sim_aocs_telemetry_t *)(buf + sizeof(sim_header_t));
+                    ESP_LOGI(TAG, "AOCS: acc[%d,%d,%d] gyro[%d,%d,%d] mag[%d,%d,%d] imu=%u mag=%u ts=%lu",
+                             aocs->accel_x, aocs->accel_y, aocs->accel_z,
+                             aocs->gyro_x, aocs->gyro_y, aocs->gyro_z,
+                             aocs->mag_x, aocs->mag_y, aocs->mag_z,
+                             aocs->imu_valid, aocs->mag_valid,
+                             (unsigned long)aocs->timestamp_ms);
                 }
                 break;
 
-            case SIM_LORA_RX_COMMAND: {
+            case SIM_CMD_PAYLOAD_QUERY_CLOUD:
+                if (hdr->len >= sizeof(sim_cloud_data_t)) {
+                    sim_cloud_data_t *cloud = (sim_cloud_data_t *)(buf + sizeof(sim_header_t));
+                    hal_compat_set_adc_value(4, cloud->channels[4]);
+                    hal_compat_set_adc_value(5, cloud->channels[5]);
+                    hal_compat_set_adc_value(8, cloud->channels[8]);
+                    hal_compat_set_adc_value(9, cloud->channels[9]);
+                    ESP_LOGI(TAG, "CLOUD: face=%u gpio_exp=0x%02x ch4=%u ch5=%u ch8=%u ch9=%u",
+                             cloud->face, cloud->gpio_expander,
+                             cloud->channels[4], cloud->channels[5],
+                             cloud->channels[8], cloud->channels[9]);
+                }
+                break;
+
+            case SIM_CMD_LORA_RX_COMMAND: {
                 sim_lora_cmd_t *cmd = (sim_lora_cmd_t *)(buf + sizeof(sim_header_t));
                 if (hdr->len >= 1) {
                     comms_dispatch_command(cmd->cmd_id, cmd->payload, cmd->payload_len);
-                    ESP_LOGI(TAG, "LoRa cmd received: 0x%02x", cmd->cmd_id);
+                    ESP_LOGI(TAG, "LoRa cmd received: 0x%02x len=%u", cmd->cmd_id, cmd->payload_len);
                 }
                 break;
             }
+
+            case SIM_CMD_ASSERT_INT1:
+                ESP_LOGI(TAG, "INT1 asserted");
+                break;
+
+            case SIM_CMD_ASSERT_INT2:
+                ESP_LOGI(TAG, "INT2 asserted");
+                break;
 
             default:
                 break;

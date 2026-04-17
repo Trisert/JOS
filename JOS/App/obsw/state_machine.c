@@ -23,16 +23,19 @@ static const bms_thresholds_t default_thresholds = {
     .b_scrit  = 25,
 };
 
-/* ---------- Stub: BMS (to be replaced by real driver) ---------- */
+/* Stub BMS — per RED_DES_ElectronicArchitecture_V1:
+ *   BQ76905 on EPS board via local I2C to EPS MCU,
+ *   OBC queries EPS over subsystem SPI.
+ *   Default voltage for 2S Li-ion: 7400 mV nominal. */
 static bms_status_t bms_stub = {
     .soc        = 100,
     .temp_c     = 250,   /* 25.0 C */
-    .voltage_mv = 4200,
+    .voltage_mv = 7400,
 };
 
 static bms_status_t bms_get_status(void)
 {
-    /* TODO: replace with real BMS SPI read */
+    /* TODO: replace with real subsystem SPI query to EPS MCU */
     return bms_stub;
 }
 

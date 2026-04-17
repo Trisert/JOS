@@ -129,8 +129,8 @@ static void lowbat_reset(void)
     lowbat_sc.phase = 0;
     lowbat_sc.active = false;
     if (g_state) {
-        g_state->bms.soc = 100;
-        g_state->bms.voltage_mv = 4200;
+        g_state->eps.soc = 100;
+        g_state->eps.voltage_mv = 8400;
         g_state->drain_rate = 0;
     }
 }
@@ -140,7 +140,7 @@ static void lowbat_start(void)
     lowbat_reset();
     lowbat_sc.active = true;
     if (g_state) {
-        g_state->bms.soc = 85;
+        g_state->eps.soc = 85;
         g_state->drain_rate = 5.0f;
     }
     ESP_LOGI(SC_TAG, "LOW_BATTERY scenario started (drain: 5%%/min)");
@@ -156,14 +156,34 @@ static void lowbat_step(uint32_t dt_ms)
         lowbat_sc.phase = 1;
         g_state->drain_rate = 0;
         ESP_LOGI(SC_TAG, "[LOWBAT] Phase 1: Stopped drain at %d%%, waiting for CRIT",
-                 g_state->bms.soc);
+                 g_state->eps.soc);
     }
 
-    if (g_state->bms.soc <= 80 && lowbat_sc.phase == 0) {
+    if (t >= 12000 && t < 14000 && lowbat_sc.phase == 0) {
+        lowbat_sc.phase = 1;
+        g_state->drain_rate = 0;
+        ESP_LOGI(SC_TAG, "[LOWBAT] Phase 1: Stopped drain at %d%%, waiting for CRIT",
+                 g_state->eps.soc);
+    }
+
+    if (g_state->eps.soc <= 80 && lowbat_sc.phase == 0) {
         lowbat_sc.phase = 1;
         g_state->drain_rate = 0;
         ESP_LOGI(SC_TAG, "[LOWBAT] Battery reached %d%%, observing state machine",
-                 g_state->bms.soc);
+                 g_state->eps.soc);
+    }
+
+    if (t >= 25000 && lowbat_sc.phase == 1) {
+        lowbat_sc.phase = 2;
+        g_state->drain_rate = -3.0f;
+        ESP_LOGI(SC_TAG, "[LOWBAT] Phase 2: Charging at 3%%/min");
+    }
+
+    if (g_state->eps.soc >= 80 && lowbat_sc.phase == 2) {
+        lowbat_sc.phase = 3;
+        g_state->drain_rate = 0;
+        ESP_LOGI(SC_TAG, "[LOWBAT] Phase 3: Battery recovered to %d%%",
+                 g_state->eps.soc);
     }
 
     if (t >= 25000 && lowbat_sc.phase == 1) {
@@ -208,15 +228,15 @@ static void debris_step(uint32_t dt_ms)
     if (t >= 3000 && t < 5000 && debris_sc.phase == 0) {
         debris_sc.phase = 1;
         ESP_LOGI(SC_TAG, "[DEBRIS] Impact! Modifying CLOUD face 0 stripe 4-6");
-        g_state->cloud_adc.channels[4] = 3500;
-        g_state->cloud_adc.channels[5] = 3800;
-        g_state->cloud_adc.channels[6] = 200;
+        g_state->cloud.channels[4] = 3500;
+        g_state->cloud.channels[5] = 3800;
+        g_state->cloud.channels[6] = 200;
     }
 
     if (t >= 10000 && debris_sc.phase == 1) {
         debris_sc.phase = 2;
         ESP_LOGI(SC_TAG, "[DEBRIS] Partial recovery on face 0");
-        g_state->cloud_adc.channels[4] = 2200;
+        g_state->cloud.channels[4] = 2200;
     }
 
     if (t >= 20000 && debris_sc.phase == 2) {
@@ -231,8 +251,8 @@ static void full_orbit_reset(void)
     full_orbit_sc.phase = 0;
     full_orbit_sc.active = false;
     if (g_state) {
-        g_state->bms.soc = 95;
-        g_state->bms.voltage_mv = 4150;
+        g_state->eps.soc = 95;
+        g_state->eps.voltage_mv = 8060;
         g_state->drain_rate = 0;
     }
 }
@@ -260,16 +280,16 @@ static void full_orbit_step(uint32_t dt_ms)
     if (orbit_ms >= eclipse_start && orbit_ms < eclipse_end && full_orbit_sc.phase == 0) {
         full_orbit_sc.phase = 1;
         g_state->drain_rate = 8.0f;
-        g_state->adc.ch4_mv = 0;
-        g_state->adc.ch5_mv = 0;
+        g_state->cloud.channels[4] = 0;
+        g_state->cloud.channels[5] = 0;
         ESP_LOGI(SC_TAG, "[ORBIT] Eclipse phase - solar panels dark");
     }
 
     if (orbit_ms >= eclipse_end && full_orbit_sc.phase == 1) {
         full_orbit_sc.phase = 2;
         g_state->drain_rate = -5.0f;
-        g_state->adc.ch4_mv = 1500;
-        g_state->adc.ch5_mv = 1200;
+        g_state->cloud.channels[4] = 1500;
+        g_state->cloud.channels[5] = 1200;
         ESP_LOGI(SC_TAG, "[ORBIT] Sunlight phase - charging");
     }
 

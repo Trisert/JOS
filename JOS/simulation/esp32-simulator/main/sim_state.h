@@ -5,11 +5,14 @@
 #include "sim_protocol.h"
 
 typedef struct {
-    sim_bms_data_t bms;
-    sim_imu_data_t imu;
-    sim_mag_data_t mag;
-    sim_adc_data_t adc;
-    sim_cloud_adc_t cloud_adc;
+    sim_eps_telemetry_t eps;
+    sim_aocs_telemetry_t aocs;
+    sim_aocs_telemetry_t aocs_redundant;
+    sim_cloud_data_t cloud;
+    sim_payload_gpio_t payload_gpio;
+    sim_temp_data_t temps;
+    sim_pok_state_t pok;
+    sim_gpio_expander_t gpio_exp;
     bool running;
     uint32_t time_multiplier;
     bool auto_mode;

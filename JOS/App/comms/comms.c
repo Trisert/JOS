@@ -17,7 +17,7 @@ extern SPI_HandleTypeDef hspi1;
 
 int lora_init(void)
 {
-    /* TODO: configure SX1268 via RadioLib — SF10, BW125, CR4/8, 436 MHz */
+    /* TODO: configure SX1268 via RadioLib — SF10, BW125, CR4/8, 433 MHz */
     return 0;
 }
 

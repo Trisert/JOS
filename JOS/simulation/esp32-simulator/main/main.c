@@ -41,25 +41,37 @@ static QueueHandle_t console_rx_queue;
 static SemaphoreHandle_t sim_state_mutex;
 
 static sim_state_t sim = {
-    .bms = {
+    .eps = {
         .soc = 100,
+        .soh = 100,
         .temp_c = 250,
-        .voltage_mv = 4200,
+        .voltage_mv = 8400,
+        .current_ma = 0,
+        .flags = 0,
     },
-    .imu = {
+    .aocs = {
         .accel_x = 0, .accel_y = 0, .accel_z = 1000,
         .gyro_x = 0, .gyro_y = 0, .gyro_z = 0,
-    },
-    .mag = {
         .mag_x = 200, .mag_y = 0, .mag_z = 40000,
+        .imu_valid = 1,
+        .mag_valid = 1,
     },
-    .adc = {
-        .ch4_mv = 1500,
-        .ch5_mv = 1200,
-        .ch8_mv = 800,
-        .ch9_mv = 750,
+    .aocs_redundant = {0},
+    .cloud = {0},
+    .payload_gpio = {0},
+    .temps = {0},
+    .pok = {
+        .pok_obc = 1,
+        .pok_aocs = 1,
+        .pok_eps = 1,
+        .pok_telecomm = 1,
+        .pok_conv_zp = 0,
     },
-    .cloud_adc = {0},
+    .gpio_exp = {
+        .outputs = 0xFF,
+        .directions = 0x00,
+        .inputs = 0x00,
+    },
     .running = false,
     .time_multiplier = 1,
     .auto_mode = false,
@@ -76,12 +88,15 @@ static void print_help(void)
     printf("  stop              - Stop simulation\n");
     printf("  status            - Show current state\n");
     printf("  reset             - Reset all to defaults\n");
-    printf("  bms <soc> <temp> <voltage>  - Set battery (e.g. bms 80 250 4100)\n");
+    printf("  bms <soc> [soh] [temp] [voltage] [current]  - Set EPS telemetry\n");
+    printf("  eps               - Show full EPS telemetry\n");
     printf("  drain <rate>      - Drain battery over time (%%/min)\n");
     printf("  charge <rate>     - Charge battery over time (%%/min)\n");
-    printf("  imu <ax> <ay> <az> <gx> <gy> <gz>  - Set IMU (raw 16-bit)\n");
-    printf("  mag <x> <y> <z>  - Set magnetometer (raw 16-bit)\n");
-    printf("  adc <ch4> <ch5> <ch8> <ch9>  - Set ADC channels (mV)\n");
+    printf("  imu <ax> <ay> <az> <gx> <gy> <gz>  - Set AOCS IMU (raw 16-bit)\n");
+    printf("  aocs              - Show AOCS telemetry (accel, gyro, mag)\n");
+    printf("  cloud <ch0> ... <ch15>  - Set CLOUD MAX11228 ADC channels\n");
+    printf("  temps <t0> <t1> <t2> <t3>  - Set TMP1827 temperatures (0.1 C)\n");
+    printf("  pok [obc|aocs|eps|telecomm|conv_zp] [0|1]  - Show/toggle POK\n");
     printf("  cmd <id> [hex_payload]  - Send telecommand to OBC\n");
     printf("  activate          - Send ACTIVATE_PAYLOAD cmd\n");
     printf("  ready             - Send EXIT_STATE cmd\n");
@@ -103,21 +118,27 @@ static void print_status(void)
     printf("  Auto Mode:    %s\n", sim.auto_mode ? "ON" : "OFF");
     printf("  Scenario:     %s\n", current_scenario ? current_scenario->name : "None");
 
-    printf("  BMS:\n");
-    printf("    SoC:        %d%%\n", sim.bms.soc);
-    printf("    Temp:       %d.%d C\n", sim.bms.temp_c / 10, abs(sim.bms.temp_c % 10));
-    printf("    Voltage:    %dmV\n", sim.bms.voltage_mv);
+    printf("  EPS:\n");
+    printf("    SoC:        %d%%\n", sim.eps.soc);
+    printf("    SoH:        %d%%\n", sim.eps.soh);
+    printf("    Temp:       %d.%d C\n", sim.eps.temp_c / 10, abs(sim.eps.temp_c % 10));
+    printf("    Voltage:    %dmV\n", sim.eps.voltage_mv);
+    printf("    Current:    %dmA\n", sim.eps.current_ma);
+    printf("    Flags:      0x%04x\n", sim.eps.flags);
 
-    printf("  IMU:\n");
-    printf("    Accel:      %d %d %d\n", sim.imu.accel_x, sim.imu.accel_y, sim.imu.accel_z);
-    printf("    Gyro:       %d %d %d\n", sim.imu.gyro_x, sim.imu.gyro_y, sim.imu.gyro_z);
+    printf("  AOCS:\n");
+    printf("    Accel:      %d %d %d\n", sim.aocs.accel_x, sim.aocs.accel_y, sim.aocs.accel_z);
+    printf("    Gyro:       %d %d %d\n", sim.aocs.gyro_x, sim.aocs.gyro_y, sim.aocs.gyro_z);
+    printf("    Mag:        %d %d %d\n", sim.aocs.mag_x, sim.aocs.mag_y, sim.aocs.mag_z);
+    printf("    Valid:      IMU=%d MAG=%d\n", sim.aocs.imu_valid, sim.aocs.mag_valid);
 
-    printf("  Mag:\n");
-    printf("    Field:      %d %d %d\n", sim.mag.mag_x, sim.mag.mag_y, sim.mag.mag_z);
+    printf("  POK:\n");
+    printf("    OBC=%d AOCS=%d EPS=%d TELECOMM=%d CONV_ZP=%d\n",
+           sim.pok.pok_obc, sim.pok.pok_aocs, sim.pok.pok_eps,
+           sim.pok.pok_telecomm, sim.pok.pok_conv_zp);
 
-    printf("  ADC (mV):\n");
-    printf("    CH4(Front): %d  CH5(Rear): %d\n", sim.adc.ch4_mv, sim.adc.ch5_mv);
-    printf("    CH8(+Z):    %d  CH9(-Z):  %d\n", sim.adc.ch8_mv, sim.adc.ch9_mv);
+    printf("  GPIO Exp:    out=0x%02x dir=0x%02x in=0x%02x\n",
+           sim.gpio_exp.outputs, sim.gpio_exp.directions, sim.gpio_exp.inputs);
 
     xSemaphoreGive(sim_state_mutex);
     printf("-------------------------\n\n");
@@ -128,29 +149,29 @@ static void send_to_obc(const uint8_t *data, size_t len)
     uart_write_bytes(OBC_TX_UART, data, len);
 }
 
-static void send_bms_to_obc(void)
+static void send_eps_to_obc(void)
 {
     sim_packet_t pkt;
     memset(&pkt, 0, sizeof(pkt));
     pkt.hdr.magic = SIM_MAGIC;
     pkt.hdr.version = SIM_VERSION;
-    pkt.hdr.cmd = SIM_RESP_DATA;
-    pkt.hdr.len = sizeof(sim_bms_data_t);
+    pkt.hdr.cmd = SIM_CMD_SUBSYS_QUERY_EPS;
+    pkt.hdr.len = sizeof(sim_eps_telemetry_t);
 
-    memcpy(pkt.payload, &sim.bms, sizeof(sim_bms_data_t));
+    memcpy(pkt.payload, &sim.eps, sizeof(sim_eps_telemetry_t));
     send_to_obc((uint8_t *)&pkt, SIM_PKT_SIZE(&pkt));
 }
 
-static void send_adc_to_obc(void)
+static void send_cloud_to_obc(void)
 {
     sim_packet_t pkt;
     memset(&pkt, 0, sizeof(pkt));
     pkt.hdr.magic = SIM_MAGIC;
     pkt.hdr.version = SIM_VERSION;
-    pkt.hdr.cmd = SIM_RESP_DATA + 1;
-    pkt.hdr.len = sizeof(sim_adc_data_t);
+    pkt.hdr.cmd = SIM_CMD_PAYLOAD_QUERY_CLOUD;
+    pkt.hdr.len = sizeof(sim_cloud_data_t);
 
-    memcpy(pkt.payload, &sim.adc, sizeof(sim_adc_data_t));
+    memcpy(pkt.payload, &sim.cloud, sizeof(sim_cloud_data_t));
     send_to_obc((uint8_t *)&pkt, SIM_PKT_SIZE(&pkt));
 }
 
@@ -160,7 +181,7 @@ static void send_telecommand(uint8_t cmd_id, const uint8_t *payload, uint8_t pay
     memset(&pkt, 0, sizeof(pkt));
     pkt.hdr.magic = SIM_MAGIC;
     pkt.hdr.version = SIM_VERSION;
-    pkt.hdr.cmd = SIM_LORA_RX_COMMAND;
+    pkt.hdr.cmd = SIM_CMD_LORA_RX_COMMAND;
     pkt.hdr.len = 1 + payload_len;
 
     pkt.payload[0] = cmd_id;
@@ -174,70 +195,168 @@ static void send_telecommand(uint8_t cmd_id, const uint8_t *payload, uint8_t pay
 
 static void cmd_bms(int argc, char **argv)
 {
-    if (argc < 4) {
-        printf("Usage: bms <soc> <temp_x10> <voltage_mv>\n");
+    if (argc < 2) {
+        xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
+        printf("EPS Telemetry:\n");
+        printf("  SoC:      %d%%\n", sim.eps.soc);
+        printf("  SoH:      %d%%\n", sim.eps.soh);
+        printf("  Temp:     %d.%d C\n", sim.eps.temp_c / 10, abs(sim.eps.temp_c % 10));
+        printf("  Voltage:  %dmV\n", sim.eps.voltage_mv);
+        printf("  Current:  %dmA\n", sim.eps.current_ma);
+        printf("  Flags:    0x%04x\n", sim.eps.flags);
+        xSemaphoreGive(sim_state_mutex);
         return;
     }
     xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
-    sim.bms.soc = (uint8_t)atoi(argv[1]);
-    sim.bms.temp_c = (int16_t)atoi(argv[2]);
-    sim.bms.voltage_mv = (uint16_t)atoi(argv[3]);
+    sim.eps.soc = (uint8_t)atoi(argv[1]);
+    if (argc >= 3) sim.eps.soh = (uint8_t)atoi(argv[2]);
+    if (argc >= 4) sim.eps.temp_c = (int16_t)atoi(argv[3]);
+    if (argc >= 5) sim.eps.voltage_mv = (uint16_t)atoi(argv[4]);
+    if (argc >= 6) sim.eps.current_ma = (int16_t)atoi(argv[5]);
     xSemaphoreGive(sim_state_mutex);
 
-    send_bms_to_obc();
-    printf("BMS updated: SoC=%d%% T=%d.%dC V=%dmV\n",
-           sim.bms.soc, sim.bms.temp_c / 10, abs(sim.bms.temp_c % 10), sim.bms.voltage_mv);
+    send_eps_to_obc();
+    printf("EPS updated: SoC=%d%% SoH=%d%% T=%d.%dC V=%dmV I=%dmA\n",
+           sim.eps.soc, sim.eps.soh,
+           sim.eps.temp_c / 10, abs(sim.eps.temp_c % 10),
+           sim.eps.voltage_mv, sim.eps.current_ma);
+}
+
+static void cmd_eps(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
+    printf("EPS Telemetry:\n");
+    printf("  SoC:      %d%%\n", sim.eps.soc);
+    printf("  SoH:      %d%%\n", sim.eps.soh);
+    printf("  Temp:     %d.%d C\n", sim.eps.temp_c / 10, abs(sim.eps.temp_c % 10));
+    printf("  Voltage:  %dmV\n", sim.eps.voltage_mv);
+    printf("  Current:  %dmA\n", sim.eps.current_ma);
+    printf("  Flags:    0x%04x\n", sim.eps.flags);
+    xSemaphoreGive(sim_state_mutex);
 }
 
 static void cmd_imu(int argc, char **argv)
 {
     if (argc < 7) {
-        printf("Usage: imu <ax> <ay> <az> <gx> <gy> <gz>\n");
+        xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
+        printf("AOCS Telemetry:\n");
+        printf("  Accel:  %d %d %d\n", sim.aocs.accel_x, sim.aocs.accel_y, sim.aocs.accel_z);
+        printf("  Gyro:   %d %d %d\n", sim.aocs.gyro_x, sim.aocs.gyro_y, sim.aocs.gyro_z);
+        printf("  Mag:    %d %d %d\n", sim.aocs.mag_x, sim.aocs.mag_y, sim.aocs.mag_z);
+        printf("  Valid:  IMU=%d MAG=%d\n", sim.aocs.imu_valid, sim.aocs.mag_valid);
+        xSemaphoreGive(sim_state_mutex);
         return;
     }
     xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
-    sim.imu.accel_x = (int16_t)atoi(argv[1]);
-    sim.imu.accel_y = (int16_t)atoi(argv[2]);
-    sim.imu.accel_z = (int16_t)atoi(argv[3]);
-    sim.imu.gyro_x = (int16_t)atoi(argv[4]);
-    sim.imu.gyro_y = (int16_t)atoi(argv[5]);
-    sim.imu.gyro_z = (int16_t)atoi(argv[6]);
-    sim.imu.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    sim.aocs.accel_x = (int16_t)atoi(argv[1]);
+    sim.aocs.accel_y = (int16_t)atoi(argv[2]);
+    sim.aocs.accel_z = (int16_t)atoi(argv[3]);
+    sim.aocs.gyro_x = (int16_t)atoi(argv[4]);
+    sim.aocs.gyro_y = (int16_t)atoi(argv[5]);
+    sim.aocs.gyro_z = (int16_t)atoi(argv[6]);
+    sim.aocs.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    if (argc >= 10) {
+        sim.aocs.mag_x = (int16_t)atoi(argv[7]);
+        sim.aocs.mag_y = (int16_t)atoi(argv[8]);
+        sim.aocs.mag_z = (int16_t)atoi(argv[9]);
+    }
     xSemaphoreGive(sim_state_mutex);
-    printf("IMU updated\n");
+    printf("AOCS IMU updated\n");
 }
 
-static void cmd_mag(int argc, char **argv)
+static void cmd_aocs(int argc, char **argv)
 {
-    if (argc < 4) {
-        printf("Usage: mag <x> <y> <z>\n");
-        return;
-    }
+    (void)argc; (void)argv;
     xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
-    sim.mag.mag_x = (int16_t)atoi(argv[1]);
-    sim.mag.mag_y = (int16_t)atoi(argv[2]);
-    sim.mag.mag_z = (int16_t)atoi(argv[3]);
-    sim.mag.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    printf("AOCS Telemetry:\n");
+    printf("  Accel:  %d %d %d\n", sim.aocs.accel_x, sim.aocs.accel_y, sim.aocs.accel_z);
+    printf("  Gyro:   %d %d %d\n", sim.aocs.gyro_x, sim.aocs.gyro_y, sim.aocs.gyro_z);
+    printf("  Mag:    %d %d %d\n", sim.aocs.mag_x, sim.aocs.mag_y, sim.aocs.mag_z);
+    printf("  Valid:  IMU=%d MAG=%d\n", sim.aocs.imu_valid, sim.aocs.mag_valid);
     xSemaphoreGive(sim_state_mutex);
-    printf("Magnetometer updated\n");
 }
 
-static void cmd_adc(int argc, char **argv)
+static void cmd_cloud(int argc, char **argv)
 {
-    if (argc < 5) {
-        printf("Usage: adc <ch4> <ch5> <ch8> <ch9>\n");
+    if (argc < 2) {
+        xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
+        printf("CLOUD MAX11228 Data (face %d):\n", sim.cloud.face);
+        for (int i = 0; i < 16; i++) {
+            printf("  CH%02d: %u mV\n", i, sim.cloud.channels[i]);
+        }
+        printf("  GPIO exp: 0x%02x\n", sim.cloud.gpio_expander);
+        xSemaphoreGive(sim_state_mutex);
         return;
     }
     xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
-    sim.adc.ch4_mv = (uint16_t)atoi(argv[1]);
-    sim.adc.ch5_mv = (uint16_t)atoi(argv[2]);
-    sim.adc.ch8_mv = (uint16_t)atoi(argv[3]);
-    sim.adc.ch9_mv = (uint16_t)atoi(argv[4]);
+    int count = argc - 1;
+    if (count > 16) count = 16;
+    for (int i = 0; i < count; i++) {
+        sim.cloud.channels[i] = (uint16_t)atoi(argv[i + 1]);
+    }
     xSemaphoreGive(sim_state_mutex);
 
-    send_adc_to_obc();
-    printf("ADC updated: CH4=%d CH5=%d CH8=%d CH9=%d mV\n",
-           sim.adc.ch4_mv, sim.adc.ch5_mv, sim.adc.ch8_mv, sim.adc.ch9_mv);
+    send_cloud_to_obc();
+    printf("CLOUD updated: %d channels set\n", count);
+}
+
+static void cmd_temps(int argc, char **argv)
+{
+    if (argc < 2) {
+        xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
+        printf("TMP1827 Temperatures:\n");
+        for (int i = 0; i < 4; i++) {
+            printf("  Sensor %d: %d.%d C\n", i,
+                   sim.temps.temps[i] / 10, abs(sim.temps.temps[i] % 10));
+        }
+        xSemaphoreGive(sim_state_mutex);
+        return;
+    }
+    xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
+    int count = argc - 1;
+    if (count > 4) count = 4;
+    for (int i = 0; i < count; i++) {
+        sim.temps.temps[i] = (int16_t)atoi(argv[i + 1]);
+    }
+    xSemaphoreGive(sim_state_mutex);
+    printf("Temperatures updated: %d sensors set\n", count);
+}
+
+static void cmd_pok(int argc, char **argv)
+{
+    if (argc < 2) {
+        xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
+        printf("POK States:\n");
+        printf("  obc:      %d\n", sim.pok.pok_obc);
+        printf("  aocs:     %d\n", sim.pok.pok_aocs);
+        printf("  eps:      %d\n", sim.pok.pok_eps);
+        printf("  telecomm: %d\n", sim.pok.pok_telecomm);
+        printf("  conv_zp:  %d\n", sim.pok.pok_conv_zp);
+        xSemaphoreGive(sim_state_mutex);
+        return;
+    }
+    xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
+    const char *target = argv[1];
+    uint8_t *reg = NULL;
+    if (strcasecmp(target, "obc") == 0) reg = &sim.pok.pok_obc;
+    else if (strcasecmp(target, "aocs") == 0) reg = &sim.pok.pok_aocs;
+    else if (strcasecmp(target, "eps") == 0) reg = &sim.pok.pok_eps;
+    else if (strcasecmp(target, "telecomm") == 0) reg = &sim.pok.pok_telecomm;
+    else if (strcasecmp(target, "conv_zp") == 0) reg = &sim.pok.pok_conv_zp;
+
+    if (!reg) {
+        printf("Unknown POK target: '%s'\n", target);
+        xSemaphoreGive(sim_state_mutex);
+        return;
+    }
+    if (argc >= 3) {
+        *reg = (uint8_t)atoi(argv[2]);
+    } else {
+        *reg = *reg ? 0 : 1;
+    }
+    printf("POK %s = %d\n", target, *reg);
+    xSemaphoreGive(sim_state_mutex);
 }
 
 static void cmd_telecommand(int argc, char **argv)
@@ -349,11 +468,14 @@ static const console_cmd_t commands[] = {
     {"status",   NULL},
     {"reset",    NULL},
     {"bms",      cmd_bms},
+    {"eps",      cmd_eps},
     {"drain",    cmd_drain},
     {"charge",   cmd_charge},
     {"imu",      cmd_imu},
-    {"mag",      cmd_mag},
-    {"adc",      cmd_adc},
+    {"aocs",     cmd_aocs},
+    {"cloud",    cmd_cloud},
+    {"temps",    cmd_temps},
+    {"pok",      cmd_pok},
     {"cmd",      cmd_telecommand},
     {"activate", NULL},
     {"ready",    NULL},
@@ -417,24 +539,27 @@ static void console_task(void *arg)
                 case 3: print_status(); break;
                 case 4:
                     xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
-                    sim.bms.soc = 100;
-                    sim.bms.temp_c = 250;
-                    sim.bms.voltage_mv = 4200;
+                    sim.eps.soc = 100;
+                    sim.eps.soh = 100;
+                    sim.eps.temp_c = 250;
+                    sim.eps.voltage_mv = 8400;
+                    sim.eps.current_ma = 0;
+                    sim.eps.flags = 0;
                     sim.drain_rate = 0;
                     xSemaphoreGive(sim_state_mutex);
-                    send_bms_to_obc();
+                    send_eps_to_obc();
                     printf("Reset to defaults\n");
                     break;
-                case 12:
+                case 15:
                     send_telecommand(0x05, NULL, 0);
                     break;
-                case 13:
+                case 16:
                     send_telecommand(0x02, NULL, 0);
                     break;
-                case 14:
+                case 17:
                     send_telecommand(0x01, NULL, 0);
                     break;
-                case 18:
+                case 22:
                     sim.auto_mode = !sim.auto_mode;
                     printf("Auto mode: %s\n", sim.auto_mode ? "ON" : "OFF");
                     break;
@@ -457,8 +582,6 @@ static void sim_update_task(void *arg)
 {
     (void)arg;
     uint32_t last_bms_ms = 0;
-    uint32_t last_adc_ms = 0;
-    uint32_t last_imu_ms = 0;
     uint32_t last_scenario_ms = 0;
 
     while (1) {
@@ -470,22 +593,22 @@ static void sim_update_task(void *arg)
 
             if (sim.drain_rate != 0 && dt >= 1000) {
                 int32_t delta = (int32_t)(sim.drain_rate * dt / 60000.0f * sim.time_multiplier);
-                int32_t new_soc = (int32_t)sim.bms.soc + delta;
+                int32_t new_soc = (int32_t)sim.eps.soc + delta;
                 if (new_soc < 0) new_soc = 0;
                 if (new_soc > 100) new_soc = 100;
-                sim.bms.soc = (uint8_t)new_soc;
+                sim.eps.soc = (uint8_t)new_soc;
 
-                sim.bms.voltage_mv = (uint16_t)(3000 + (sim.bms.soc * 12));
-                if (sim.bms.soc > 80) {
-                    sim.bms.temp_c = 250;
-                } else if (sim.bms.soc > 40) {
-                    sim.bms.temp_c = 200;
+                sim.eps.voltage_mv = (uint16_t)(6000 + (sim.eps.soc * 24));
+                if (sim.eps.soc > 80) {
+                    sim.eps.temp_c = 250;
+                } else if (sim.eps.soc > 40) {
+                    sim.eps.temp_c = 200;
                 } else {
-                    sim.bms.temp_c = 150;
+                    sim.eps.temp_c = 150;
                 }
 
                 last_bms_ms = now;
-                send_bms_to_obc();
+                send_eps_to_obc();
             }
 
             if (sim.auto_mode && (now - last_scenario_ms) >= 1000) {
@@ -535,32 +658,71 @@ static void spi_slave_task(void *arg)
         sim_header_t *hdr = (sim_header_t *)rx_buf;
         if (hdr->magic != SIM_MAGIC) continue;
 
+        xSemaphoreTake(sim_state_mutex, portMAX_DELAY);
+
         switch (hdr->cmd) {
-        case SIM_CMD_GET_BMS:
+        case SIM_CMD_SUBSYS_QUERY_AOCS:
             memset(tx_buf, 0, sizeof(tx_buf));
-            memcpy(tx_buf, &sim.bms, sizeof(sim_bms_data_t));
-            ESP_LOGI(TAG, "SPI: BMS request from OBC");
+            memcpy(tx_buf, &sim.aocs, sizeof(sim_aocs_telemetry_t));
+            ESP_LOGI(TAG, "SPI: AOCS query from OBC");
             break;
 
-        case SIM_CMD_GET_ADC_CHANNELS:
+        case SIM_CMD_SUBSYS_QUERY_EPS:
             memset(tx_buf, 0, sizeof(tx_buf));
-            memcpy(tx_buf, &sim.adc, sizeof(sim_adc_data_t));
+            memcpy(tx_buf, &sim.eps, sizeof(sim_eps_telemetry_t));
+            ESP_LOGI(TAG, "SPI: EPS query from OBC");
+            break;
+
+        case SIM_CMD_PAYLOAD_QUERY_CLOUD:
+            memset(tx_buf, 0, sizeof(tx_buf));
+            memcpy(tx_buf, &sim.cloud, sizeof(sim_cloud_data_t));
+            ESP_LOGI(TAG, "SPI: CLOUD query from OBC");
+            break;
+
+        case SIM_CMD_GET_TEMPS:
+            memset(tx_buf, 0, sizeof(tx_buf));
+            memcpy(tx_buf, &sim.temps, sizeof(sim_temp_data_t));
+            ESP_LOGI(TAG, "SPI: TEMPS query from OBC");
+            break;
+
+        case SIM_CMD_GET_POK:
+            memset(tx_buf, 0, sizeof(tx_buf));
+            memcpy(tx_buf, &sim.pok, sizeof(sim_pok_state_t));
+            ESP_LOGI(TAG, "SPI: POK query from OBC");
             break;
 
         case SIM_CMD_NOTIFY_GPIO:
-            ESP_LOGI(TAG, "SPI: GPIO state notification from OBC");
-            if (hdr->len >= sizeof(sim_gpio_state_t)) {
-                sim_gpio_state_t *gpio = (sim_gpio_state_t *)(rx_buf + sizeof(sim_header_t));
+            ESP_LOGI(TAG, "SPI: GPIO notification from OBC");
+            if (hdr->len >= sizeof(sim_payload_gpio_t)) {
+                sim_payload_gpio_t *gpio = (sim_payload_gpio_t *)(rx_buf + sizeof(sim_header_t));
                 ESP_LOGI(TAG, "  CRYSTALS: en=%d heater=%d cam=%d",
                          gpio->crystals_en, gpio->crystals_heater, gpio->crystals_cam_trig);
                 ESP_LOGI(TAG, "  CLEAR: +Z_A=%d +Z_B=%d -Z=%d",
                          gpio->clear_led_fz_a, gpio->clear_led_fz_b, gpio->clear_led_fmz);
+                memcpy(&sim.payload_gpio, gpio, sizeof(sim_payload_gpio_t));
+            }
+            break;
+
+        case SIM_CMD_I2C_GPIO_EXPANDER_RD:
+            memset(tx_buf, 0, sizeof(tx_buf));
+            memcpy(tx_buf, &sim.gpio_exp, sizeof(sim_gpio_expander_t));
+            ESP_LOGI(TAG, "SPI: GPIO expander read from OBC");
+            break;
+
+        case SIM_CMD_I2C_GPIO_EXPANDER_WR:
+            if (hdr->len >= sizeof(sim_gpio_expander_t)) {
+                sim_gpio_expander_t *exp = (sim_gpio_expander_t *)(rx_buf + sizeof(sim_header_t));
+                memcpy(&sim.gpio_exp, exp, sizeof(sim_gpio_expander_t));
+                ESP_LOGI(TAG, "SPI: GPIO expander written from OBC (out=0x%02x dir=0x%02x)",
+                         sim.gpio_exp.outputs, sim.gpio_exp.directions);
             }
             break;
 
         default:
             break;
         }
+
+        xSemaphoreGive(sim_state_mutex);
     }
 }
 
@@ -631,6 +793,7 @@ void app_main(void)
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  JOS Satellite Simulator");
     ESP_LOGI(TAG, "  ESP32-SIM Hardware-in-the-Loop");
+    ESP_LOGI(TAG, "  Per RED_DES_ElectronicArchitecture_V1");
     ESP_LOGI(TAG, "========================================");
 
     sim_state_mutex = xSemaphoreCreateMutex();
