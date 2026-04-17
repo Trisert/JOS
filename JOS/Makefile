@@ -119,9 +119,71 @@ DEPS := $(C_DEPS) $(CXX_DEPS) $(ASM_DEPS)
 ##############################################################################
 # Default target
 ##############################################################################
-.PHONY: all clean flash
+.PHONY: all clean flash sim sim-build sim-flash sim-monitor sim-clean sim-erase
 
 all: $(BUILD_DIR)/$(PROJECT_NAME).elf $(BUILD_DIR)/$(PROJECT_NAME).hex $(BUILD_DIR)/$(PROJECT_NAME).bin
+
+##############################################################################
+# Verification Simulation (dual ESP32)
+##############################################################################
+#
+# Builds and flashes both ESP32 boards for hardware-in-the-loop testing.
+#
+# Usage:
+#   make sim OBC_PORT=COMx SIM_PORT=COMy       build + flash both
+#   make sim-monitor OBC_PORT=COMx SIM_PORT=COMy open two serial monitors
+#   make sim-flash SIM_PORT=COMy                 flash only simulator
+#   make sim-flash OBC_PORT=COMx                 flash only OBC
+#   make sim-clean                                clean both ESP-IDF builds
+#   make sim-erase OBC_PORT=COMx                  erase OBC flash
+#
+# Prerequisites: ESP-IDF v5.x with IDF_PATH set
+#
+##############################################################################
+
+OBC_PORT  ?= COM3
+SIM_PORT  ?= COM4
+OBC_PROJ  := simulation/esp32-obc
+SIM_PROJ  := simulation/esp32-simulator
+
+sim:
+	@echo "=== Building ESP32-OBC ==="
+	(cd $(OBC_PROJ) && idf.py -p $(OBC_PORT) flash)
+	@echo ""
+	@echo "=== Building ESP32-Simulator ==="
+	(cd $(SIM_PROJ) && idf.py -p $(SIM_PORT) flash)
+	@echo ""
+	@echo "=== Both boards flashed. Use 'make sim-monitor' to connect. ==="
+
+sim-build:
+	@echo "=== Building ESP32-OBC ==="
+	(cd $(OBC_PROJ) && idf.py build)
+	@echo ""
+	@echo "=== Building ESP32-Simulator ==="
+	(cd $(SIM_PROJ) && idf.py build)
+
+sim-flash:
+ifndef BOARD
+	$(error Usage: make sim-flash OBC_PORT=COMx or make sim-flash SIM_PORT=COMy)
+endif
+ifeq ($(BOARD),obc)
+	(cd $(OBC_PROJ) && idf.py -p $(OBC_PORT) flash)
+else ifeq ($(BOARD),sim)
+	(cd $(SIM_PROJ) && idf.py -p $(SIM_PORT) flash)
+endif
+
+sim-monitor:
+	@echo "Opening two serial monitors..."
+	@echo "--- ESP32-Simulator (ctrl+] to exit) ---"
+	$(start cmd /c "title SIMULATOR & idf.py -p $(SIM_PORT) monitor")
+	$(start cmd /c "title OBC & idf.py -p $(OBC_PORT) monitor")
+
+sim-clean:
+	$(RM) $(OBC_PROJ)/build
+	$(RM) $(SIM_PROJ)/build
+
+sim-erase:
+	(cd $(OBC_PROJ) && idf.py -p $(OBC_PORT) erase-flash)
 
 ##############################################################################
 # Link

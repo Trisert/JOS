@@ -121,6 +121,28 @@ Length: 128 * N entries
 | Coding Rate | 4/8 |
 | Max Packet | 64 bytes |
 
+### Simulation Testing
+
+Before operating with real hardware, test all commands using the ESP32 verification simulator:
+
+```bash
+make sim OBC_PORT=COM3 SIM_PORT=COM4
+```
+
+On the simulator console:
+```bash
+# Simulate ground station commands
+activate           # Send ACTIVATE_PAYLOAD
+ready               # Send EXIT_STATE
+bms 20 150 3200     # Simulate low battery
+
+# Run automated scenarios
+scenario low_battery
+scenario full_orbit
+```
+
+See [docs/dev/simulation.md](../dev/simulation.md) for details.
+
 ### Transmission Sequence
 
 1. Wait for beacon to confirm satellite health

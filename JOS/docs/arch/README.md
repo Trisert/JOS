@@ -75,22 +75,22 @@ The comprehensive system architecture is documented in the parent directory:
 ## File Structure
 
 ```
-docs/
-├── api/          # Module API references
-│   ├── obsw.md
-│   ├── bms.md
-│   ├── comms.md
-│   ├── memory.md
-│   ├── aocs.md
-│   └── payloads.md
-├── arch/         # This directory
-│   └── README.md # This file
-├── dev/          # Developer guides
-│   ├── building.md
-│   ├── coding_standards.md
-│   └── debugging.md
-└── user/        # User manual (pending)
-```
+JOS/
+├── App/                  # Application layer
+│   ├── obsw/            # State machine, watchdog
+│   ├── bms/             # Battery management
+│   ├── comms/           # LoRa communications
+│   ├── aocs/            # Attitude control
+│   ├── memory/          # FRAM, Flash, cyclic buffer
+│   └── payloads/        # CRYSTALS, CLOUD, CLEAR
+├── Core/                 # STM32CubeMX generated (HAL, startup)
+├── Drivers/              # STM32 HAL + CMSIS
+├── Middlewares/          # FreeRTOS
+├── simulation/           # ESP32 dual-board HIL verification
+│   ├── shared/          # Communication protocol
+│   ├── esp32-obc/       # JOS ported to ESP-IDF
+│   └── esp32-simulator/ # Satellite environment simulator
+└── docs/                 # Documentation
 
 ## Dependencies
 
@@ -100,3 +100,27 @@ docs/
 | RadioLib | LoRa communication |
 | STM32L4 HAL | Hardware abstraction |
 | CMSIS | ARM Cortex-M interface |
+
+## Verification Test Bed
+
+For hardware-in-the-loop verification without real satellite hardware, the OBSW can be ported to ESP32 and tested against a second ESP32 that simulates the satellite environment:
+
+```
+┌──────────────────────┐       SPI + UART       ┌──────────────────────┐
+│    ESP32-OBC         │◄──────────────────────►│   ESP32-Simulator   │
+│  (JOS OBSW ported)   │                        │  (satellite env)     │
+│                      │                        │                      │
+│  - State Machine     │                        │  - BMS/EPS sim       │
+│  - Watchdog          │                        │  - IMU/Mag sim       │
+│  - LoRa comms stub   │                        │  - ADC sensor sim    │
+│  - Payload drivers   │                        │  - Ground station    │
+│  - FreeRTOS tasks    │                        │  - Scenario engine   │
+└──────────────────────┘                        └──────────────────────┘
+```
+
+Build and run with:
+```bash
+make sim OBC_PORT=COM3 SIM_PORT=COM4
+```
+
+See [docs/dev/simulation.md](../dev/simulation.md) for full documentation.

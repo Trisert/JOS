@@ -7,6 +7,7 @@ Welcome to the JOS (RedPill) On-Board Software documentation.
 | For... | Go to |
 |--------|-------|
 | Building the code | [docs/dev/building.md](dev/building.md) |
+| Verification simulation | [docs/dev/simulation.md](dev/simulation.md) |
 | Understanding modules | [docs/api/](api/) |
 | System design | [docs/arch/README.md](arch/README.md) |
 | Operating the satellite | [docs/user/README.md](user/README.md) |
@@ -26,7 +27,8 @@ docs/
 ├── arch/             # Architecture
 │   └── README.md
 ├── dev/              # Developer guides
-│   ├── building.md
+│   ├── building.md   # Build STM32 firmware
+│   ├── simulation.md # ESP32 dual-board HIL verification
 │   ├── coding_standards.md
 │   └── debugging.md
 └── user/            # User manual
@@ -55,6 +57,7 @@ docs/
 
 - **Full Technical Report:** `RedPill_OBSW_Report.md` (in parent directory)
 - **Source Code:** `App/`, `Core/`
+- **Simulation:** `simulation/` (ESP32 dual-board HIL verification)
 
 ## Support
 
@@ -62,3 +65,4 @@ For questions:
 - Check the source code in `App/`
 - Review API docs in `docs/api/`
 - See debugging guide in `docs/dev/debugging.md`
+- See simulation guide in `docs/dev/simulation.md`

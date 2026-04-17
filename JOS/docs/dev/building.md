@@ -5,6 +5,7 @@
 - **ARM Toolchain:** `arm-none-eabi-gcc`
 - **Make:** GNU Make
 - **ST-Link:** For flashing (optional)
+- **ESP-IDF v5.x:** For verification simulation (optional, see [simulation.md](simulation.md))
 
 ## Installing Toolchain
 
@@ -87,3 +88,13 @@ Run from the project root. The Makefile uses relative paths.
 - Check ST-Link driver installation
 - Verify MCU is in bootloader mode (BOOT0 pin)
 - Try: `st-info --probe` to verify connection
+
+## Verification Simulation
+
+For hardware-in-the-loop testing without real satellite hardware, use the dual ESP32 simulation:
+
+```bash
+make sim OBC_PORT=COM3 SIM_PORT=COM4
+```
+
+See [simulation.md](simulation.md) for full documentation.
