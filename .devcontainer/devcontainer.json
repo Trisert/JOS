@@ -1,0 +1,27 @@
+{
+  "name": "JOS - RedPill OBSW (STM32L496VGTx + FreeRTOS)",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
+  "features": {
+    "ghcr.io/devcontainers-contrib/features/nix-flake:1": {}
+  },
+  "postCreateCommand": "nix develop --command echo 'Nix dev shell OK — run: nix develop'",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "jnoortheen.nix-ide",
+        "marus25.cortex-debug"
+      ],
+      "settings": {
+        "nix.enableLanguageServer": true,
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+  "remoteUser": "vscode",
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "4gb"
+  }
+}
