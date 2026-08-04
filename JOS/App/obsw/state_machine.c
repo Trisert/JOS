@@ -45,16 +45,21 @@ void bms_set_soc_stub(uint8_t soc)
     bms_stub.soc = soc;
 }
 
-/* ---------- Stub: LastStates logging ---------- */
+/* ---------- LastStates logging ---------- */
 static void laststates_log(uint8_t from, uint8_t to, uint8_t trigger,
                            const uint8_t *ctx, size_t ctx_len)
 {
-    /* TODO: replace with real Flash write at 0x08080000 */
-    (void)from;
-    (void)to;
-    (void)trigger;
-    (void)ctx;
-    (void)ctx_len;
+    laststates_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.timestamp  = (uint32_t)osKernelGetTickCount();
+    entry.state_from = from;
+    entry.state_to   = to;
+    entry.trigger    = trigger;
+    if (ctx && ctx_len > 0) {
+        size_t n = (ctx_len < sizeof(entry.context)) ? ctx_len : sizeof(entry.context);
+        memcpy(entry.context, ctx, n);
+    }
+    laststates_write(&entry);
 }
 
 /* ---------- Stub: watchdog kick ---------- */

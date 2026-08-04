@@ -116,14 +116,33 @@ void laststates_init(void)
     ls_idx = 0;
 }
 
+/* Write one 64-bit double-word to internal Flash at the given address.
+   Caller must ensure the target sector was erased and FLASH is unlocked. */
+static HAL_StatusTypeDef flash_write_dword(uint32_t addr, uint64_t data)
+{
+    return HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr, data);
+}
+
 static int flash_write_row(uint32_t addr, const uint8_t *data, size_t len)
 {
-    /* STM32L4 Flash programming: unlock, write double-word (8 bytes), lock */
-    /* TODO: implement with HAL_FLASH_Unlock/Program/Lock */
-    (void)addr;
-    (void)data;
-    (void)len;
-    return 0;
+    if (len == 0 || (len % 8U) != 0) return -1;
+    if (addr < LASTSTATES_FLASH_BASE || (addr + len) > LASTSTATES_FLASH_END) return -1;
+
+    HAL_StatusTypeDef rc = HAL_OK;
+    uint32_t off = 0;
+
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+    while (off < len) {
+        uint64_t dw = 0;
+        memcpy(&dw, data + off, 8);
+        rc = flash_write_dword(addr + off, dw);
+        if (rc != HAL_OK) break;
+        off += 8;
+    }
+    HAL_FLASH_Lock();
+
+    return (rc == HAL_OK) ? 0 : -1;
 }
 
 int laststates_write(const laststates_entry_t *entry)
