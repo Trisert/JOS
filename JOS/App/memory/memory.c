@@ -123,6 +123,32 @@ static HAL_StatusTypeDef flash_write_dword(uint32_t addr, uint64_t data)
     return HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr, data);
 }
 
+/* Erase the Flash sector that contains the given LastStates address.
+   STM32L4 internal Flash is erased per sector; a double-word can only be
+   programmed once per bit until the whole sector is erased again. */
+static int flash_erase_sector(uint32_t addr)
+{
+    /* 8 KB sectors in the L4 bank-1 range [0x08000000, 0x080FFFFF] */
+    uint32_t sector = (addr - 0x08000000U) / (8U * 1024U);
+
+    FLASH_EraseInitTypeDef erase_init;
+    uint32_t sector_error = 0U;
+
+    erase_init.TypeErase     = FLASH_TYPEERASE_SECTORS;
+    erase_init.Banks         = FLASH_BANK_1;
+    erase_init.Sector        = sector;
+    erase_init.NbSectors     = 1;
+    erase_init.VoltageRange  = FLASH_VOLTAGE_RANGE_3; /* up to 3.6 V */
+
+    HAL_StatusTypeDef rc = HAL_OK;
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+    rc = HAL_FLASHEx_Erase(&erase_init, &sector_error);
+    HAL_FLASH_Lock();
+
+    return (rc == HAL_OK) ? 0 : -1;
+}
+
 static int flash_write_row(uint32_t addr, const uint8_t *data, size_t len)
 {
     if (len == 0 || (len % 8U) != 0) return -1;
@@ -134,10 +160,12 @@ static int flash_write_row(uint32_t addr, const uint8_t *data, size_t len)
     HAL_FLASH_Unlock();
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
     while (off < len) {
-        uint64_t dw = 0;
-        memcpy(&dw, data + off, 8);
-        rc = flash_write_dword(addr + off, dw);
-        if (rc != HAL_OK) break;
+        uint64_t dword = 0;
+        memcpy(&dword, data + off, 8);
+        rc = flash_write_dword(addr + off, dword);
+        if (rc != HAL_OK) {
+            break;
+        }
         off += 8;
     }
     HAL_FLASH_Lock();
@@ -148,6 +176,16 @@ static int flash_write_row(uint32_t addr, const uint8_t *data, size_t len)
 int laststates_write(const laststates_entry_t *entry)
 {
     if (!entry) return -1;
+
+    /* When the pool is full and we are about to wrap to index 0, the target
+       sector still holds the oldest (now overwritten) entry. STM32L4 Flash
+       must be erased per sector before it can be reprogrammed, so erase the
+       LastStates sector first. */
+    if (ls_idx == 0 && ls_count >= LASTSTATES_MAX_ENTRIES) {
+        if (flash_erase_sector(LASTSTATES_FLASH_BASE) != 0) {
+            return -1;
+        }
+    }
 
     uint32_t addr = LASTSTATES_FLASH_BASE + ls_idx * LASTSTATES_ENTRY_SIZE;
     int rc = flash_write_row(addr, (const uint8_t *)entry, LASTSTATES_ENTRY_SIZE);

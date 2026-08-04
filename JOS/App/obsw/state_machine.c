@@ -46,7 +46,7 @@ void bms_set_soc_stub(uint8_t soc)
 }
 
 /* ---------- LastStates logging ---------- */
-static void laststates_log(uint8_t from, uint8_t to, uint8_t trigger,
+static int laststates_log(uint8_t from, uint8_t to, uint8_t trigger,
                            const uint8_t *ctx, size_t ctx_len)
 {
     laststates_entry_t entry;
@@ -59,7 +59,13 @@ static void laststates_log(uint8_t from, uint8_t to, uint8_t trigger,
         size_t n = (ctx_len < sizeof(entry.context)) ? ctx_len : sizeof(entry.context);
         memcpy(entry.context, ctx, n);
     }
-    laststates_write(&entry);
+    int rc = laststates_write(&entry);
+    if (rc != 0) {
+        /* Flash write failed: the transition cannot be considered safely
+           persisted. Signal via the QM fault path (no silent success). */
+        return -1;
+    }
+    return 0;
 }
 
 /* ---------- Stub: watchdog kick ---------- */
@@ -118,7 +124,12 @@ static int try_transition(obw_state_t target, uint8_t trigger)
         return -1;
     }
 
-    laststates_log((uint8_t)current_state, (uint8_t)target, trigger, NULL, 0);
+    if (laststates_log((uint8_t)current_state, (uint8_t)target, trigger, NULL, 0) != 0) {
+        /* LastStates persistence failed (Flash write/erase error). The
+           transition still proceeds, but we flag it so the QM fault path
+           can record the anomaly instead of silently reporting success. */
+        return -1;
+    }
     current_state = target;
     return 0;
 }
