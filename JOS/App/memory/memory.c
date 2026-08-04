@@ -1,6 +1,7 @@
 #include "memory.h"
 #include "main.h"
 #include <string.h>
+#include <stdint.h>
 
 /* ========== FRAM driver (I2C) ========== */
 /* Per RED_DES_ElectronicArchitecture_V1:
@@ -123,27 +124,28 @@ static HAL_StatusTypeDef flash_write_dword(uint32_t addr, uint64_t data)
     return HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr, data);
 }
 
-/* Erase the Flash sector that contains the given LastStates address.
-   STM32L4 internal Flash is erased per sector; a double-word can only be
-   programmed once per bit until the whole sector is erased again. */
-static int flash_erase_sector(uint32_t addr)
+/* Erase the Flash pages that contain the LastStates pool.
+   STM32L4 internal Flash is erased per 2 KB page (not per sector). A
+   double-word can only be programmed once per bit until the page is erased
+   again, so the pool (8 KB = 4 pages) must be erased before reuse. */
+static int flash_erase_pool(void)
 {
-    /* 8 KB sectors in the L4 bank-1 range [0x08000000, 0x080FFFFF] */
-    uint32_t sector = (addr - 0x08000000U) / (8U * 1024U);
+    /* STM32L4 bank-1 pages are 2 KB; LastStates pool is 8 KB @ 0x08080000. */
+    uint32_t first_page = (LASTSTATES_FLASH_BASE - 0x08000000U) / (2U * 1024U);
+    uint32_t page_count  = LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE / (2U * 1024U);
 
     FLASH_EraseInitTypeDef erase_init;
-    uint32_t sector_error = 0U;
+    uint32_t page_error = 0U;
 
-    erase_init.TypeErase     = FLASH_TYPEERASE_SECTORS;
-    erase_init.Banks         = FLASH_BANK_1;
-    erase_init.Sector        = sector;
-    erase_init.NbSectors     = 1;
-    erase_init.VoltageRange  = FLASH_VOLTAGE_RANGE_3; /* up to 3.6 V */
+    erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
+    erase_init.Banks     = FLASH_BANK_1;
+    erase_init.Page      = first_page;
+    erase_init.NbPages   = page_count;
 
     HAL_StatusTypeDef rc = HAL_OK;
     HAL_FLASH_Unlock();
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
-    rc = HAL_FLASHEx_Erase(&erase_init, &sector_error);
+    rc = HAL_FLASHEx_Erase(&erase_init, &page_error);
     HAL_FLASH_Lock();
 
     return (rc == HAL_OK) ? 0 : -1;
@@ -182,7 +184,7 @@ int laststates_write(const laststates_entry_t *entry)
        must be erased per sector before it can be reprogrammed, so erase the
        LastStates sector first. */
     if (ls_idx == 0 && ls_count >= LASTSTATES_MAX_ENTRIES) {
-        if (flash_erase_sector(LASTSTATES_FLASH_BASE) != 0) {
+        if (flash_erase_pool() != 0) {
             return -1;
         }
     }

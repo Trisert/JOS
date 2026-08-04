@@ -2,6 +2,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
+#include <string.h>
 
 /* ---------- Private variables ---------- */
 static obw_state_t current_state = STATE_OFF;
