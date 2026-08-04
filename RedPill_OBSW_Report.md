@@ -72,7 +72,7 @@ The OBC is developed entirely in-house. Key parameters:
 | Analog Inputs | 30 |
 | IMU | Integrated (ASM330LHHXTR — gyros + accelerometers) |
 | Internal Flash | 1024 KB |
-| Internal RAM | 128 KB |
+| Internal RAM | 256 KB |
 | External Memory | 4 MB FRAM |
 | Hardware Watchdog | Yes |
 | Communication Bus | SPI (to TT&C, CLOUD, EPS, CLEAR) |
@@ -121,7 +121,7 @@ The OBSW uses a ring-buffer approach for all persistent memory writes, assuming 
 
 - **External FRAM (4 MB):** Primary payload data sink. Overwrites oldest data first.
 - **Internal Flash (1024 KB):** Hosts the OBSW binary, LastStates pool (8 KB), beacon buffers, and ACK buffers. Non-critical data may be discarded on overflow; the OBSW image and LastStates pool are always preserved.
-- **Internal RAM (128 KB):** Runtime stack, heap, and FreeRTOS kernel structures. Not persistent across resets.
+- **Internal RAM (256 KB):** Runtime stack, heap, and FreeRTOS kernel structures. Not persistent across resets.
 
 > **Memory overflow policy:** Graceful degradation — oldest data overwritten; no system fault triggered.
 
@@ -172,7 +172,7 @@ Four SoC thresholds (provided by the BQ27441 Gas Gauge via the EPS STM32L1) gove
 | Memory Region | Capacity | Allocated Contents |
 |---|---|---|
 | Flash (STM32L4 internal) | 1024 KB | OBSW binary; LastStates pool (8 KB); beacon buffers; ACK buffers |
-| RAM (STM32L4 internal) | 128 KB | FreeRTOS kernel; task stacks; heap; runtime variables |
+| RAM (STM32L4 internal) | 256 KB | FreeRTOS kernel; task stacks; heap; runtime variables |
 | External FRAM | 4 MB | All payload data (camera, CLOUD, CLEAR photodiodes, IMU, temperature); system logging |
 
 ### 5.2 Data Production Rates
@@ -590,7 +590,7 @@ make -C STM32CubeIDE/Debug all 2>&1 | tail -5
 
 # Budget validation:
 # text + data  must be < 1,048,576  (1 MB Flash)
-# bss  + data  must be < 131,072    (128 KB RAM)
+# bss  + data  must be < 131,072    (256 KB RAM)
 ```
 
 #### 15.1.8 Initialise Git and Add .gitignore
@@ -669,7 +669,7 @@ The most important step before starting any Claude Code session. Claude Code rea
 ## Target Hardware
 - MCU: STM32L4 (ARM Cortex-M4, 80 MHz)
 - Flash: 1024 KB internal + 4 MB external FRAM (SPI2)
-- RAM: 128 KB internal
+- RAM: 256 KB internal
 - RTOS: FreeRTOS (latest stable, CMSIS_V2 interface, CubeIDE integration)
 
 ## Coding Rules
