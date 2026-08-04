@@ -448,6 +448,9 @@ Development of EGSE and GS software proceeds in parallel with flight software. B
 | Camera payload COTS | COTS (ArduCam B0068) | Only COTS software component |
 | CRYSTALS voltage calibration | TBC (3 V nominal) | In-orbit validation required |
 | AOCS residual dipole measurement | Pending | To be measured during actuator manufacturing |
+| LastStates Flash write | In progress | `laststates_write` implemented (HAL_FLASH double-word); state-machine logging hook wired in `state_machine.c`. Verified with OBSW integration build; persistent across reset once sector is pre-erased. |
+| TC/TM CRC + decryption | Partial | `comms_dispatch_command` routes RESET/EXIT_STATE/ACTIVATE_PAYLOAD/SET_BEACON_INTERVAL; SET_CONFIG/SEND_DATA and RX CRC/decrypt still stubs pending RadioLib+HAL integration. |
+| Comms / BMS integration | To integrate | LoRa (RadioLib) and EPS SPI drivers stubbed; flight-ready at QM subject to integration gate (see QM TSTP Annex A). |
 
 ---
 
