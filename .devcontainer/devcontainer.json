@@ -1,17 +1,15 @@
 {
   "name": "JOS - RedPill OBSW (STM32L496VGTx + FreeRTOS)",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
-  "postCreateCommand": "sudo bash -c 'apt-get update -qq && apt-get install -y -qq curl ca-certificates openssh-server && service ssh start && curl -fsSL https://tailscale.com/install.sh | sh && tailscale up --authkey=\"$TS_AUTH\" --hostname=\"jos-codespace\"' && sh -c 'curl -L https://nixos.org/nix/install | sh -s -- --no-daemon' && . \"$HOME/.nix-profile/etc/profile.d/nix.sh\" && nix develop --command echo 'Nix dev shell OK — run: nix develop'",
+  "postCreateCommand": "sudo bash -c 'apt-get update -qq && apt-get install -y -qq curl ca-certificates openssh-server gcc-arm-none-eabi libnewlib-arm-none-eabi && service ssh start && curl -fsSL https://tailscale.com/install.sh | sh && tailscale up --authkey=\"$TS_AUTH\" --hostname=\"jos-codespace\"' && echo 'Toolchain ready: run make all in JOS/'",
   "customizations": {
     "vscode": {
       "extensions": [
         "ms-vscode.cpptools",
         "ms-vscode.cmake-tools",
-        "jnoortheen.nix-ide",
         "marus25.cortex-debug"
       ],
       "settings": {
-        "nix.enableLanguageServer": true,
         "terminal.integrated.defaultProfile.linux": "bash"
       }
     }
