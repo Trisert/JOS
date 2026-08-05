@@ -3,12 +3,15 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "cmsis_os2.h"
 
 /* Initialise LoRa transceiver (SX1268 on SPI1) */
 int lora_init(void);
 
 /* Beacon TX task — sends beacon at state-dependent interval */
 void lora_beacon_task(void *arg);
+osThreadId_t lora_beacon_task_create(void);
+osThreadId_t lora_rx_task_create(void);
 
 /* RX task — continuous uplink listening, command dispatch */
 void lora_rx_task(void *arg);
