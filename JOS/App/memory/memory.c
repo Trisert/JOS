@@ -1,6 +1,7 @@
 #include "memory.h"
 #include "main.h"
 #include <string.h>
+#include <stdint.h>
 
 /* ========== FRAM driver (I2C) ========== */
 /* Per RED_DES_ElectronicArchitecture_V1:
@@ -116,19 +117,77 @@ void laststates_init(void)
     ls_idx = 0;
 }
 
+/* Write one 64-bit double-word to internal Flash at the given address.
+   Caller must ensure the target sector was erased and FLASH is unlocked. */
+static HAL_StatusTypeDef flash_write_dword(uint32_t addr, uint64_t data)
+{
+    return HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr, data);
+}
+
+/* Erase the Flash pages that contain the LastStates pool.
+   STM32L4 internal Flash is erased per 2 KB page (not per sector). A
+   double-word can only be programmed once per bit until the page is erased
+   again, so the pool (8 KB = 4 pages) must be erased before reuse. */
+static int flash_erase_pool(void)
+{
+    /* STM32L4 bank-1 pages are 2 KB; LastStates pool is 8 KB @ 0x08080000. */
+    uint32_t first_page = (LASTSTATES_FLASH_BASE - 0x08000000U) / (2U * 1024U);
+    uint32_t page_count  = LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE / (2U * 1024U);
+
+    FLASH_EraseInitTypeDef erase_init;
+    uint32_t page_error = 0U;
+
+    erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
+    erase_init.Banks     = FLASH_BANK_1;
+    erase_init.Page      = first_page;
+    erase_init.NbPages   = page_count;
+
+    HAL_StatusTypeDef rc = HAL_OK;
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+    rc = HAL_FLASHEx_Erase(&erase_init, &page_error);
+    HAL_FLASH_Lock();
+
+    return (rc == HAL_OK) ? 0 : -1;
+}
+
 static int flash_write_row(uint32_t addr, const uint8_t *data, size_t len)
 {
-    /* STM32L4 Flash programming: unlock, write double-word (8 bytes), lock */
-    /* TODO: implement with HAL_FLASH_Unlock/Program/Lock */
-    (void)addr;
-    (void)data;
-    (void)len;
-    return 0;
+    if (len == 0 || (len % 8U) != 0) return -1;
+    if (addr < LASTSTATES_FLASH_BASE || (addr + len) > LASTSTATES_FLASH_END) return -1;
+
+    HAL_StatusTypeDef rc = HAL_OK;
+    uint32_t off = 0;
+
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+    while (off < len) {
+        uint64_t dword = 0;
+        memcpy(&dword, data + off, 8);
+        rc = flash_write_dword(addr + off, dword);
+        if (rc != HAL_OK) {
+            break;
+        }
+        off += 8;
+    }
+    HAL_FLASH_Lock();
+
+    return (rc == HAL_OK) ? 0 : -1;
 }
 
 int laststates_write(const laststates_entry_t *entry)
 {
     if (!entry) return -1;
+
+    /* When the pool is full and we are about to wrap to index 0, the target
+       sector still holds the oldest (now overwritten) entry. STM32L4 Flash
+       must be erased per sector before it can be reprogrammed, so erase the
+       LastStates sector first. */
+    if (ls_idx == 0 && ls_count >= LASTSTATES_MAX_ENTRIES) {
+        if (flash_erase_pool() != 0) {
+            return -1;
+        }
+    }
 
     uint32_t addr = LASTSTATES_FLASH_BASE + ls_idx * LASTSTATES_ENTRY_SIZE;
     int rc = flash_write_row(addr, (const uint8_t *)entry, LASTSTATES_ENTRY_SIZE);
