@@ -1,4 +1,5 @@
 #include "aocs.h"
+#include "watchdog.h"
 #include "cmsis_os.h"
 
 /* Per RED_DES_ElectronicArchitecture_V1:
@@ -20,7 +21,26 @@ void aocs_task(void *arg)
     (void)arg;
 
     for (;;) {
+        watchdog_alive_self();
         /* TODO: poll AOCS MCU via subsystem SPI for attitude data */
         osDelay(pdMS_TO_TICKS(20));
     }
+}
+
+osThreadId_t aocs_task_create(void)
+{
+    static const osThreadAttr_t attrs = {
+        .name       = "aocs",
+        .stack_size = 256 * 4,
+        .priority   = osPriorityNormal,
+    };
+
+    /* Not started from main() yet: the subsystem SPI link to the AOCS MCU is
+       still a stub. Kept here so the task is watchdog-monitored the moment it
+       is enabled (docs/dev/hardening.md §3.1). */
+    osThreadId_t handle = osThreadNew(aocs_task, NULL, &attrs);
+    if (handle != NULL) {
+        (void)watchdog_register_task(handle, WDG_PERIOD_AOCS_MS);
+    }
+    return handle;
 }
