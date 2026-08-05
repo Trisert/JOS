@@ -1,110 +1,82 @@
-# Building the Project
+# Building the RedPill OBSW
+
+This guide covers how to compile and link the RedPill (JOS) on-board software
+for the STM32L496VGTx target.
 
 ## Prerequisites
 
-- **ARM Toolchain:** `arm-none-eabi-gcc`
-- **Make:** GNU Make
-- **ST-Link:** For flashing (optional)
-- **ESP-IDF v5.x:** For verification simulation (optional, see [simulation.md](simulation.md))
+| Tool | Version | Notes |
+|------|---------|-------|
+| ARM GCC toolchain | `gcc-arm-none-eabi` ≥ 10 (CI uses 10.3; build container uses 15.2) | `arm-none-eabi-gcc`, `arm-none-eabi-ld`, `arm-none-eabi-size`, `arm-none-eabi-objcopy` |
+| GNU Make | any 4.x | drives the `Makefile` at `JOS/` root |
+| Git | any | for source checkout |
 
-## Installing Toolchain
+> **Warning — toolchain strictness:** GCC 15 treats implicit-function-declaration
+> as a hard error; GCC 10 only warns. A build that is green on CI (GCC 10) may
+> fail locally on GCC 15. Keep prototypes declared (see `App/comms/comms.h`).
 
-### Windows (via ARM toolchain installer)
-1. Download ARM GNU toolchain from [ARM Developer Website](https://developer.arm.com/tools-and-software/open-source-software/developer-tools/gnu-toolchain/gnu-rm)
-2. Install and add to PATH: `C:\Program Files (x86)\Arm\gnu-arm-eabi\bin`
+## Build (canonical — NixOS container + CI)
 
-### Linux (Debian/Ubuntu)
-```bash
-sudo apt-get install gcc-arm-none-eabi
-```
-
-### macOS
-```bash
-brew install --cask gcc-arm-embedded
-```
-
-## Building
-
-From the project root:
+The reference build environment is a dedicated NixOS container (`josbuilder`)
+with the ARM toolchain installed, reachable from the dev machine over Tailscale.
+This isolates the build from the desktop and matches CI exactly.
 
 ```bash
-make
+# On the dev machine (Pi / laptop), hop into the container:
+ssh -A nicola@nixos "ssh -A root@10.250.0.2"
+cd /srv/josbuilder/JOS/JOS
+make all
 ```
 
-This produces:
-- `build/JOS.elf` - ELF binary
-- `build/JOS.hex` - Intel HEX format
-- `build/JOS.bin` - Raw binary for flashing
-- `build/JOS.map` - Memory map
-- `build/JOS.list` - Disassembly listing
+Artifacts land in `JOS/build/`:
 
-## Cleaning
+| File | Purpose |
+|------|---------|
+| `JOS.elf` | Linked executable (for GDB / `arm-none-eabi-size`) |
+| `JOS.bin` | Raw binary for flashing |
+| `JOS.hex` | Intel HEX for flashing |
+| `JOS.map` | Linker map (for memory analysis) |
+
+Verify size budget:
 
 ```bash
-make clean
+arm-none-eabi-size build/JOS.elf
+# text + data  must be < 1,048,576  (1 MB Flash, 512K reserved for firmware)
+# bss  + data  must be <   327,680  (320 KB SRAM)
 ```
+
+## Build (local — any Linux/macOS with the toolchain)
+
+```bash
+cd JOS
+make all
+arm-none-eabi-size build/JOS.elf
+```
+
+## Build (CI — GitHub Actions)
+
+Pushing to `main` or opening a PR triggers `.github/workflows/build.yml`,
+which installs `gcc-arm-none-eabi` + `libnewlib-arm-none-eabi` on
+`ubuntu-latest` and runs `make all` in `JOS/`. Artifacts (`JOS.elf/.bin/.hex`)
+are uploaded on success. This is the authoritative build gate.
+
+## Build (alternative — STM32CubeIDE)
+
+CubeIDE can also build the project: it bundles the same ARM GCC and drives the
+generated `Makefile`. Open the `.ioc` in CubeIDE, **Generate Code**, then build
+the Debug configuration. The command-line equivalent (if CubeIDE generated a
+`STM32CubeIDE/Debug` tree) is `make -C STM32CubeIDE/Debug all`.
+
+> CubeIDE is **optional** — the canonical path above (container / local `make
+> all` / CI) does not require it. Keep CubeIDE only if you prefer the IDE
+> workflow or need the RTOS Viewer debugger panel.
 
 ## Flashing
 
-### Using ST-Link (STMicroelectronics)
 ```bash
-make flash
+# Via OpenOCD + ST-LINK (requires the toolchain + openocd):
+make -C JOS flash        # if a flash target exists; otherwise use STM32CubeIDE / STM32CubeProgrammer
 ```
 
-This runs:
-```bash
-st-flash write build/JOS.bin 0x08000000
-```
-
-### Using OpenOCD
-```bash
-openocd -f interface/stlink.cfg -f target/stm32l4x.cfg -c "program build/JOS.elf verify reset exit"
-```
-
-## Build Options
-
-### Debug Build (default)
-```bash
-make CFLAGS="-DDEBUG"  # adds -g3 -O0
-```
-
-### Release Build
-```bash
-make CFLAGS="-DRELEASE"  # adds -Os
-```
-
-## Troubleshooting
-
-### "arm-none-eabi-gcc: command not found"
-Ensure the ARM toolchain is in your PATH.
-
-### "No rule to make target"
-Ensure you're in the project root directory (where Makefile is located).
-
-### Build errors about missing headers
-Run from the project root. The Makefile uses relative paths.
-
-### Flash errors
-- Check ST-Link driver installation
-- Verify MCU is in bootloader mode (BOOT0 pin)
-- Try: `st-info --probe` to verify connection
-
-## Verification Simulation
-
-For hardware-in-the-loop testing without real satellite hardware, use the dual ESP32 simulation:
-
-```bash
-make sim OBC_PORT=COM3 SIM_PORT=COM4
-```
-
-### Building in STM32CubeIDE
-
-The STM32 firmware and the ESP32 simulator projects can both be managed from CubeIDE:
-
-1. **STM32 project:** `File` → `Open Projects from File System` → select the JOS root directory. The `.project` and `.cproject` files will be detected automatically.
-
-2. **ESP32 simulator:** `File` → `Open Projects from File System` → select `simulation/esp32-simulator/`. Requires ESP-IDF tools installed (see [simulation.md](simulation.md) for setup).
-
-3. **Build all:** Use the hammer icon on each project, or register `make sim` as an external tool (`Run` → `External Tools Configurations`).
-
-See [simulation.md](simulation.md) for full documentation including CubeIDE-specific instructions.
+The LastStates pool is reserved at `0x08080000` (8 KB) — never overwrite it
+with the application image (see `JOS/STM32L496VGTX_FLASH.ld`).
