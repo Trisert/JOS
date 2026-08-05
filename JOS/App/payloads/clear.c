@@ -1,5 +1,6 @@
 #include "clear.h"
 #include "memory.h"
+#include "watchdog.h"
 #include "main.h"
 #include "stm32l4xx_hal.h"
 #include "FreeRTOS.h"
@@ -128,6 +129,8 @@ static void clear_task(void *arg)
     (void)arg;
 
     for (;;) {
+        watchdog_alive_self();
+
         if (status.burst_active && burst_idx < CLEAR_BURST_MAX) {
             burst_buf[burst_idx].timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
             burst_buf[burst_idx].pd_fz_mv   = clear_read_pd(CLEAR_FACE_Z);
@@ -151,5 +154,9 @@ osThreadId_t clear_task_create(void)
         .stack_size = 256 * 4,
         .priority   = osPriorityBelowNormal,
     };
-    return osThreadNew(clear_task, NULL, &attrs);
+    osThreadId_t handle = osThreadNew(clear_task, NULL, &attrs);
+    if (handle != NULL) {
+        (void)watchdog_register_task(handle, WDG_PERIOD_CLEAR_MS);
+    }
+    return handle;
 }

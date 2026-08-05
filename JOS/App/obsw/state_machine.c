@@ -1,7 +1,9 @@
 #include "state_machine.h"
+#include "watchdog.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
+#include "memory.h"
 #include <string.h>
 
 /* ---------- Private variables ---------- */
@@ -170,6 +172,7 @@ static void state_machine_task(void *arg)
     /* 10 Hz main loop */
     for (;;) {
         watchdog_kick();
+        watchdog_alive_self();
 
         osMutexAcquire(state_mutex, osWaitForever);
         check_battery_autonomous();
@@ -194,6 +197,9 @@ void state_machine_init(void)
 osThreadId_t state_machine_task_create(void)
 {
     sm_task_handle = osThreadNew(state_machine_task, NULL, &sm_task_attrs);
+    if (sm_task_handle != NULL) {
+        (void)watchdog_register_task(sm_task_handle, WDG_PERIOD_STATE_MACHINE_MS);
+    }
     return sm_task_handle;
 }
 

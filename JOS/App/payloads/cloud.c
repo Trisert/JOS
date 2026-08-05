@@ -1,6 +1,7 @@
 #include "cloud.h"
 #include "memory.h"
 #include "state_machine.h"
+#include "watchdog.h"
 #include "MAX11128.h"
 #include "main.h"
 #include "FreeRTOS.h"
@@ -114,6 +115,8 @@ static void cloud_task(void *arg)
     cloud_sample_t sample;
 
     for (;;) {
+        watchdog_alive_self();
+
         /* Only acquire when in ACTIVE state */
         if (state_machine_get_state() == STATE_ACTIVE) {
             cloud_acquire(&sample);
@@ -131,5 +134,9 @@ osThreadId_t cloud_task_create(void)
         .stack_size = 256 * 4,
         .priority   = osPriorityBelowNormal,
     };
-    return osThreadNew(cloud_task, NULL, &attrs);
+    osThreadId_t handle = osThreadNew(cloud_task, NULL, &attrs);
+    if (handle != NULL) {
+        (void)watchdog_register_task(handle, WDG_PERIOD_CLOUD_MS);
+    }
+    return handle;
 }

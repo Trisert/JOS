@@ -31,7 +31,22 @@ void watchdog_monitor_init(void)
 
 int watchdog_register_task(osThreadId_t handle, uint32_t expected_period_ms)
 {
+    if ((wdg_mutex == NULL) || (handle == NULL) || (expected_period_ms == 0u)) {
+        /* Not initialised yet, or nonsense arguments: refuse rather than
+           silently pretend the task is monitored. */
+        return -1;
+    }
+
     osMutexAcquire(wdg_mutex, osWaitForever);
+    for (int i = 0; i < WDG_MAX_TASKS; i++) {
+        if (wdg_tasks[i].registered && wdg_tasks[i].handle == handle) {
+            /* Already registered (e.g. task re-created): refresh in place. */
+            wdg_tasks[i].expected_period_ms = expected_period_ms;
+            wdg_tasks[i].last_tick          = xTaskGetTickCount();
+            osMutexRelease(wdg_mutex);
+            return 0;
+        }
+    }
     for (int i = 0; i < WDG_MAX_TASKS; i++) {
         if (!wdg_tasks[i].registered) {
             wdg_tasks[i].handle            = handle;
@@ -48,6 +63,10 @@ int watchdog_register_task(osThreadId_t handle, uint32_t expected_period_ms)
 
 void watchdog_alive(osThreadId_t handle)
 {
+    if ((wdg_mutex == NULL) || (handle == NULL)) {
+        return;
+    }
+
     osMutexAcquire(wdg_mutex, osWaitForever);
     for (int i = 0; i < WDG_MAX_TASKS; i++) {
         if (wdg_tasks[i].registered && wdg_tasks[i].handle == handle) {
@@ -56,6 +75,11 @@ void watchdog_alive(osThreadId_t handle)
         }
     }
     osMutexRelease(wdg_mutex);
+}
+
+void watchdog_alive_self(void)
+{
+    watchdog_alive(osThreadGetId());
 }
 
 /* ---------- Monitor task ---------- */
