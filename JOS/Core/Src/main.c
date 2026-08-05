@@ -27,6 +27,7 @@
 #include "bms.h"
 #include "memory.h"
 #include "comms.h"
+#include "faults.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -122,6 +123,9 @@ int main(void)
   MX_SPI2_Init();
   MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
+  /* Enable fault containment first: a fault taken during the remaining
+     init sequence must reset the OBSW instead of hanging in a stub. */
+  fault_handlers_init();
   bms_init();
   fram_init();
   cyclic_buffer_init();

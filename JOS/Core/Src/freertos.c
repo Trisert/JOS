@@ -24,7 +24,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "faults.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -78,6 +78,15 @@ void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
    /* Run time stack overflow checking is performed if
    configCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2. This hook function is
    called if a stack overflow is detected. */
+   (void)xTask;
+
+   /* Fault containment (NASA-STD-8739.8): by the time this hook runs the
+      offending task has already written past its stack, so the surrounding
+      memory can no longer be trusted. Record which task overflowed in the
+      LastStates pool and reboot into a known-good state - this call does not
+      return. Interrupts are deliberately left enabled so that the HAL Flash
+      driver's tick-based timeouts still work while the record is written. */
+   fault_log_stack_overflow((const char *)pcTaskName);
 }
 /* USER CODE END 4 */
 
