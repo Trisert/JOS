@@ -1,5 +1,6 @@
 #include "comms.h"
 #include "state_machine.h"
+#include "watchdog.h"
 #include "cmsis_os.h"
 #include "main.h"
 #include <string.h>
@@ -78,6 +79,7 @@ void lora_beacon_task(void *arg)
 
     for (;;) {
         uint32_t interval = state_machine_get_beacon_interval();
+        watchdog_alive_self();
         /* TODO: build beacon packet (96 B telemetry + 32 B sys) */
         /* TODO: lora_tx(beacon_buf, BEACON_SIZE); */
 
@@ -87,7 +89,12 @@ void lora_beacon_task(void *arg)
 
 osThreadId_t lora_beacon_task_create(void)
 {
-    return osThreadNew(lora_beacon_task, NULL, &beacon_attrs);
+    osThreadId_t handle = osThreadNew(lora_beacon_task, NULL, &beacon_attrs);
+    if (handle != NULL) {
+        /* Beacon cadence is state-dependent; register the slowest (CRIT). */
+        (void)watchdog_register_task(handle, WDG_PERIOD_LORA_BEACON_MS);
+    }
+    return handle;
 }
 
 /* ---------- RX task ---------- */
@@ -103,6 +110,7 @@ void lora_rx_task(void *arg)
     (void)arg;
 
     for (;;) {
+        watchdog_alive_self();
         /* TODO: enter RX mode, wait for interrupt, decode packet */
         /* TODO: CRC check → decrypt → dispatch command */
         osDelay(pdMS_TO_TICKS(100));
@@ -111,5 +119,9 @@ void lora_rx_task(void *arg)
 
 osThreadId_t lora_rx_task_create(void)
 {
-    return osThreadNew(lora_rx_task, NULL, &rx_attrs);
+    osThreadId_t handle = osThreadNew(lora_rx_task, NULL, &rx_attrs);
+    if (handle != NULL) {
+        (void)watchdog_register_task(handle, WDG_PERIOD_LORA_RX_MS);
+    }
+    return handle;
 }

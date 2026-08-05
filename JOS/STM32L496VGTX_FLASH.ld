@@ -39,6 +39,10 @@ ENTRY(Reset_Handler)
 /* Highest address of the user mode stack */
 _estack = ORIGIN(RAM) + LENGTH(RAM); /* end of "RAM" Ram type memory */
 
+/* Start of the firmware image, i.e. first byte covered by the boot CRC32
+   (see App/obsw/boot_crc.c). */
+__fw_image_start = ORIGIN(FLASH);
+
 _Min_Heap_Size = 0x200; /* required amount of heap */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
@@ -151,6 +155,20 @@ SECTIONS
     _edata = .;        /* define a global symbol at data end */
 
   } >RAM AT> FLASH
+
+  /* Firmware image CRC32 — MUST stay the last loaded section so that the
+     checked region is exactly [__fw_image_start, __fw_crc_start) and the
+     stored CRC word is the last 4 bytes of the .bin image.
+     Contents are the placeholder 0xFFFFFFFF until tools/fw_crc_stamp.py
+     patches the built binary. */
+  .fw_crc :
+  {
+    . = ALIGN(4);
+    __fw_crc_start = .;
+    KEEP(*(.fw_crc))
+    . = ALIGN(4);
+    __fw_crc_end = .;
+  } >FLASH
 
   /* Uninitialized data section into "RAM" Ram type memory */
   . = ALIGN(4);
