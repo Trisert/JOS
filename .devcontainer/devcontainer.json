@@ -4,7 +4,7 @@
   "features": {
     "ghcr.io/devcontainers-contrib/features/nix-flake:1": {}
   },
-  "postCreateCommand": "nix develop --command echo 'Nix dev shell OK — run: nix develop'",
+  "postCreateCommand": "sudo bash -c 'apt-get update -qq && apt-get install -y -qq curl openssh-server && service ssh start && curl -fsSL https://tailscale.com/install.sh | sh && tailscale up --authkey=\"$TS_AUTH\" --hostname=\"jos-codespace\"' && nix develop --command echo 'Nix dev shell OK — run: nix develop'",
   "customizations": {
     "vscode": {
       "extensions": [
@@ -23,5 +23,9 @@
   "hostRequirements": {
     "cpus": 2,
     "memory": "4gb"
+  },
+  "forwardPorts": [22],
+  "containerEnv": {
+    "TS_AUTH": "${TS_AUTH}"
   }
 }
