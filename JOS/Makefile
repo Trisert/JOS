@@ -62,11 +62,39 @@ CXX_DEFS := -DDEBUG -DUSE_HAL_DRIVER -DSTM32L496xx -DRADIOLIB_STATIC_ONLY=1
 ASM_DEFS := -DDEBUG
 
 ##############################################################################
+# Warning / hardening flags (shared by C and C++)
+##############################################################################
+#
+# -Wall -Wextra          : broad diagnostic coverage (NASA Power of Ten rule 10,
+#                          JPL-182, ECSS-E-ST-40C: compile at max warning level).
+# -Werror=implicit-function-declaration
+#                        : REQUIRED-ERROR. GCC >= 14 rejects implicit
+#                          declarations outright while GCC 10 (the Ubuntu CI
+#                          toolchain) only warns, so CI could stay green on code
+#                          that does not build with a modern toolchain. This
+#                          caught a real defect (see PR #5), hence it is
+#                          promoted explicitly on every toolchain.
+# -Wdouble-promotion     : flags accidental float -> double promotion. The
+#                          Cortex-M4F FPU is single precision only; every
+#                          promotion drops into slow soft-float libgcc code.
+#
+# -Werror is intentionally NOT enabled globally: the vendored third-party trees
+# (STM32 HAL, FreeRTOS, RadioLib) emit warnings we neither own nor want to
+# patch, and turning those into hard errors would block the build for reasons
+# unrelated to flight-software quality.
+#
+WARNFLAGS   := -Wall -Wextra -Wdouble-promotion
+
+# C-only: C++ has no implicit function declarations, and cc1plus rejects the
+# option with "'-Werror=' argument ... is not valid for C++" on every C++ TU.
+C_WARNFLAGS := $(WARNFLAGS) -Werror=implicit-function-declaration
+
+##############################################################################
 # C Flags
 ##############################################################################
 CFLAGS  := $(MCU) $(C_DEFS)
 CFLAGS += -std=gnu11 -g3 -O0
-CFLAGS += -Wall -ffunction-sections -fdata-sections
+CFLAGS += $(C_WARNFLAGS) -ffunction-sections -fdata-sections
 CFLAGS += $(INCLUDES)
 
 ##############################################################################
@@ -74,7 +102,7 @@ CFLAGS += $(INCLUDES)
 ##############################################################################
 CXXFLAGS  := $(MCU) $(CXX_DEFS)
 CXXFLAGS += -std=gnu++14 -g3 -O0
-CXXFLAGS += -Wall -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti
+CXXFLAGS += $(WARNFLAGS) -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti
 CXXFLAGS += $(INCLUDES)
 
 ##############################################################################

@@ -13,13 +13,53 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ARM GCC toolchain
+      - name: Install ARM GCC toolchain and cppcheck
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-none-eabi \
             libnewlib-arm-none-eabi \
-            libstdc++-arm-none-eabi-newlib
+            libstdc++-arm-none-eabi-newlib \
+            cppcheck
+
+      # Static analysis gate. Scope: first-party code only (JOS/App + the
+      # hand-written CubeMX Core sources). Vendored trees (RadioLib, STM32 HAL,
+      # FreeRTOS, the ST asm330lhh register driver) and the generated newlib
+      # syscall stubs are excluded: we do not own that code, and its findings
+      # would make the gate permanently red instead of actionable.
+      - name: Static analysis (cppcheck)
+        run: |
+          cppcheck --version
+          cppcheck --enable=all --std=c11 --error-exitcode=1 \
+            --inline-suppr \
+            --suppress=missingIncludeSystem \
+            --suppress=missingInclude \
+            --suppress=unusedFunction \
+            --suppress=checkersReport \
+            --suppress=unmatchedSuppression \
+            --suppress=toomanyconfigs \
+            --suppress=normalCheckLevelMaxBranches \
+            --suppress=preprocessorErrorDirective \
+            -DUSE_HAL_DRIVER -DSTM32L496xx \
+            -I JOS/Core/Inc \
+            -I JOS/App \
+            -I JOS/App/obsw \
+            -I JOS/App/bms \
+            -I JOS/App/memory \
+            -I JOS/App/comms \
+            -I JOS/App/aocs \
+            -I JOS/App/payloads \
+            -I JOS/Drivers/STM32L4xx_HAL_Driver/Inc \
+            -I JOS/Drivers/STM32L4xx_HAL_Driver/Inc/Legacy \
+            -I JOS/Drivers/CMSIS/Device/ST/STM32L4xx/Include \
+            -I JOS/Drivers/CMSIS/Include \
+            -I JOS/Middlewares/Third_Party/FreeRTOS/Source/include \
+            -I JOS/Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2 \
+            -i JOS/Core/Src/asm330lhh_reg.c \
+            -i JOS/Core/Src/syscalls.c \
+            -i JOS/Core/Src/sysmem.c \
+            -i JOS/Core/Src/system_stm32l4xx.c \
+            JOS/App JOS/Core/Src
 
       - name: Build firmware
         working-directory: JOS
