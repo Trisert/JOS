@@ -1,0 +1,53 @@
+:project:
+  :use_test_preprocessor: :none
+  :use_dependencies: FALSE
+  :build_root: build
+  :test_file_prefix: test_
+  :release_build: FALSE
+
+:extension:
+  :executable: .out
+
+:paths:
+  :test:
+    - +:test/**
+  :source:
+    - ../App/obsw
+    - vendor/unity/src
+  :include:
+    - ../App/obsw
+    - vendor/unity/src
+  :support:
+    - support
+  :libraries:
+
+:cmock:
+  :mock_path: test/mocks
+
+:unittest:
+  :test_file:
+    - - --cmock
+  :mock_file:
+    - - --cmock
+  :verbosity:
+    :run_test: TRUE
+    :use_mock: TRUE
+    :parse: TRUE
+  :use_test_preprocessor: :none
+  :use_dependencies: FALSE
+  :treat_as:
+    :string:
+      - char*
+      - const char*
+    :uint8:
+      - uint8_t
+    :uint16:
+      - uint16_t
+    :uint32:
+      - uint32_t
+    :int8:
+      - int8_t
+    :int16:
+      - int16_t
+    :int32:
+      - int32_t
