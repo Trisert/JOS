@@ -1,74 +1,22 @@
-# AOCS (Attitude and Orbit Control System) API Reference
+# AOCS API — Attitude Control (`App/aocs/`)
 
-## Overview
+The OBC also acts as the AOCS microcontroller.
 
-The AOCS module handles satellite attitude control. Located in `App/aocs/`.
+## Modes
 
-## Dependencies
+- **Detumbling (B-dot):** angular rate from ASM330LHHXTR IMU @ 50 Hz; magnetometer
+  (IIS2MDC) field vector; drives 3 magnetorquers (TIM2 PWM). Exit when all-axis
+  rate < 5 deg/s.
+- **Nadir-Pointing (EKF):** state = [quaternion(4), omega(3)]; predict with
+  Euler @ 50 Hz, update with magnetometer. Ported from validated MATLAB model.
 
-- Header: `App/aocs/aocs.h`
-- Hardware: ASM330LHH (IMU), IIS2MDC (magnetometer)
+## API
 
-## Status
+| Function | Purpose |
+|----------|---------|
+| `iis2mdc_init()` / `iis2mdc_read()` | Magnetometer (I2C1, 50 Hz) |
+| `asm330lhh_init()` / `asm330lhh_read()` | IMU (SPI1, 50 Hz) |
+| `aocs_bdot_step()` | B-dot corrective dipole |
+| `aocs_ekf_predict()` / `aocs_ekf_update()` | EKF steps |
 
-**Current Implementation:** Placeholder (stub)
-
-The AOCS is developed by a separate team. Placeholder functions exist for integration.
-
-## Hardware
-
-- **IMU:** ASM330LHHXTR (3-axis gyroscope + accelerometer)
-- **Magnetometer:** IIS2MDC
-- **Interface:** I2C
-
-## Public API
-
-### `void aocs_init(void)`
-
-Initialize AOCS hardware.
-
-**Parameters:** None
-
-**Returns:** Nothing
-
-**Notes:**
-- TODO: Initialize IMU (ASM330LHH) and magnetometer (IIS2MDC)
-
----
-
-### `void aocs_task(void *arg)`
-
-AOCS control task.
-
-**Parameters:**
-- `arg` - FreeRTOS task argument (unused)
-
-**Returns:** Nothing
-
-**Notes:**
-- TODO: B-dot controller / EKF at 50 Hz
-- Runs at 20ms period (50 Hz)
-
----
-
-## Control Algorithm
-
-The AOCS implements:
-1. **B-dot controller** - Detumble algorithm using magnetometer
-2. **EKF** - Extended Kalman Filter for attitude estimation (future)
-
-## Task Parameters
-
-| Parameter | Value |
-|-----------|-------|
-| Period | 20 ms |
-| Frequency | 50 Hz |
-| Priority | TBD |
-
-## Notes
-
-This module requires:
-- IMU driver integration
-- Magnetometer driver integration
-- Control law implementation
-- Sensor calibration routines
+> Status: integrated (placeholder control law in `aocs.c`).

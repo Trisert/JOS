@@ -1,126 +1,111 @@
 # System Architecture
 
-## Overview
+This document describes the RedPill (JOS) on-board software architecture for the
+STM32L496VGTx target.
 
-The JOS (RedPill) On-Board Software (OBSW) is flight software for a CubeSat/PocketQube satellite. It manages all satellite operations including power, communications, payloads, and state transitions.
+## Hardware Context
 
-## Architecture Layers
+| Parameter | Value |
+|-----------|-------|
+| MCU | STM32L496VGTx — ARM Cortex-M4 @ 80 MHz |
+| Internal Flash | 1024 KB (firmware reserves 512 KB; LastStates pool 8 KB @ `0x08080000`) |
+| Internal SRAM | 320 KB (256 KB SRAM1 + 64 KB SRAM2) |
+| External memory | 4 MB FRAM (SPI2) |
+| IMU | ASM330LHHXTR (gyro + accel) |
+| Radio | Semtech SX1268 (LoRa, SPI1) |
+| Watchdog | Independent IWDG (~32 s) |
 
-```
-┌─────────────────────────────────────┐
-│         Application Layer          │
-│  ┌──────┬──────┬──────┬─────────┐ │
-│  │ AOCS │ BMS  │Comms │ Payloads│ │
-│  │      │      │      │CRY/C/L  │ │
-│  └──────┴──────┴──────┴─────────┘ │
-│   State Machine + Watchdog        │
-├─────────────────────────────────────┤
-│     FreeRTOS Kernel               │
-├─────────────────────────────────────┤
-│   STM32L4 HAL + Drivers            │
-├─────────────────────────────────────┤
-│        Hardware                   │
-└─────────────────────────────────────┘
-```
+### Multi-processor split
 
-## Hardware Platform
+| Processor | Location | Workload |
+|-----------|----------|----------|
+| STM32L496 (OBC) | OBC board | Core OBSW: state machine, telemetry, TT&C, payload commanding, AOCS, memory |
+| STM32L1 | EPS board | BMS: SoC, per-cell temperature, charge current/voltage, safe-mode triggers |
+| Camera MCU | Camera PCB | ArduCam image capture + compression (offloaded from OBC) |
 
-| Component | Specification |
-|------------|---------------|
-| MCU | STM32L496VGTx (ARM Cortex-M4) |
-| Flash | 1024 KB |
-| RAM | 128 KB |
-| External Storage | 4 MB FRAM |
-| Communication | SX1268 LoRa (436 MHz) |
+## Software Architecture
 
-## Operational States
+- **RTOS:** FreeRTOS (CMSIS-V2, `heap_4`), pre-emptive scheduling.
+- **Watchdog task:** monitors all tasks via tick counters; terminates anomalous tasks.
+- **Communication:** interrupt-driven SPI (no polling). SPI1 = LoRa + CLOUD; SPI2 = FRAM; I2C1 = magnetometer.
+- **Storage:** cyclic buffers. FRAM (4 MB) = primary payload sink; internal Flash = OBSW binary + LastStates pool (8 KB @ `0x08080000`) + beacon/ACK buffers.
+- **Chunking:** LoRa max packet 64 B; large objects fragmented on-board, reassembled at GS.
 
-| State | Description | Beacon Interval |
-|-------|-------------|-----------------|
-| OFF | System off | None |
-| INIT | Boot, antenna deploy | None |
-| CRIT | Safe mode | 16 min |
-| READY | Idle, listening | 4 min |
-| ACTIVE | Payload operations | 1-10 min |
+## Operational State Machine
 
-## Key Design Decisions
+Five-state FSM; all transitions logged to the LastStates pool.
 
-### Multi-Processor Distribution
-- **OBC (STM32L4):** Core OBSW, state machine, comms, payloads
-- **EPS (STM32L1):** Battery management
-- **Camera MCU:** Image acquisition
+| State | Name | Key activities |
+|-------|------|----------------|
+| s0 | OFF | Kill switches active; awaiting deployment |
+| s1 | INIT | Antenna deployment retry; self-tests; COMMS disabled |
+| s2 | CRIT | Low/supercritical battery; charging; beacon every 16 min |
+| s3 | READY | Idle; beacon every 4 min; uplink listening |
+| s4 | ACTIVE | Payload + PDT execution; beacon every 1–10 min |
 
-### Memory Strategy
-- **FRAM (4 MB):** Payload data, cyclic buffer
-- **Internal Flash:** OBSW + LastStates (8 KB)
-- **RAM:** Runtime stacks, FreeRTOS
+### Battery thresholds (from EPS STM32L1 / BQ27441)
 
-### Communication
-- LoRa with 64-byte max packets
-- Chunked transfer for large data
-- No polling — interrupt-driven
+| Threshold | ≈ SoC | Behaviour |
+|-----------|-------|-----------|
+| B_OPOK | 80% | Normal ops; payload + PDT allowed |
+| B_COMMOK | intermediate | PDTs allowed; payload suspended; → s2 until B_OPOK |
+| B_CRIT | low | Current PDT may finish, then → s2 |
+| B_SCRIT | 25% | Ongoing PDT interrupted immediately; → s2 |
 
-### Reliability
-- Hardware watchdog
-- Software task monitoring
-- LastStates pool for anomalies
-- State-based beacon intervals
+## Memory Budget
 
-## Detailed Documentation
+| Region | Capacity | Contents |
+|--------|----------|----------|
+| Flash (internal) | 1024 KB | OBSW binary (≤512 KB reserved); LastStates pool (8 KB @ `0x08080000`); beacon/ACK buffers |
+| SRAM (internal) | 320 KB | FreeRTOS kernel; task stacks; heap; runtime vars |
+| FRAM (external) | 4 MB | All payload data + system logging |
 
-The comprehensive system architecture is documented in the parent directory:
+Linker script: `JOS/STM32L496VGTX_FLASH.ld` (FLASH capped at 512K; `LASTSTATES`
+region 8K at `0x08080000`).
 
-- **RedPill_OBSW_Report.md** — Full technical report (ESA Fly Your Satellite! 4)
+## TT&C Layer
 
-## File Structure
+- **Modulation:** LoRa (CSS), 436 MHz (TBC), SF10, BW125, CR4/8, 610 b/s
+- **Max packet:** 64 B
+- **Security:** encryption (whitelist + shuffle), CRC on RX, NACK on failure
+- **Workflows:** Beacon TX, Data TX (on `SEND_DATA`), RX (uplink listening)
 
-```
-JOS/
-├── App/                  # Application layer
-│   ├── obsw/            # State machine, watchdog
-│   ├── bms/             # Battery management
-│   ├── comms/           # LoRa communications
-│   ├── aocs/            # Attitude control
-│   ├── memory/          # FRAM, Flash, cyclic buffer
-│   └── payloads/        # CRYSTALS, CLOUD, CLEAR
-├── Core/                 # STM32CubeMX generated (HAL, startup)
-├── Drivers/              # STM32 HAL + CMSIS
-├── Middlewares/          # FreeRTOS
-├── simulation/           # ESP32 dual-board HIL verification
-│   ├── shared/          # Communication protocol
-│   ├── esp32-obc/       # JOS ported to ESP-IDF
-│   └── esp32-simulator/ # Satellite environment simulator
-└── docs/                 # Documentation
+See `docs/api/comms.md` for the LoRa task API.
 
-## Dependencies
+## AOCS
 
-| Library | Purpose |
-|---------|---------|
-| FreeRTOS | Real-time operating system |
-| RadioLib | LoRa communication |
-| STM32L4 HAL | Hardware abstraction |
-| CMSIS | ARM Cortex-M interface |
+The OBC also runs AOCS: B-dot detumbling (IMU @ 50 Hz) → Nadir-Pointing EKF
+(IMU + IIS2MDC magnetometer fusion, 50 Hz). Three magnetorquers driven via TIM2 PWM.
 
-## Verification Test Bed
+## ECSS Service Alignment
 
-For hardware-in-the-loop verification without real satellite hardware, the OBSW can be ported to ESP32 and tested against a second ESP32 that simulates the satellite environment:
+| ST | Service | Status |
+|----|---------|--------|
+| ST[02] | Device Access | Y |
+| ST[03] | Housekeeping | Y |
+| ST[06] | Memory Management | Y |
+| ST[08] | Function Management | Y |
+| ST[09] | Time Management | Y |
+| ST[11] | Time-Based Scheduling | Y |
+| ST[12] | On-Board Monitoring | Y |
+| ST[13] | Large Data Transfer | Y |
+| ST[15] | On-Board Storage | Y |
+| ST[17] | Test | Y |
+| ST[20] | On-Board Parameter Mgmt | Y |
+| ST[23] | File Management | Y |
+| ST[01] | Request Verification | N (FreeRTOS priority list used) |
+| ST[04]/[05]/[14] | Param Stats / Event Report / RT Forwarding | TBD |
+| ST[18] | On-Board Control Procedure | N |
+| ST[22] | Position-Based Scheduling | N |
 
-```
-┌──────────────────────┐       SPI + UART       ┌──────────────────────┐
-│    ESP32-OBC         │◄──────────────────────►│   ESP32-Simulator   │
-│  (JOS OBSW ported)   │                        │  (satellite env)     │
-│                      │                        │                      │
-│  - State Machine     │                        │  - BMS/EPS sim       │
-│  - Watchdog          │                        │  - IMU/Mag sim       │
-│  - LoRa comms stub   │                        │  - ADC sensor sim    │
-│  - Payload drivers   │                        │  - Ground station    │
-│  - FreeRTOS tasks    │                        │  - Scenario engine   │
-└──────────────────────┘                        └──────────────────────┘
-```
+## Known Limitations
 
-Build and run with:
-```bash
-make sim OBC_PORT=COM3 SIM_PORT=COM4
-```
+| Item | Status | Notes |
+|------|--------|-------|
+| In-flight RAM update | Not planned | Restricted to 320 KB SRAM |
+| Context save/restore across reset | Not planned | Only LastStates pool preserved |
+| In-flight SW patching | TBD | No formal post-launch commitment |
+| Full command DB consolidation | In progress | Being simplified |
+| CRYSTALS voltage calibration | TBC (3 V nominal) | In-orbit validation |
 
-See [docs/dev/simulation.md](../dev/simulation.md) for full documentation.
+See `docs/api/` for module-level detail and `docs/dev/` for build/verify.

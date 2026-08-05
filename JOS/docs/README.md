@@ -17,52 +17,52 @@ Welcome to the JOS (RedPill) On-Board Software documentation.
 ```
 docs/
 ├── README.md           # This file
-├── api/              # Module API reference
-│   ├── obsw.md       # State machine, watchdog
-│   ├── bms.md        # Battery management
-│   ├── comms.md      # Communications
-│   ├── memory.md    # FRAM, Flash storage
-│   ├── aocs.md      # Attitude control
-│   └── payloads.md  # CRYSTALS, CLOUD, CLEAR
-├── arch/             # Architecture
+├── api/                # Module API reference
+│   ├── obsw.md         # State machine, watchdog, LastStates pool
+│   ├── bms.md          # Battery management (EPS interface)
+│   ├── comms.md        # LoRa TT&C (SX1268)
+│   ├── memory.md       # FRAM cyclic buffer, Flash write, LastStates
+│   ├── aocs.md         # Attitude control (B-dot, EKF)
+│   └── payloads.md     # CRYSTALS, CLOUD, CLEAR
+├── arch/               # Architecture & system design
 │   └── README.md
-├── dev/              # Developer guides
-│   ├── building.md   # Build STM32 firmware
-│   ├── simulation.md # ESP32 dual-board HIL verification
+├── dev/                # Developer guides
+│   ├── building.md     # Build (NixOS container / local / CI / CubeIDE)
+│   ├── simulation.md   # ESP32 dual-board HIL verification
 │   ├── coding_standards.md
 │   └── debugging.md
-└── user/            # User manual
+└── user/               # User manual (ground operators)
     └── README.md
 ```
+
+## Hardware at a glance
+
+- **MCU:** STM32L496VGTx (Cortex-M4 @ 80 MHz)
+- **Flash:** 1024 KB (firmware reserves 512 KB; LastStates pool 8 KB @ `0x08080000`)
+- **SRAM:** 320 KB (256 + 64)
+- **FRAM:** 4 MB external (SPI2)
 
 ## Module Overview
 
 ### OBSW (Core)
 - **State Machine:** 5-state FSM (OFF → INIT → CRIT → READY → ACTIVE)
-- **Watchdog:** Task monitoring, anomaly detection
-- **LastStates:** Flash log of state transitions
+- **Watchdog:** task monitoring, anomaly detection
+- **LastStates:** Flash log of state transitions (@ `0x08080000`)
 
 ### Payloads
-- **CRYSTALS:** Crystal growth observation
-- **CLOUD:** Debris detection
-- **CLEAR:** Optical measurements
+- **CRYSTALS:** crystal growth observation
+- **CLOUD:** debris detection
+- **CLEAR:** optical measurements
 
 ### Support
-- **BMS:** Battery status (stub)
-- **Comms:** LoRa radio (stub)
+- **BMS:** battery status (EPS STM32L1 interface)
+- **Comms:** LoRa radio (SX1268)
 - **Memory:** FRAM + Flash storage
-- **AOCS:** Attitude control (placeholder)
-
-## Additional Resources
-
-- **Full Technical Report:** `RedPill_OBSW_Report.md` (in parent directory)
-- **Source Code:** `App/`, `Core/`
-- **Simulation:** `simulation/` (ESP32 dual-board HIL verification)
+- **AOCS:** attitude control (B-dot + EKF)
 
 ## Support
 
-For questions:
-- Check the source code in `App/`
+- Check source in `App/`
 - Review API docs in `docs/api/`
 - See debugging guide in `docs/dev/debugging.md`
 - See simulation guide in `docs/dev/simulation.md`
