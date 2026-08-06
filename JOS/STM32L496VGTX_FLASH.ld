@@ -190,9 +190,14 @@ SECTIONS
   /* Data that must survive a warm reset (NVIC_SystemReset): the startup code
      only zeroes [_sbss,_ebss) and copies .data, so nothing here is touched.
      NOLOAD keeps it out of the image. Holds the boot-CRC retry counter
-     (App/obsw/boot_crc.c — docs/dev/hardening.md 2.4) and the MemManage fault
+     (App/obsw/boot_crc.c — docs/dev/hardening.md 2.4), the MemManage fault
      record staged by mpu_memmanage_fault() (W2-1), which is flushed to
-     LastStates by mpu_fault_log_flush() on the next boot.
+     LastStates by mpu_fault_log_flush() on the next boot, and the dual-bank
+     boot-fault scratch (W2-2, Core/Src/dual_bank.c), which is magic-guarded
+     so losing it on a power cycle is harmless. Deliberately in SRAM1, not
+     SRAM2: SRAM2 parity init (W2-3) rewrites the whole of SRAM2 at boot and
+     reading never-written SRAM2 with parity enabled raises an NMI. No Flash
+     bytes, no change to the bank layout.
      8-byte aligned so the region can be covered by an MPU sub-region. */
   . = ALIGN(8);
   .noinit (NOLOAD) :
@@ -201,6 +206,8 @@ SECTIONS
     _snoinit = __noinit_start__;
     *(.noinit)
     *(.noinit*)
+    . = ALIGN(4);
+    KEEP(*(.boot_fault))
     . = ALIGN(8);
     __noinit_end__ = .;
     _enoinit = __noinit_end__;

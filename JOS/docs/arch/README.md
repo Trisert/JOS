@@ -63,6 +63,27 @@ Five-state FSM; all transitions logged to the LastStates pool.
 Linker script: `JOS/STM32L496VGTX_FLASH.ld` (FLASH capped at 512K; `LASTSTATES`
 region 8K at `0x08080000`).
 
+### Dual-bank golden-image fallback (W2-2)
+
+The STM32L496VGTx is permanently dual bank: bank 1 = `0x08000000`..`0x0807FFFF`
+(primary image), bank 2 = `0x08080000`..`0x080FFFFF` (golden image slot). The
+`BFB2` option bit makes the boot ROM swap the two banks in the address map, so
+the golden image is *linked for `0x08000000`* even though it is stored in
+bank 2. `Core/Src/dual_bank.c` falls back to it when the primary image fails
+its boot CRC32 or has taken three consecutive boot-phase faults
+(NASA-STD-8739.8 graceful degradation, ECSS-Q-ST-80C §6.2.6).
+
+Golden image descriptor (written by ground tooling), last 16 bytes of bank 2:
+`magic 'GLDN'` + `length` + `crc32` + `~crc32`.
+
+**Open layout conflict:** the LastStates pool occupies `0x08080000`, i.e. the
+exact address the boot ROM fetches the golden vector table from after a `BFB2`
+swap. The two cannot share it, so the fallback is *compile-time inhibited*
+(`DUAL_BANK_GOLDEN_SLOT_AVAILABLE == 0`) and will never arm `BFB2` into an
+unbootable configuration. Relocating the pool (proposal: `0x080FE000`, top of
+bank 2) in `App/memory/memory.c`, the `LASTSTATES` linker region and the ground
+forensics tooling enables the fallback with no code change.
+
 ## TT&C Layer
 
 - **Modulation:** LoRa (CSS), 436 MHz (TBC), SF10, BW125, CR4/8, 610 b/s

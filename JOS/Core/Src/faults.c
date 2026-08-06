@@ -29,6 +29,7 @@
 #include "memory.h"         /* laststates_write()                            */
 #include "obsw_types.h"     /* laststates_entry_t, TRIGGER_*                 */
 #include "mpu.h"            /* mpu_memmanage_fault(): MemManage entry (W2-1) */
+#include "dual_bank.h"      /* dual_bank_mark_boot_fault() (W2-2)            */
 
 #include <stddef.h>
 #include <string.h>
@@ -130,6 +131,12 @@ void fault_handlers_init(void)
 void fault_capture(const uint32_t *frame, uint32_t fault_id, uint32_t exc_return)
 {
     fault_record_t rec;
+
+    /* Dual-bank fallback evidence (W2-2) FIRST: RAM-only, ISR-safe, no Flash
+       and no HAL, so it cannot block or fault. It must be recorded before the
+       Flash write below, which may legitimately fail on a corrupted image -
+       exactly the case the golden-image fallback exists for. */
+    dual_bank_mark_boot_fault();
 
     memset(&rec, 0, sizeof(rec));
     rec.magic      = FAULT_RECORD_MAGIC;
