@@ -11,6 +11,18 @@
 # There is deliberately NO vendored copy of Unity in this repository: two
 # Unity versions in one build produce silent ABI/macro mismatches.
 #
+# Two complementary doubling strategies live side by side (W2-6):
+#   - hand-written fakes in fakes/ + support/ for the HAL/Flash/FRAM surface
+#     (boot_crc, memory): the tests need a *behavioural* double (a real write
+#     -> read round trip through an emulated Flash pool), not a call recorder;
+#   - CMock mocks generated from fakes/cmsis_os.h, fakes/task.h and from the
+#     App headers for the RTOS-facing modules (watchdog, comms): there the
+#     question under test is "was this call made, with these arguments", which
+#     is exactly what a mock answers and a fake cannot.
+# The two must never overlap in one executable: a symbol defined by a file on
+# the :support: path is linked into EVERY test binary, so its header must not
+# also be mocked (see the note at the top of fakes/main.h).
+#
 # Run from JOS/test/:   ceedling test:all
 # Or from JOS/:         make test
 #
@@ -21,7 +33,7 @@
 :project:
   :which_ceedling: gem          # use the installed gem's Unity/CMock, never a vendored copy
   :use_exceptions: FALSE
-  :use_test_preprocessor: :none # no mocks are generated; fakes are hand written
+  :use_test_preprocessor: :none # headers are plain C; no macro expansion needed
   :use_backtrace: :simple
   :build_root: build
   :test_file_prefix: test_
@@ -45,11 +57,20 @@
   :source:
     - ../App/obsw
     - ../App/memory
+    - ../App/comms
+    - ../App/aocs
   :include:
+    # fakes/ first: it shadows main.h, cmsis_os.h, cmsis_os2.h, FreeRTOS.h,
+    # task.h and the Core/Inc headers the App modules pull in (sram2_parity.h,
+    # dual_bank.h, hw_watchdog.h), none of which can be compiled for the host.
+    # Any real header that reached the compiler first would drag in the whole
+    # HAL/CMSIS/FreeRTOS tree.
+    - fakes
     - ../App
     - ../App/obsw
     - ../App/memory
-    - fakes
+    - ../App/comms
+    - ../App/aocs
     - support
   :support:
     - support
@@ -83,10 +104,33 @@
 :cmock:
   :mock_prefix: mock_
   :when_no_prototypes: :warn
-  :enforce_strict_ordering: TRUE
+  # FALSE, not TRUE: the RTOS-facing tests (test_watchdog, test_comms) assert
+  # on calls to several independent mocks at once (mock_cmsis_os +
+  # mock_task + mock_state_machine). Global cross-mock ordering would then
+  # encode the *interleaving* of mutex traffic, tick reads and dispatch calls
+  # as part of the contract, which is an implementation detail: reordering two
+  # lines inside watchdog_register_task() would break a test without changing
+  # any observable behaviour. Ordering that genuinely matters is asserted
+  # explicitly (e.g. the registration tick stamp preceding the liveness stamp).
+  :enforce_strict_ordering: FALSE
   :plugins:
     - :ignore
+    - :ignore_arg
     - :callback
+    - :expect_any_args
+    - :return_thru_ptr
+  # CMock cannot infer a comparison for a typedef it has not seen expanded
+  # (:use_test_preprocessor: :none), so the enum/scalar aliases used in the
+  # mocked prototypes are mapped explicitly. Getting one wrong makes CMock
+  # compare the wrong width and silently pass.
+  :treat_as:
+    HAL_StatusTypeDef: INT
+    osStatus_t: INT
+    osPriority_t: INT
+    osKernelState_t: INT
+    obw_state_t: INT
+    comms_tc_result_t: INT
+    TickType_t: UINT32
 
 :plugins:
   :load_paths: []

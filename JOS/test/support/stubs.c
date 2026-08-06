@@ -24,6 +24,7 @@
  *     permits as the right-hand operand of a subtraction.
  * ------------------------------------------------------------------------- */
 #include "host_support.h"
+#include "main.h"          /* fakes/main.h - peripheral handle types (W2-6) */
 #include "unity.h"
 
 #include <stdint.h>
@@ -159,4 +160,35 @@ uint32_t host_fw_crc_stamped_value(void)
     const volatile uint32_t *slot = host_fw_crc_slot();
 
     return (slot != NULL) ? *slot : 0xFFFFFFFFu;
+}
+
+/* ---------------------------------------------------------------------------
+ * CubeMX peripheral handles (W2-6)
+ *
+ * App/ modules reference these as externs that the flight build resolves in
+ * Core/Src/main.c (CubeMX generated, not on the host :source: path):
+ *
+ *     App/comms/comms.c -> extern SPI_HandleTypeDef hspi1;
+ *
+ * The tests never inspect the contents: every HAL entry point that consumes a
+ * handle is a support-file double which ignores it, so these are address-only
+ * placeholders.
+ *
+ * hi2c2 is deliberately NOT here: support/host_flash.c already defines it
+ * next to the FRAM emulation that consumes it, and both files are linked into
+ * every test executable, so a second definition is a duplicate symbol.
+ * ------------------------------------------------------------------------- */
+SPI_HandleTypeDef  hspi1;    /* SX1268 LoRa transceiver  */
+ADC_HandleTypeDef  hadc1;    /* BMS measurements         */
+IWDG_HandleTypeDef hiwdg;    /* independent watchdog     */
+
+/* ---------------------------------------------------------------------------
+ * Error_Handler(): the CubeMX trap. On target it disables interrupts and
+ * spins (bounded now only by the IWDG). Reaching it from a host test means
+ * the code under test gave up, which is never an expected outcome here, so
+ * the double fails the run loudly instead of hanging the CI job.
+ * ------------------------------------------------------------------------- */
+void Error_Handler(void)
+{
+    TEST_FAIL_MESSAGE("flight code called Error_Handler()");
 }
