@@ -1,0 +1,33 @@
+:project:
+  :use_test_preprocessor: :all
+  :use_dependencies: TRUE
+  :build_root: build
+
+:paths:
+  :test:
+    - +:.
+  :source:
+    # The two modules under test live here. memory.c pulls HAL (main.h) and is
+    # NOT used by scrub.c when built with SCRUB_NO_RTOS (it binds a fake FRAM
+    # backend instead), so it is intentionally excluded. boot_crc.c provides
+    # boot_crc32() which scrub.c calls; being in :source it links into every
+    # test executable.
+    - +:../App/obsw
+  :include:
+    - +:../App/obsw
+    - +:..
+
+:defines:
+  :test:
+    - CEDLING_TEST
+    - SCRUB_NO_RTOS
+    - BOOT_CRC_HOST_BUILD
+
+:cmock: {}
+
+:plugins:
+  :enabled: []
+
+:options:
+  :logging:
+    :verbosity: 1

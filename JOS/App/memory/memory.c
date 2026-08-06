@@ -19,6 +19,15 @@
 #define FM24VN_NUM_CHIPS      4
 #define FRAM_SIZE             (FM24VN_NUM_CHIPS * FM24VN_CHIP_SIZE)
 
+/* FRAM layout (64 KB total):
+ *   [0 .. cyclic_buffer_head)  : cyclic science-data buffer (wraps the device)
+ *   [top - scrub_pool .. top)   : SEU scrub golden records (W2-5), reserved at
+ *                                 the TOP and grown downward; see scrub.h
+ *                                 SCRUB_FRAM_BASE. The scrub records are
+ *                                 CRC-protected and reject any payload they do
+ *                                 not own, so the two regions never corrupt
+ *                                 each other even on a head-pointer collision. */
+
 extern I2C_HandleTypeDef hi2c2;
 
 static uint8_t fram_addr_to_chip(uint32_t addr)

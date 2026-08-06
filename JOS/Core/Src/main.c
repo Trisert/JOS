@@ -27,6 +27,8 @@
 #include "bms.h"
 #include "memory.h"
 #include "comms.h"
+#include "sram2_parity.h"
+#include "scrub.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -103,6 +105,10 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+  /* SRAM2 hardware-parity protection for the critical OBSW data (W2-3).
+     Runs before every other init: it hardware-erases SRAM2 and restores
+     the .sram2 image, so no SRAM2_CRITICAL object may be touched earlier. */
+  sram2_parity_init();
 
   /* USER CODE END Init */
 
@@ -129,12 +135,15 @@ int main(void)
   lora_init();
   state_machine_init();
   watchdog_monitor_init();
+  /* Boot-time SEU repair (W2-5): restore every registered critical region from
+     its CRC-verified golden copy in FRAM before the mission logic runs. After a
+     parity-NMI reboot (W2-3) this re-establishes the last-good obsw_state; on a
+     clean first boot there is no backup yet, which is reported, not an error. */
+  (void)scrub_init();
   /* USER CODE END 2 */
 
   /* Init scheduler */
   osKernelInitialize();
-
-  /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
   /* USER CODE END RTOS_MUTEX */
 
@@ -157,6 +166,7 @@ int main(void)
   /* USER CODE BEGIN RTOS_THREADS */
   state_machine_task_create();
   watchdog_task_create();
+  scrub_task_create();
   lora_beacon_task_create();
   lora_rx_task_create();
   /* USER CODE END RTOS_THREADS */

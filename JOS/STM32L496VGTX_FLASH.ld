@@ -51,6 +51,12 @@ MEMORY
   LASTSTATES (rx)  : ORIGIN = 0x8080000,   LENGTH = 8K
 }
 
+/* Boot-image CRC coverage bounds, used by App/obsw/boot_crc.c (W2-1).
+   __fw_image_start is the first byte of the loaded image; the covered
+   region ends at __fw_crc_start (the byte just before the stored CRC
+   word). The .fw_crc section below is excluded from the checksum. */
+__fw_image_start = ORIGIN(FLASH);
+
 /* Sections */
 SECTIONS
 {
@@ -152,6 +158,41 @@ SECTIONS
 
   } >RAM AT> FLASH
 
+  /* ---- Critical runtime data in SRAM2 (hardware parity) - W2-3 ----
+     SRAM2 (64 KB @ 0x10000000) is the only RAM block on the STM32L496 with a
+     hardware parity bit per byte. The OBSW state struct and the comms buffers
+     live here so that a bit flip is detected (NMI) instead of silently used.
+
+     .sram2        : initialised data, load image kept in Flash and copied by
+                     sram2_parity_init() (startup.s only copies .data).
+     .sram2_noinit : NOLOAD buffers, zeroed by the SRAM2 hardware erase that
+                     sram2_parity_init() performs before any access.       */
+  _sisram2 = LOADADDR(.sram2);
+
+  .sram2 :
+  {
+    . = ALIGN(8);
+    _ssram2 = .;       /* start of the initialised SRAM2 image */
+    KEEP(*(.sram2))
+    KEEP(*(.sram2.*))
+    . = ALIGN(8);
+    _esram2 = .;       /* end of the initialised SRAM2 image */
+  } >RAM2 AT> FLASH
+
+  .sram2_noinit (NOLOAD) :
+  {
+    . = ALIGN(8);
+    _ssram2_noinit = .;
+    KEEP(*(.sram2_noinit))
+    KEEP(*(.sram2_noinit.*))
+    . = ALIGN(8);
+    _esram2_noinit = .;
+  } >RAM2
+
+  /* Bounds of the parity-protected block, used by sram2_parity.c */
+  _sram2_region_start = ORIGIN(RAM2);
+  _sram2_region_end   = ORIGIN(RAM2) + LENGTH(RAM2);
+
   /* Uninitialized data section into "RAM" Ram type memory */
   . = ALIGN(4);
   .bss :
@@ -188,4 +229,22 @@ SECTIONS
   }
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
+
+  /* ---- Boot-image CRC word (W2-1) ----
+     Emitted as the LAST loaded section of the image so that __fw_crc_start
+     marks the end of the CRC-protected region. Left at the placeholder
+     BOOT_CRC_UNSTAMPED_VALUE until tools/fw_crc_stamp.py patches the built
+     .bin/.hex. KEEP() prevents --gc-sections from dropping the only
+     reference to the symbol. */
+  .fw_crc :
+  {
+    . = ALIGN(4);
+    __fw_crc_start = .;
+    KEEP(*(.fw_crc))
+    . = ALIGN(4);
+  } >FLASH
 }
+
+/* Fail the build rather than silently truncating critical data. */
+ASSERT(_esram2_noinit <= (ORIGIN(RAM2) + LENGTH(RAM2)),
+       "SRAM2 critical data (.sram2 + .sram2_noinit) overflows the RAM2 region")
