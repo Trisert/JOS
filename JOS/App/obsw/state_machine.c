@@ -4,6 +4,7 @@
 #include "main.h"
 #include "memory.h"         /* laststates_write() prototype */
 #include "sram2_parity.h"   /* SRAM2_CRITICAL placement (W2-3) */
+#include "scrub.h"          /* W2-5 SEU scrub of obsw_state (golden FRAM copy) */
 #include <string.h>
 
 /* ---------- Private variables ---------- */
@@ -154,6 +155,11 @@ static int try_transition(obw_state_t target, uint8_t trigger)
         return -1;
     }
     obsw_state.current_state = target;
+    /* Write-through the new critical state to the FRAM golden copy so the
+       scrubber (W2-5) always has an authoritative backup after a committed
+       mutation. A FRAM write failure here is logged via the scrub error
+       counter but does not roll back the already-committed transition. */
+    (void)scrub_sync(SCRUB_REGION_OBSW_STATE);
     return 0;
 }
 
@@ -221,7 +227,14 @@ void state_machine_init(void)
 
     obsw_state.current_state            = STATE_OFF;
     obsw_state.beacon_interval_override = 0U;
-}
+
+    /* Register the critical state struct with the SEU scrubber (W2-5). The
+       golden copy in FRAM is empty on the very first boot (SCRUB_ERR_MAGIC),
+       which is expected; scrub_init() then only refreshes regions that
+       already have a valid backup. Write-through on every committed mutation
+       keeps the golden copy authoritative (see scrub_sync in try_transition). */
+    (void)scrub_register(&obsw_state, sizeof(obsw_state),
+                         SCRUB_REGION_OBSW_STATE);
 
 osThreadId_t state_machine_task_create(void)
 {

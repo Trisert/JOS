@@ -51,6 +51,12 @@ MEMORY
   LASTSTATES (rx)  : ORIGIN = 0x8080000,   LENGTH = 8K
 }
 
+/* Boot-image CRC coverage bounds, used by App/obsw/boot_crc.c (W2-1).
+   __fw_image_start is the first byte of the loaded image; the covered
+   region ends at __fw_crc_start (the byte just before the stored CRC
+   word). The .fw_crc section below is excluded from the checksum. */
+__fw_image_start = ORIGIN(FLASH);
+
 /* Sections */
 SECTIONS
 {
@@ -223,6 +229,20 @@ SECTIONS
   }
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
+
+  /* ---- Boot-image CRC word (W2-1) ----
+     Emitted as the LAST loaded section of the image so that __fw_crc_start
+     marks the end of the CRC-protected region. Left at the placeholder
+     BOOT_CRC_UNSTAMPED_VALUE until tools/fw_crc_stamp.py patches the built
+     .bin/.hex. KEEP() prevents --gc-sections from dropping the only
+     reference to the symbol. */
+  .fw_crc :
+  {
+    . = ALIGN(4);
+    __fw_crc_start = .;
+    KEEP(*(.fw_crc))
+    . = ALIGN(4);
+  } >FLASH
 }
 
 /* Fail the build rather than silently truncating critical data. */

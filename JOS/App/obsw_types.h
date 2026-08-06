@@ -48,6 +48,8 @@ enum {
     TRIGGER_WATCHDOG        = 7,
     /* 8 and 9 are reserved for the Cortex-M fault handlers (faults.h). */
     TRIGGER_SRAM2_PARITY    = 10, /* SRAM2 parity error NMI (see sram2_parity.h) */
+    TRIGGER_SCRUB_FAULT     = 11, /* SEU scrub: golden FRAM record unusable
+                                    (never synced / FRAM CRC mismatch) */
 };
 
 /* ---------- BMS interface (stub for now) ---------- */
