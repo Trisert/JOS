@@ -1,4 +1,6 @@
 #include "state_machine.h"
+#include "memory.h"      /* laststates_write() prototype — GCC 15 rejects
+                          * implicit declarations (-Werror=implicit-function-declaration) */
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
