@@ -8,6 +8,7 @@
 #include "memory.h"         /* laststates_write() prototype */
 #include "sram2_parity.h"   /* SRAM2_CRITICAL placement (W2-3) */
 #include "seu_mitigation.h" /* redundant snapshot + scrubbing (W2-5) */
+#include "scrub.h"          /* W2-5 SEU scrub of obsw_state (golden FRAM copy) */
 #include <string.h>
 
 /* ---------- Private variables ---------- */
@@ -96,6 +97,10 @@ void bms_set_soc_stub(uint8_t soc)
     obsw_state.bms.soc = soc;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
+    /* Same reason the RAM shadow is re-committed above: the FRAM golden copy
+       must follow every trusted mutation, or the next scrub pass would find
+       live != golden and "repair" this change away (W2-5). */
+    (void)scrub_sync(SCRUB_REGION_OBSW_STATE);
 }
 
 void *state_machine_critical_region(size_t *len)
@@ -213,6 +218,16 @@ static int try_transition(obw_state_t target, uint8_t trigger)
     obsw_state.current_state = target;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
+
+    /* Write-through the new critical state to the CRC-protected FRAM golden
+       copy so the scrubber (W2-5) always has an authoritative backup after a
+       committed mutation, and so the state survives a parity-NMI reboot.
+       Deliberately OUTSIDE the SEU lock: scrub_sync() runs a blocking I2C
+       transaction to the FRAM and must not hold off the RAM-shadow scrubber
+       for the duration. A FRAM write failure is counted in
+       scrub_fram_error_count() but does not roll back the already-committed
+       transition. */
+    (void)scrub_sync(SCRUB_REGION_OBSW_STATE);
     return 0;
 }
 
@@ -249,6 +264,9 @@ static int enter_safe_state(uint8_t trigger)
     obsw_state.current_state = STATE_CRIT;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
+    /* Containment must also survive a reboot: refresh the FRAM golden copy so
+       scrub_init() restores CRIT and not the pre-fault state (W2-5). */
+    (void)scrub_sync(SCRUB_REGION_OBSW_STATE);
 
     /* Containment is in force either way - only the evidence is missing. */
     return SAFE_STATE_FORCED;
@@ -385,6 +403,16 @@ void state_machine_init(void)
     obsw_state.current_state            = STATE_OFF;
     obsw_state.beacon_interval_override = 0U;
 
+    /* Register the critical state struct with the FRAM golden-copy scrubber
+       (W2-5, App/obsw/scrub.c). Registration only records the address/length;
+       the golden record in FRAM is empty on the very first boot
+       (SCRUB_ERR_MAGIC), which is expected. main() calls scrub_init() right
+       after this function to restore the region from a valid backup, and
+       write-through on every committed mutation keeps the golden copy
+       authoritative (see scrub_sync() in try_transition()). */
+    (void)scrub_register(&obsw_state, sizeof(obsw_state),
+                         SCRUB_REGION_OBSW_STATE);
+
     /* seu_mitigation_init() runs after this function and takes the first
        snapshot; the commit here is a no-op before that point and keeps the
        shadow in step if the state machine is ever re-initialised. */
@@ -457,6 +485,9 @@ int state_machine_set_beacon_interval(uint32_t interval_ms)
     obsw_state.beacon_interval_override = interval_ms;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
+    /* Write-through to the FRAM golden copy (W2-5) so a commanded cadence
+       change is not scrubbed back to the previous value. */
+    (void)scrub_sync(SCRUB_REGION_OBSW_STATE);
     osMutexRelease(state_mutex);
     return 0;
 }
