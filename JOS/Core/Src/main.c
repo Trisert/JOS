@@ -27,6 +27,7 @@
 #include "bms.h"
 #include "memory.h"
 #include "comms.h"
+#include "sram2_parity.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -103,6 +104,10 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+  /* SRAM2 hardware-parity protection for the critical OBSW data (W2-3).
+     Runs before every other init: it hardware-erases SRAM2 and restores
+     the .sram2 image, so no SRAM2_CRITICAL object may be touched earlier. */
+  sram2_parity_init();
 
   /* USER CODE END Init */
 

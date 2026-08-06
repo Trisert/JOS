@@ -8,6 +8,7 @@ Welcome to the JOS (RedPill) On-Board Software documentation.
 |--------|-------|
 | Building the code | [docs/dev/building.md](dev/building.md) |
 | Verification simulation | [docs/dev/simulation.md](dev/simulation.md) |
+| SRAM2 parity / critical data | [docs/dev/sram2_parity.md](dev/sram2_parity.md) |
 | Understanding modules | [docs/api/](api/) |
 | System design | [docs/arch/README.md](arch/README.md) |
 | Operating the satellite | [docs/user/README.md](user/README.md) |
@@ -29,6 +30,7 @@ docs/
 ├── dev/                # Developer guides
 │   ├── building.md     # Build (NixOS container / local / CI / CubeIDE)
 │   ├── simulation.md   # ESP32 dual-board HIL verification
+│   ├── sram2_parity.md # SRAM2 parity NMI for critical data (W2-3)
 │   ├── coding_standards.md
 │   └── debugging.md
 └── user/               # User manual (ground operators)

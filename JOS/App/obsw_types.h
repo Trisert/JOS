@@ -46,6 +46,8 @@ enum {
     TRIGGER_TASK_COMPLETE   = 5,
     TRIGGER_ANTENNA_DONE    = 6,
     TRIGGER_WATCHDOG        = 7,
+    /* 8 and 9 are reserved for the Cortex-M fault handlers (faults.h). */
+    TRIGGER_SRAM2_PARITY    = 10, /* SRAM2 parity error NMI (see sram2_parity.h) */
 };
 
 /* ---------- BMS interface (stub for now) ---------- */

@@ -24,6 +24,7 @@
 #include "task.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "sram2_parity.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -71,7 +72,11 @@
 void NMI_Handler(void)
 {
   /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
-
+  /* SRAM2 parity error (SYSCFG_CFGR2.SPF) and the RCC clock security
+     system both vector here. sram2_parity_nmi_handler() records the
+     failure context in the LastStates pool and resets the OBSW; it
+     never returns, so the spin below is unreachable (W2-3). */
+  sram2_parity_nmi_handler();
   /* USER CODE END NonMaskableInt_IRQn 0 */
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
    while (1)
