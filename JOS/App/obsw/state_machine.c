@@ -5,14 +5,45 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
-#include "memory.h"
+#include "memory.h"         /* laststates_write() prototype */
+#include "sram2_parity.h"   /* SRAM2_CRITICAL placement (W2-3) */
 #include <string.h>
 
 /* ---------- Private variables ---------- */
-static obw_state_t current_state = STATE_OFF;
-static uint32_t beacon_interval_override = 0;
 static osMutexId_t state_mutex;
 static osThreadId_t sm_task_handle;
+
+/* ---------- Critical OBSW state (SRAM2, hardware parity) ----------
+   Operational state, beacon override and the last BMS snapshot decide every
+   autonomous action of the spacecraft, so they live in the parity-protected
+   SRAM2 block: a bit flip here raises an NMI and is contained by
+   sram2_parity_nmi_handler() instead of silently steering the mission.
+   The .sram2 image is copied from Flash by sram2_parity_init(), which MUST
+   run before state_machine_init(); static initialisers below are therefore
+   effective exactly as for ordinary .data. */
+#define OBSW_STATE_MAGIC   0x4F53574DU   /* "OSWM" */
+
+typedef struct {
+    uint32_t     magic;                    /* integrity marker for ground     */
+    obw_state_t  current_state;            /* current operational state       */
+    uint32_t     beacon_interval_override; /* 0 = per-state default           */
+    bms_status_t bms;                      /* latest battery snapshot (stub)  */
+} obsw_critical_state_t;
+
+static SRAM2_CRITICAL obsw_critical_state_t obsw_state = {
+    .magic                    = OBSW_STATE_MAGIC,
+    .current_state            = STATE_OFF,
+    .beacon_interval_override = 0U,
+    /* Stub BMS - per RED_DES_ElectronicArchitecture_V1:
+         BQ76905 on EPS board via local I2C to EPS MCU,
+         OBC queries EPS over subsystem SPI.
+       Default voltage for 2S Li-ion: 7400 mV nominal. */
+    .bms                      = {
+        .soc        = 100,
+        .temp_c     = 250,   /* 25.0 C */
+        .voltage_mv = 7400,
+    },
+};
 
 static const osThreadAttr_t sm_task_attrs = {
     .name       = "stateMachine",
@@ -28,26 +59,16 @@ static const bms_thresholds_t default_thresholds = {
     .b_scrit  = 25,
 };
 
-/* Stub BMS — per RED_DES_ElectronicArchitecture_V1:
- *   BQ76905 on EPS board via local I2C to EPS MCU,
- *   OBC queries EPS over subsystem SPI.
- *   Default voltage for 2S Li-ion: 7400 mV nominal. */
-static bms_status_t bms_stub = {
-    .soc        = 100,
-    .temp_c     = 250,   /* 25.0 C */
-    .voltage_mv = 7400,
-};
-
 static bms_status_t bms_get_status(void)
 {
     /* TODO: replace with real subsystem SPI query to EPS MCU */
-    return bms_stub;
+    return obsw_state.bms;
 }
 
 /* For testing: allow overriding SoC from outside */
 void bms_set_soc_stub(uint8_t soc)
 {
-    bms_stub.soc = soc;
+    obsw_state.bms.soc = soc;
 }
 
 /* ---------- LastStates logging ---------- */
@@ -97,7 +118,7 @@ static int try_transition(obw_state_t target, uint8_t trigger)
     switch (target) {
     case STATE_INIT:
         /* Only valid from OFF (boot) */
-        ok = (current_state == STATE_OFF);
+        ok = (obsw_state.current_state == STATE_OFF);
         break;
 
     case STATE_CRIT:
@@ -108,9 +129,9 @@ static int try_transition(obw_state_t target, uint8_t trigger)
     case STATE_READY:
         /* s1→s3: after boot + antenna deploy success */
         /* s2→s3: battery recovers to b_opok */
-        if (current_state == STATE_INIT) {
+        if (obsw_state.current_state == STATE_INIT) {
             ok = 1;  /* assume antenna deploy + self-test passed */
-        } else if (current_state == STATE_CRIT) {
+        } else if (obsw_state.current_state == STATE_CRIT) {
             bms = bms_get_status();
             ok = (bms.soc >= default_thresholds.b_opok);
         }
@@ -119,9 +140,9 @@ static int try_transition(obw_state_t target, uint8_t trigger)
     case STATE_ACTIVE:
         /* s3→s4: scheduled task / ground command */
         /* s2→s4: ground command + stable battery */
-        if (current_state == STATE_READY) {
+        if (obsw_state.current_state == STATE_READY) {
             ok = 1;
-        } else if (current_state == STATE_CRIT) {
+        } else if (obsw_state.current_state == STATE_CRIT) {
             bms = bms_get_status();
             ok = (bms.soc >= default_thresholds.b_opok) &&
                  (trigger == TRIGGER_GROUND_CMD);
@@ -138,13 +159,13 @@ static int try_transition(obw_state_t target, uint8_t trigger)
         return -1;
     }
 
-    if (laststates_log((uint8_t)current_state, (uint8_t)target, trigger, NULL, 0) != 0) {
+    if (laststates_log((uint8_t)obsw_state.current_state, (uint8_t)target, trigger, NULL, 0) != 0) {
         /* LastStates persistence failed (Flash write/erase error). The
            transition still proceeds, but we flag it so the QM fault path
            can record the anomaly instead of silently reporting success. */
         return -1;
     }
-    current_state = target;
+    obsw_state.current_state = target;
     return 0;
 }
 
@@ -155,7 +176,7 @@ static void check_battery_autonomous(void)
 
     if (bms.soc <= default_thresholds.b_scrit) {
         try_transition(STATE_CRIT, TRIGGER_BATTERY_LOW);
-    } else if (current_state == STATE_CRIT &&
+    } else if (obsw_state.current_state == STATE_CRIT &&
                bms.soc >= default_thresholds.b_opok) {
         try_transition(STATE_READY, TRIGGER_BATTERY_OK);
     }
@@ -208,7 +229,17 @@ void state_machine_init(void)
         .attr_bits = osMutexPrioInherit,
     };
     state_mutex = osMutexNew(&mtx_attrs);
-    current_state = STATE_OFF;
+
+    /* sram2_parity_init() copies the .sram2 image out of Flash before the
+       application starts. A wrong magic means that copy never happened (or
+       the block is corrupted), so restore the compile-time defaults rather
+       than running the mission on undefined data. */
+    if (obsw_state.magic != OBSW_STATE_MAGIC) {
+        (void)sram2_restore_from_image(&obsw_state, sizeof(obsw_state));
+    }
+
+    obsw_state.current_state            = STATE_OFF;
+    obsw_state.beacon_interval_override = 0U;
 }
 
 osThreadId_t state_machine_task_create(void)
@@ -224,7 +255,7 @@ obw_state_t state_machine_get_state(void)
 {
     obw_state_t s;
     osMutexAcquire(state_mutex, osWaitForever);
-    s = current_state;
+    s = obsw_state.current_state;
     osMutexRelease(state_mutex);
     return s;
 }
@@ -242,10 +273,10 @@ uint32_t state_machine_get_beacon_interval(void)
 {
     uint32_t interval;
     osMutexAcquire(state_mutex, osWaitForever);
-    if (beacon_interval_override != 0) {
-        interval = beacon_interval_override;
+    if (obsw_state.beacon_interval_override != 0) {
+        interval = obsw_state.beacon_interval_override;
     } else {
-        obw_state_t s = current_state;
+        obw_state_t s = obsw_state.current_state;
         switch (s) {
         case STATE_CRIT:   interval = BEACON_INTERVAL_CRIT;   break;
         case STATE_ACTIVE: interval = BEACON_INTERVAL_ACTIVE;  break;
@@ -273,7 +304,7 @@ int state_machine_set_beacon_interval(uint32_t interval_ms)
     }
 
     osMutexAcquire(state_mutex, osWaitForever);
-    beacon_interval_override = interval_ms;
+    obsw_state.beacon_interval_override = interval_ms;
     osMutexRelease(state_mutex);
     return 0;
 }

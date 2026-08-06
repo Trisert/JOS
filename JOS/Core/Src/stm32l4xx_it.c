@@ -25,6 +25,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "dual_bank.h"
+#include "sram2_parity.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -79,6 +80,11 @@ void NMI_Handler(void)
      the loop below would otherwise be a permanent silent hang and the
      fallback threshold could never be reached. See Core/Inc/dual_bank.h. */
   dual_bank_handle_boot_fault();
+  /* SRAM2 parity error (SYSCFG_CFGR2.SPF) and the RCC clock security
+     system both vector here. sram2_parity_nmi_handler() records the
+     failure context in the LastStates pool and resets the OBSW; it
+     never returns, so the spin below is unreachable (W2-3). */
+  sram2_parity_nmi_handler();
   /* USER CODE END NonMaskableInt_IRQn 0 */
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
    while (1)

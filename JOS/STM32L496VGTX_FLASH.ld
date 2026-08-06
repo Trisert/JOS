@@ -156,6 +156,45 @@ SECTIONS
 
   } >RAM AT> FLASH
 
+  /* ---- Critical runtime data in SRAM2 (hardware parity) - W2-3 ----
+     SRAM2 (64 KB @ 0x10000000) is the only RAM block on the STM32L496 with a
+     hardware parity bit per byte. The OBSW state struct and the comms buffers
+     live here so that a bit flip is detected (NMI) instead of silently used.
+
+     .sram2        : initialised data, load image kept in Flash and copied by
+                     sram2_parity_init() (startup.s only copies .data).
+     .sram2_noinit : NOLOAD buffers, zeroed by the SRAM2 hardware erase that
+                     sram2_parity_init() performs before any access.
+
+     NOTE: this block MUST stay *before* .fw_crc — .sram2 has its load image
+     in Flash (AT> FLASH), so placing it after the CRC word would push loaded
+     bytes past __fw_crc_start and break the boot CRC32 check (W2 / PR #10). */
+  _sisram2 = LOADADDR(.sram2);
+
+  .sram2 :
+  {
+    . = ALIGN(8);
+    _ssram2 = .;       /* start of the initialised SRAM2 image */
+    KEEP(*(.sram2))
+    KEEP(*(.sram2.*))
+    . = ALIGN(8);
+    _esram2 = .;       /* end of the initialised SRAM2 image */
+  } >RAM2 AT> FLASH
+
+  .sram2_noinit (NOLOAD) :
+  {
+    . = ALIGN(8);
+    _ssram2_noinit = .;
+    KEEP(*(.sram2_noinit))
+    KEEP(*(.sram2_noinit.*))
+    . = ALIGN(8);
+    _esram2_noinit = .;
+  } >RAM2
+
+  /* Bounds of the parity-protected block, used by sram2_parity.c */
+  _sram2_region_start = ORIGIN(RAM2);
+  _sram2_region_end   = ORIGIN(RAM2) + LENGTH(RAM2);
+
   /* Firmware image CRC32 — MUST stay the last loaded section so that the
      checked region is exactly [__fw_image_start, __fw_crc_start) and the
      stored CRC word is the last 4 bytes of the .bin image.
@@ -234,3 +273,7 @@ SECTIONS
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }
+
+/* Fail the build rather than silently truncating critical data. */
+ASSERT(_esram2_noinit <= (ORIGIN(RAM2) + LENGTH(RAM2)),
+       "SRAM2 critical data (.sram2 + .sram2_noinit) overflows the RAM2 region")
