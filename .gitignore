@@ -27,3 +27,6 @@ Thumbs.db
 
 # Archives
 *.zip
+
+# Ceedling build artifacts
+JOS/test/build/

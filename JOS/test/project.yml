@@ -1,3 +1,20 @@
+# Ceedling project configuration — RedPill OBSW host-side unit tests.
+#
+# Tests are compiled and run on the build host (x86_64 / aarch64) with the
+# native gcc; the STM32L4 HAL, the CMSIS-RTOS2 API and the FreeRTOS kernel are
+# replaced by the fake headers in test/fakes/ from which CMock generates mocks.
+#
+# Run with:  cd JOS/test && ceedling test:all
+#
+# Unity and CMock are taken from the installed Ceedling gem (build/vendor/...)
+# rather than vendored in-tree: a vendored Unity 2.6.1 against Ceedling 1.1.x
+# links against the 2.7 runner ABI and fails with undefined references to
+# UnityAssertEqualNumber. Letting Ceedling supply both keeps the framework
+# self-consistent on every host and in CI.
+#
+# Standards: ECSS-E-ST-40C §5.5 (unit testing), NASA-STD-8739.8 §7,
+#            JPL-182 (JPL Institutional Coding Standard for C).
+
 :project:
   :use_test_preprocessor: :none
   :use_dependencies: FALSE
@@ -13,16 +30,46 @@
     - +:test/**
   :source:
     - ../App/obsw
-    - vendor/unity/src
+    - ../App/comms
+    - ../App/memory
+    - ../App/aocs
   :include:
+    # fakes/ first: it shadows cmsis_os.h / FreeRTOS.h / task.h / main.h /
+    # stm32l4xx_hal.h, none of which can be compiled for the host.
+    - fakes
+    - ../App
     - ../App/obsw
-    - vendor/unity/src
+    - ../App/comms
+    - ../App/memory
+    - ../App/aocs
   :support:
     - support
-  :libraries:
+  :libraries: []
+
+:defines:
+  :test:
+    - _GNU_SOURCE          # MAP_FIXED_NOREPLACE in test_memory.c
 
 :cmock:
+  :mock_prefix: mock_
   :mock_path: test/mocks
+  :when_no_prototypes: :warn
+  :enforce_strict_ordering: FALSE
+  :verbosity: 2
+  :plugins:
+    - :ignore
+    - :ignore_arg
+    - :callback
+    - :expect_any_args
+    - :return_thru_ptr
+  :treat_as:
+    HAL_StatusTypeDef: INT
+    osStatus_t: INT
+    osPriority_t: INT
+    obw_state_t: INT
+    comms_tc_result_t: INT
+    TickType_t: UINT32
+    GPIO_PinState: INT
 
 :unittest:
   :test_file:
