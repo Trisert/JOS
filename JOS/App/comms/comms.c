@@ -1,4 +1,5 @@
 #include "comms.h"
+#include "comms_validate.h"
 #include "state_machine.h"
 #include "watchdog.h"
 #include "cmsis_os.h"
@@ -53,21 +54,53 @@ void comms_dispatch_command(uint8_t cmd_id, const uint8_t *payload, size_t len)
            the state machine range-check the value before it can affect the
            beacon cadence or the beacon watchdog period. A rejected or
            malformed command leaves the current cadence untouched. */
-        if ((payload != NULL) && (len >= 4u)) {
+        if ((payload != NULL) && (len >= 4U)) {
             uint32_t interval_ms = ((uint32_t)payload[0] << 24) |
                                    ((uint32_t)payload[1] << 16) |
                                    ((uint32_t)payload[2] << 8)  |
                                     (uint32_t)payload[3];
-            if (state_machine_set_beacon_interval(interval_ms) != 0) {
-                /* TODO: emit TC rejection telemetry (out-of-range argument) */
+            /* Defence in depth: comms_validate_tc() already range-checked this,
+             * re-check here so a direct caller cannot bypass the bounds.
+             * NASA-PoT #1 / NASA-STD-8739.8. */
+            if ((interval_ms == 0UL) ||
+                ((interval_ms >= COMMS_TC_BEACON_MIN_MS) &&
+                 (interval_ms <= COMMS_TC_BEACON_MAX_MS))) {
+                state_machine_set_beacon_interval(interval_ms);
             }
-        } else {
-            /* TODO: emit TC rejection telemetry (malformed argument) */
         }
         break;
     default:
         break;
     }
+}
+
+/* ---------- Uplink validation gate ---------- */
+
+/**
+ * Validate a raw uplink frame and dispatch it only if it is well formed,
+ * CRC-clean, of a known opcode and with in-range parameters. Every rejection
+ * is counted (comms_rx_get_stats) and never reaches the dispatcher.
+ *
+ * Standards: NASA-PoT #1 (bounds-checked, no overflow), NASA-STD-8739.8
+ * (command validation before execution).
+ */
+comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len)
+{
+    uint8_t        opcode      = 0U;
+    const uint8_t *payload     = NULL;
+    size_t         payload_len = 0U;
+
+    comms_tc_result_t result =
+        comms_validate_tc(frame, len, &opcode, &payload, &payload_len);
+
+    comms_rx_account(result);
+
+    if (result != COMMS_TC_OK) {
+        return result;   /* rejected — do NOT dispatch */
+    }
+
+    comms_dispatch_command(opcode, payload, payload_len);
+    return COMMS_TC_OK;
 }
 
 /* ---------- Beacon TX task ---------- */
@@ -136,7 +169,11 @@ void lora_rx_task(void *arg)
     for (;;) {
         watchdog_alive_self();
         /* TODO: enter RX mode, wait for interrupt, decode packet */
-        /* TODO: CRC check → decrypt → dispatch command */
+        /* TODO: enter RX mode, wait for DIO1 IRQ, read the PHY payload into
+         *       rx_buf / rx_len, decrypt, then gate it through:
+         *           (void)comms_rx_handle_frame(rx_buf, rx_len);
+         *       which performs structure + CRC + opcode + range validation and
+         *       dispatches only valid telecommands. */
         osDelay(pdMS_TO_TICKS(100));
     }
 }

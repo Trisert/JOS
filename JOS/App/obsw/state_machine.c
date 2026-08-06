@@ -2,6 +2,7 @@
 #include "memory.h"        /* laststates_write(): LastStates pool API */
 #include "watchdog.h"
 #include "boot_crc.h"
+>>>>>>> a8ff31b (feat(comms): validate uplink telecommands before dispatch (W2-4))
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
