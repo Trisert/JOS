@@ -29,6 +29,7 @@
 #include "memory.h"
 #include "comms.h"
 #include "faults.h"
+#include "mpu.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -96,7 +97,9 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  /* W2-1: lock down memory before anything else runs — kernel/task
+     isolation and no-execute SRAM (NASA-PoT #4, JPL-182). */
+  mpu_init();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
