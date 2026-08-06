@@ -7,6 +7,7 @@
 #include "main.h"
 #include "memory.h"         /* laststates_write() prototype */
 #include "sram2_parity.h"   /* SRAM2_CRITICAL placement (W2-3) */
+#include "seu_mitigation.h" /* redundant snapshot + scrubbing (W2-5) */
 #include <string.h>
 
 /* ---------- Private variables ---------- */
@@ -68,7 +69,19 @@ static bms_status_t bms_get_status(void)
 /* For testing: allow overriding SoC from outside */
 void bms_set_soc_stub(uint8_t soc)
 {
+    /* Update and re-snapshot atomically: the scrub task must never observe
+       the struct between the write and the commit, or it would "repair" a
+       legitimate change back to the previous value (W2-5). */
+    seu_mitigation_lock();
     obsw_state.bms.soc = soc;
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+    seu_mitigation_unlock();
+}
+
+void *state_machine_critical_region(size_t *len)
+{
+    if (len != NULL) { *len = sizeof(obsw_state); }
+    return &obsw_state;
 }
 
 /* ---------- LastStates logging ---------- */
@@ -165,7 +178,11 @@ static int try_transition(obw_state_t target, uint8_t trigger)
            can record the anomaly instead of silently reporting success. */
         return -1;
     }
+
+    seu_mitigation_lock();
     obsw_state.current_state = target;
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+    seu_mitigation_unlock();
     return 0;
 }
 
@@ -240,6 +257,11 @@ void state_machine_init(void)
 
     obsw_state.current_state            = STATE_OFF;
     obsw_state.beacon_interval_override = 0U;
+
+    /* seu_mitigation_init() runs after this function and takes the first
+       snapshot; the commit here is a no-op before that point and keeps the
+       shadow in step if the state machine is ever re-initialised. */
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
 }
 
 osThreadId_t state_machine_task_create(void)
@@ -304,7 +326,10 @@ int state_machine_set_beacon_interval(uint32_t interval_ms)
     }
 
     osMutexAcquire(state_mutex, osWaitForever);
+    seu_mitigation_lock();
     obsw_state.beacon_interval_override = interval_ms;
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+    seu_mitigation_unlock();
     osMutexRelease(state_mutex);
     return 0;
 }

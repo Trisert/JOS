@@ -26,6 +26,7 @@
 /* USER CODE BEGIN Includes */
 #include "dual_bank.h"
 #include "sram2_parity.h"
+#include "seu_mitigation.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -84,6 +85,10 @@ void NMI_Handler(void)
      system both vector here. sram2_parity_nmi_handler() records the
      failure context in the LastStates pool and resets the OBSW; it
      never returns, so the spin below is unreachable (W2-3). */
+  /* Count the upset in the RTC backup domain first: the call below
+     records the context and resets, so an in-RAM counter would not
+     survive its own event (W2-5). */
+  seu_mitigation_nmi_hook();
   sram2_parity_nmi_handler();
   /* USER CODE END NonMaskableInt_IRQn 0 */
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */

@@ -32,6 +32,7 @@
 #include "faults.h"
 #include "mpu.h"
 #include "sram2_parity.h"
+#include "seu_mitigation.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -179,6 +180,11 @@ int main(void)
   lora_init();
   state_machine_init();
   watchdog_monitor_init();
+  /* SEU mitigation (W2-5): snapshot the critical structures once their
+     owners are initialised, so the periodic scrub has a trustworthy
+     reference to vote against. Must run after sram2_parity_init(),
+     laststates_init(), lora_init() and state_machine_init(). */
+  seu_mitigation_init();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -215,6 +221,7 @@ int main(void)
   watchdog_task_create();
   lora_beacon_task_create();
   lora_rx_task_create();
+  seu_scrub_task_create();   /* low-priority RAM scrubber (W2-5) */
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */

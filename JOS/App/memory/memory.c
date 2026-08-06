@@ -1,6 +1,7 @@
 #include "memory.h"
 #include "main.h"
 #include "dual_bank.h"
+#include "seu_mitigation.h"   /* bookkeeping mirror scrubbing (W2-5) */
 #include <string.h>
 #include <stdint.h>
 
@@ -159,6 +160,17 @@ _Static_assert(((LASTSTATES_FLASH_BASE - DUAL_BANK_FLASH_BASE)
 _Static_assert(((LASTSTATES_FLASH_BASE - DUAL_BANK_FLASH_BASE) / DUAL_BANK_BANK_SIZE)
                == (((LASTSTATES_FLASH_END - 1U) - DUAL_BANK_FLASH_BASE) / DUAL_BANK_BANK_SIZE),
                "LastStates pool must not straddle the bank boundary");
+/* Pool bookkeeping, mirrored and scrubbed by seu_mitigation.c (W2-5). Kept
+   in one structure with a magic marker so the scrubber has something to vote
+   on and ground can recognise it in a dump. `idx` is THE write cursor of the
+   ring; `count` tracks how many valid records the last scan found plus the
+   records written since. */
+static laststates_mirror_t ls_mirror = {
+    .magic = LASTSTATES_MIRROR_MAGIC,
+    .count = 0U,   /* number of entries written */
+    .idx   = 0U,   /* next write index (circular) */
+};
+>>>>>>> e66cae8 (feat: SEU mitigation via periodic scrub + parity NMI (W2-5))
 
 /* Compile-time guards against the divide-by-zero class in this module (M1). */
 _Static_assert(LASTSTATES_MAX_ENTRIES > 0U, "LASTSTATES_MAX_ENTRIES must be > 0");
@@ -170,8 +182,6 @@ _Static_assert((LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE) % FLASH_PAGE_SIZ
                "LastStates pool must be a whole number of Flash pages");
 _Static_assert((FLASH_PAGE_SIZE & (FLASH_PAGE_SIZE - 1U)) == 0U,
                "FLASH_PAGE_SIZE must be a power of two (page mask)");
-
-static uint32_t ls_idx = 0;  /* next write index (circular) */
 
 /* ---------- DWT cycle counter (bounded Flash waits in the fault path) ----------
  * The fault handlers run with interrupts masked, so HAL_GetTick() never
@@ -192,6 +202,12 @@ static void dwt_cyccnt_enable(void)
         DWT->CYCCNT = 0U;
         DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
     }
+}
+
+void *laststates_mirror_region(size_t *len)
+{
+    if (len != NULL) { *len = sizeof(ls_mirror); }
+    return &ls_mirror;
 }
 
 static int slot_is_erased(uint32_t idx)
@@ -352,17 +368,40 @@ void laststates_init(void)
      * existing trail after the reboot (review C1). If the pool is completely
      * full we wrap to index 0 and the next write will recycle the oldest page.
      */
-    (void)laststates_resync();
+    uint32_t idx   = 0U;
+    uint32_t valid = 0U;
+    while (idx < LASTSTATES_MAX_ENTRIES) {
+        if (slot_is_erased(idx)) {
+            break;
+        }
+        idx++;
+    }
+    for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
+        if (!slot_is_erased(i)) {
+            valid++;
+        }
+    }
+
+    /* Publish the scanned cursor through the SEU-scrubbed bookkeeping mirror
+       and take its snapshot, so the scrub task votes on the real state from
+       the first cycle (W2-5). The commit is a no-op until
+       seu_mitigation_init() has registered the region. */
+    seu_mitigation_lock();
+    ls_mirror.magic = LASTSTATES_MIRROR_MAGIC;
+    ls_mirror.idx   = (idx < LASTSTATES_MAX_ENTRIES) ? idx : 0U;
+    ls_mirror.count = valid;
+    (void)seu_mitigation_commit(SEU_REGION_LASTSTATES);
+    seu_mitigation_unlock();
 }
 
 int laststates_write(const laststates_entry_t *entry)
 {
     if (entry == NULL) return -1;
 
-    /* Bounds guard: ls_idx is always in range after init, but never trust a
-       cached index against corruption. */
-    if (ls_idx >= LASTSTATES_MAX_ENTRIES) {
-        ls_idx = 0U;
+    /* Bounds guard: the cursor is always in range after init, but never trust
+       a cached index against corruption. */
+    if (ls_mirror.idx >= LASTSTATES_MAX_ENTRIES) {
+        ls_mirror.idx = 0U;
     }
 
     /* The pool has a second writer: Core/Src/dual_bank.c appends boot-fault
@@ -378,6 +417,7 @@ int laststates_write(const laststates_entry_t *entry)
     }
 
     uint32_t addr = LASTSTATES_FLASH_BASE + ls_idx * LASTSTATES_ENTRY_SIZE;
+    ls_mirror.idx = ls_idx;  /* keep the SEU scrubber mirror in sync (W2-5) */
 
     /* If the target slot STILL holds a valid (programmed) record after the
      * resync, the ring really has wrapped: recycle the OLDEST page it belongs
@@ -396,7 +436,15 @@ int laststates_write(const laststates_entry_t *entry)
         return -1;
     }
 
-    ls_idx = (ls_idx + 1U) & (LASTSTATES_MAX_ENTRIES - 1U);
+    /* Advance the bookkeeping and re-take its snapshot in one atomic step, so
+       the scrub task can never see the pair half-updated and mistake a
+       legitimate advance for a bit flip (W2-5). The lock is PRIMASK based, so
+       this is also safe on the parity-NMI path, which logs through here. */
+    seu_mitigation_lock();
+    ls_mirror.idx = (ls_mirror.idx + 1U) & (LASTSTATES_MAX_ENTRIES - 1U);
+    if (ls_mirror.count < LASTSTATES_MAX_ENTRIES) { ls_mirror.count++; }
+    (void)seu_mitigation_commit(SEU_REGION_LASTSTATES);
+    seu_mitigation_unlock();
     return 0;
 }
 
@@ -422,6 +470,8 @@ int laststates_dump_all(uint8_t *out, size_t *len)
 
 uint32_t laststates_count(void)
 {
+    /* Authoritative count comes from Flash, not from the cached mirror: page
+       recycling leaves gaps and a cached counter can itself be upset. */
     uint32_t valid = 0U;
     for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
         if (!slot_is_erased(i)) {
