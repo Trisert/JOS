@@ -216,9 +216,13 @@ int main(void)
   /* add events, ... */
   /* USER CODE END RTOS_EVENTS */
 
-  /* This boot reached the scheduler: clear the boot-fault evidence so the
-     dual-bank fallback threshold only counts genuinely failing boots. */
-  dual_bank_boot_complete();
+  /* NOTE: the boot is NOT declared good here. dual_bank_boot_complete() used
+     to run at this point, which closed the boot-fault window before a single
+     task had executed: an image that crashed as soon as the scheduler started
+     would still have been recorded as a healthy boot and the golden-image
+     fallback could never have armed. The declaration now happens from the
+     watchdog monitor task once the system has stayed alive for
+     DUAL_BANK_BOOT_OK_UPTIME_MS (App/obsw/watchdog.c). */
 
   /* Start scheduler */
   osKernelStart();

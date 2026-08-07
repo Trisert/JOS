@@ -19,6 +19,19 @@ _Static_assert(sizeof(laststates_entry_t) == LASTSTATES_ENTRY_SIZE,
                "LastStates entry must be exactly one 128-byte pool slot");
 _Static_assert((LASTSTATES_ENTRY_SIZE % 8U) == 0U,
                "LastStates entry must be a whole number of Flash double-words");
+_Static_assert((LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE)
+               <= DUAL_BANK_LASTSTATES_SIZE,
+               "LastStates ring does not fit in the reserved pool");
+
+/* G1 belt-and-braces: even a hand-tuned DUAL_BANK_GOLDEN_MAX_SIZE must never
+ * leave the golden trailer page shared with the forensic pool — writing the
+ * pool would then destroy the descriptor the switch is validated against. */
+#if DUAL_BANK_GOLDEN_SLOT_AVAILABLE
+#if ((DUAL_BANK_TRAILER_PAGE_BASE) < (DUAL_BANK_LASTSTATES_END)) && \
+    (((DUAL_BANK_TRAILER_PAGE_BASE) + (DUAL_BANK_PAGE_SIZE)) > (DUAL_BANK_LASTSTATES_BASE))
+#error "G1: LastStates pool shares the golden trailer page — relocate it outside bank 2"
+#endif
+#endif
 
 /* SYSCFG_MEMRMP.FB_MODE is the authoritative runtime answer to "which physical
  * bank am I executing from": the boot ROM sets it from BFB2 and the bank pair
@@ -32,10 +45,11 @@ _Static_assert((LASTSTATES_ENTRY_SIZE % 8U) == 0U,
  *
  * Lives in SRAM1 through the .boot_fault (NOLOAD) linker section, outside
  * [_sbss,_ebss): the startup code neither loads nor zeroes it, and SRAM keeps
- * its contents across a system reset. It is deliberately NOT in SRAM2, whose
- * parity initialisation (W2-3) rewrites the whole block at boot. If the
- * content is lost anyway (power cycle) the magic check fails and we fall back
- * to the Flash-persisted count — degraded, never wrong.
+ * its contents across a system reset — including the NVIC_SystemReset() the
+ * fault handler issues. It is deliberately NOT in SRAM2, whose parity
+ * initialisation (W2-3) rewrites the whole block at boot. If the content is
+ * lost anyway (power cycle) the magic check fails and we fall back to the
+ * Flash-persisted count — degraded, never wrong.
  * ------------------------------------------------------------------------- */
 #define DUAL_BANK_SCRATCH_MAGIC  0xB007FA17U
 
@@ -43,6 +57,7 @@ typedef struct {
     uint32_t magic;
     uint32_t fault_count;   /* faults recorded since the last good boot */
     uint32_t pending;       /* faults not yet written to LastStates     */
+    uint32_t ok_pending;    /* boot-OK marker not yet written           */
 } dual_bank_scratch_t;
 
 static volatile dual_bank_scratch_t db_scratch
@@ -54,6 +69,7 @@ static void scratch_init_if_needed(void)
         db_scratch.magic       = DUAL_BANK_SCRATCH_MAGIC;
         db_scratch.fault_count = 0U;
         db_scratch.pending     = 0U;
+        db_scratch.ok_pending  = 0U;
     }
 }
 
@@ -63,6 +79,7 @@ static uint32_t           db_active_bank  = 1U;
 static uint32_t           db_fault_count  = 0U;
 static bool               db_golden_valid = false;
 static uint32_t           db_optr         = 0U;
+static bool               db_bfb2_armed   = false;
 
 /* ===========================================================================
  * Option bytes
@@ -83,10 +100,31 @@ static uint32_t read_user_option_bytes(void)
     return ob.USERConfig;   /* FLASH->OPTR with the RDP field cleared */
 }
 
+/* Is the boot-from-bank-2 option bit programmed? Used two ways:
+ *   - G5, so we never reprogram an option byte that is already armed (each
+ *     OBProgram costs an erase/program cycle of the option area and an
+ *     OBL_LAUNCH reset — repeating it would be a reset loop);
+ *   - to detect the "armed but still executing bank 1" state, i.e. the switch
+ *     was programmed and the swap has not taken effect yet. */
+static bool option_bfb2_enabled(uint32_t optr)
+{
+#if defined(FLASH_OPTR_BFB2)
+    return (optr & FLASH_OPTR_BFB2) != 0U;
+#else
+    (void)optr;
+    return false;
+#endif
+}
+
 /* G2: is the part really organised as two 512 KB banks?
- * On 1 MB STM32L4 parts dual bank is permanent and the DUALBANK option bit
- * only configures the 512/256 KB parts (RM0351 §3.7.8), so trust the reported
- * Flash size first and only consult the option bit on smaller devices. */
+ * Two independent conditions, both required (RM0351 §3.7.8):
+ *   - the device reports 1 MB of Flash, i.e. two banks of DUAL_BANK_BANK_SIZE;
+ *   - the DUALBANK option bit is set. On the 1 MB STM32L496 this bit is
+ *     factory-programmed to 1, but it is writable, and a device shipped or
+ *     re-provisioned with it cleared has 4 KB pages and a single 1 MB bank —
+ *     BFB2 would then mean nothing and the switch must not happen. Checking
+ *     the reported size alone (the previous behaviour) silently trusted a bit
+ *     this gate claims to verify. */
 static bool geometry_is_dual_bank(uint32_t optr)
 {
     const uint32_t flash_size = (uint32_t)FLASH_SIZE;
@@ -94,14 +132,13 @@ static bool geometry_is_dual_bank(uint32_t optr)
     if (flash_size != (2U * DUAL_BANK_BANK_SIZE)) {
         return false;               /* not the 1 MB part this layout assumes */
     }
-    if (flash_size >= (1024U * 1024U)) {
-        return true;
-    }
 #if defined(FLASH_OPTR_DUALBANK)
     return (optr & FLASH_OPTR_DUALBANK) != 0U;
+#elif defined(FLASH_OPTR_DBANK)
+    return (optr & FLASH_OPTR_DBANK) != 0U;
 #else
     (void)optr;
-    return false;
+    return false;                   /* cannot prove it — refuse to switch */
 #endif
 }
 
@@ -164,7 +201,7 @@ bool dual_bank_verify_golden(void)
         return false;                       /* descriptor itself corrupt */
     }
     if ((tr->length < DUAL_BANK_GOLDEN_MIN_SIZE) ||
-        (tr->length > (DUAL_BANK_BANK_SIZE - sizeof(*tr)))) {
+        (tr->length > (DUAL_BANK_GOLDEN_MAX_SIZE - sizeof(*tr)))) {
         return false;
     }
     if (!golden_vector_table_sane(DUAL_BANK_GOLDEN_BASE)) {
@@ -184,9 +221,17 @@ bool dual_bank_verify_golden(void)
  *
  * The counter is persisted as ordinary LastStates entries (trigger
  * TRIGGER_BOOT_FAULT / TRIGGER_BOOT_OK), so existing ground forensics tooling
- * sees them in the normal 64 x 128 B ring. This module only ever programs
- * slots that are still erased and never erases the pool, so it cannot destroy
- * transition history written by App/memory/memory.c.
+ * sees them in the normal 64 x 128 B ring.
+ *
+ * Coexistence contract with App/memory/memory.c (the other writer):
+ *   - both writers append to the first still-erased slot; memory.c re-scans
+ *     before every write (laststates_write()), so an entry appended here
+ *     between two of its writes shifts its cursor instead of colliding with
+ *     it — programming a non-erased slot would fail and, before that fix,
+ *     wedged the forensic log permanently;
+ *   - this module NEVER erases the pool. memory.c owns the erase (only when
+ *     the ring wraps), which also clears our evidence. That is fail-safe: a
+ *     lost counter can only inhibit a fallback, never trigger one.
  * ========================================================================= */
 
 #define DB_LS_TAG  0x4B4E4244U   /* 'D','B','N','K' (LE) — marks our entries */
@@ -213,6 +258,18 @@ static bool ls_slot_is_ours(const laststates_entry_t *e)
     uint32_t tag;
     memcpy(&tag, e->context, sizeof(tag));
     return tag == DB_LS_TAG;
+}
+
+/* Index of the first erased slot, or LASTSTATES_MAX_ENTRIES if the pool is
+ * full (no room left for new evidence, in either direction). */
+static uint32_t ls_first_free_slot(void)
+{
+    for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
+        if (ls_slot_is_erased(ls_slot(i))) {
+            return i;
+        }
+    }
+    return LASTSTATES_MAX_ENTRIES;
 }
 
 /* Boot faults recorded after the most recent successful boot. */
@@ -244,14 +301,8 @@ static uint32_t ls_count_boot_faults(void)
 static int ls_append(uint8_t trigger, uint32_t value)
 {
     laststates_entry_t entry;
-    uint32_t slot = LASTSTATES_MAX_ENTRIES;
+    const uint32_t slot = ls_first_free_slot();
 
-    for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
-        if (ls_slot_is_erased(ls_slot(i))) {
-            slot = i;
-            break;
-        }
-    }
     if (slot >= LASTSTATES_MAX_ENTRIES) {
         return -1;
     }
@@ -298,23 +349,77 @@ void dual_bank_mark_boot_fault(void)
     __DSB();
 }
 
+void dual_bank_handle_boot_fault(void)
+{
+    dual_bank_mark_boot_fault();
+
+#if defined(DUAL_BANK_FAULT_NO_RESET)
+    /* Bench/debug build: keep the CPU in the faulting state for the debugger.
+     * The fallback cannot make progress in this configuration. */
+    for (;;) {
+        __NOP();
+    }
+#else
+    /* Flight behaviour. There is no IWDG in this build, so a fault handler
+     * that spins is a permanently silent spacecraft: nothing would ever reset
+     * us, dual_bank_init() would never run again, the evidence would never be
+     * persisted and the threshold could never be reached. Reset ourselves
+     * instead — the RAM scratch survives NVIC_SystemReset(), the next boot
+     * writes it to LastStates, and DUAL_BANK_BOOT_FAULT_THRESHOLD failed boots
+     * arm the golden-image fallback. A reset loop is recoverable (and visible
+     * from ground through the LastStates log); a frozen OBSW is not. */
+    __DSB();
+    __ISB();
+    NVIC_SystemReset();
+
+    for (;;) {          /* NVIC_SystemReset() does not return */
+        __NOP();
+    }
+#endif
+}
+
 uint32_t dual_bank_boot_fault_count(void)
 {
     return db_fault_count;
 }
 
-void dual_bank_boot_complete(void)
+bool dual_bank_boot_ok_pending(void)
+{
+    return (db_scratch.ok_pending != 0U);
+}
+
+int dual_bank_boot_complete(void)
 {
     scratch_init_if_needed();
 
     /* Only touch Flash when there is evidence to clear — a nominal boot must
      * not consume a pool slot on every power cycle. */
-    if (db_fault_count > 0U) {
-        (void)ls_append(TRIGGER_BOOT_OK, db_fault_count);
+    if ((db_fault_count == 0U) && (db_scratch.fault_count == 0U)) {
+        db_scratch.pending    = 0U;
+        db_scratch.ok_pending = 0U;
+        return 0;
     }
+
+    if (ls_append(TRIGGER_BOOT_OK, db_fault_count) != 0) {
+        /* Pool exhausted: the boot-OK marker is NOT recorded, so the persisted
+         * fault evidence still reads "this image keeps failing". Keep the
+         * counters as they are, flag the outstanding write and report the
+         * failure so the caller can retry. dual_bank_init() knows that an
+         * exhausted pool cannot be cleared and stops trusting the Flash
+         * evidence in that case (see below), so an unwritable marker can never
+         * provoke a spurious bank switch. */
+        db_scratch.ok_pending = 1U;
+        if (db_status == DUAL_BANK_PRIMARY_OK) {
+            db_status = DUAL_BANK_DEGRADED;
+        }
+        return -1;
+    }
+
     db_scratch.fault_count = 0U;
     db_scratch.pending     = 0U;
+    db_scratch.ok_pending  = 0U;
     db_fault_count         = 0U;
+    return 0;
 }
 
 /* ===========================================================================
@@ -333,7 +438,22 @@ int dual_bank_switch_to_golden(void)
         db_status = DUAL_BANK_ON_GOLDEN;
         return DUAL_BANK_SWITCH_ALREADY;
     }
-    if (!geometry_is_dual_bank(read_user_option_bytes())) {   /* G2 */
+
+    const uint32_t optr = read_user_option_bytes();
+
+    db_optr       = optr;
+    db_bfb2_armed = option_bfb2_enabled(optr);
+
+    if (db_bfb2_armed) {
+        /* G5 — BFB2 is already programmed but we are still executing bank 1:
+         * either the OBL_LAUNCH reset has not happened yet, or the boot ROM
+         * rejected bank 2 and fell back. Reprogramming the same value would
+         * burn the option area and could loop resets, so stop here and report
+         * the armed state. */
+        db_status = DUAL_BANK_FALLBACK_ARMED;
+        return DUAL_BANK_SWITCH_ALREADY;
+    }
+    if (!geometry_is_dual_bank(optr)) {               /* G2 */
         db_status = DUAL_BANK_NOT_DUAL;
         return DUAL_BANK_SWITCH_NOT_DUAL;
     }
@@ -363,7 +483,8 @@ int dual_bank_switch_to_golden(void)
         return DUAL_BANK_SWITCH_OB_FAILED;
     }
 
-    db_status = DUAL_BANK_FALLBACK_ARMED;
+    db_status     = DUAL_BANK_FALLBACK_ARMED;
+    db_bfb2_armed = true;
 
     /* OBL_LAUNCH reloads the option bytes and resets the device; the calls
      * below are only reached if that somehow does not happen. */
@@ -386,13 +507,23 @@ dual_bank_status_t dual_bank_init(void)
 
     db_optr        = read_user_option_bytes();
     db_active_bank = dual_bank_active_bank();
+    db_bfb2_armed  = option_bfb2_enabled(db_optr);
 
     /* Fold the evidence: what previous boots persisted, plus anything the
      * fault handlers recorded in RAM since the last successful boot. */
     const uint32_t persisted = ls_count_boot_faults();
     const uint32_t in_ram    = db_scratch.fault_count;
+    const bool     pool_full = (ls_first_free_slot() >= LASTSTATES_MAX_ENTRIES);
 
-    if (db_scratch.pending != 0U) {
+    if (pool_full) {
+        /* Nothing can be appended any more — neither a fault nor the boot-OK
+         * marker that clears it. The Flash evidence is therefore frozen and
+         * possibly stale, so only the RAM scratch (which a good boot does
+         * clear) may drive the switch decision. Fail-safe: the worst case is
+         * that a genuinely failing image is not detected across a power cycle,
+         * never that a healthy one is thrown away. */
+        db_fault_count = in_ram;
+    } else if (db_scratch.pending != 0U) {
         /* Write the RAM evidence through to Flash now that we are in thread
          * mode with the HAL available. One entry per faulting boot. */
         if (ls_append(TRIGGER_BOOT_FAULT, persisted + 1U) == 0) {
@@ -409,6 +540,15 @@ dual_bank_status_t dual_bank_init(void)
         /* Already running the golden image: report and stay. Recovery of the
          * primary image is a ground operation (re-upload + clear BFB2). */
         db_status = DUAL_BANK_ON_GOLDEN;
+        return db_status;
+    }
+
+    if (db_bfb2_armed) {
+        /* BFB2 programmed, yet the address map still shows bank 1: the switch
+         * is armed and pending (or the boot ROM refused bank 2). Report it and
+         * do not try to arm it again this boot. */
+        db_status = DUAL_BANK_FALLBACK_ARMED;
+        (void)dual_bank_verify_golden();   /* keep the health flag current */
         return db_status;
     }
 
@@ -440,6 +580,8 @@ dual_bank_status_t dual_bank_init(void)
         db_status = DUAL_BANK_NOT_DUAL;
     } else if (rc == DUAL_BANK_SWITCH_OB_FAILED) {
         db_status = DUAL_BANK_ERROR;
+    } else if (rc == DUAL_BANK_SWITCH_ALREADY) {
+        /* switch_to_golden() already latched ON_GOLDEN / FALLBACK_ARMED. */
     } else {
         db_status = DUAL_BANK_DEGRADED;
     }
@@ -450,3 +592,4 @@ dual_bank_status_t dual_bank_init(void)
 dual_bank_status_t dual_bank_get_status(void)      { return db_status; }
 bool               dual_bank_golden_valid(void)    { return db_golden_valid; }
 uint32_t           dual_bank_get_optr_snapshot(void) { return db_optr; }
+bool               dual_bank_bfb2_armed(void)      { return db_bfb2_armed; }

@@ -26,6 +26,26 @@
  * forensics and for re-upload from ground.
  *
  * ---------------------------------------------------------------------------
+ * HOW A FAILING BOOT ACTUALLY REACHES THE THRESHOLD  (no IWDG in this build)
+ *
+ * RedPill has no independent watchdog running yet (HAL_IWDG_MODULE_ENABLED is
+ * off and the software watchdog only monitors task liveness), so nothing
+ * external can reset a spinning fault handler. The fault handlers therefore
+ * drive the reset themselves:
+ *
+ *   fault -> dual_bank_handle_boot_fault()
+ *              -> dual_bank_mark_boot_fault()   (RAM scratch, ISR-safe)
+ *              -> NVIC_SystemReset()            (system reset, SRAM retained)
+ *   next boot -> dual_bank_init() writes the RAM evidence to LastStates
+ *   after DUAL_BANK_BOOT_FAULT_THRESHOLD such boots -> switch_to_golden()
+ *
+ * The counter therefore survives both the reset (RAM scratch, .boot_fault
+ * NOLOAD) and a power cycle (LastStates in Flash). Build with
+ * -DDUAL_BANK_FAULT_NO_RESET to keep the classic spin-forever behaviour for
+ * on-bench debugging; the fallback is then inert, which is why it is not the
+ * default for flight.
+ *
+ * ---------------------------------------------------------------------------
  * SAFETY / ANTI-BRICK CONTRACT  (read before changing anything here)
  *
  * Arming BFB2 with an unbootable bank 2 bricks the spacecraft: the boot ROM
@@ -33,17 +53,20 @@
  * physical access to BOOT0. dual_bank_switch_to_golden() therefore refuses to
  * touch the option bytes unless ALL of the following hold:
  *
- *   G1  the golden slot is not overlapped by another Flash user
- *       (compile-time, DUAL_BANK_GOLDEN_SLOT_AVAILABLE below);
- *   G2  the device really is in dual-bank mode (DUALBANK option bit) with two
- *       512 KB banks;
+ *   G1  no other Flash user overlaps ANY part of the golden slot — the whole
+ *       extent [DUAL_BANK_GOLDEN_BASE, +DUAL_BANK_GOLDEN_MAX_SIZE), trailer
+ *       included, not just the first vector table page (compile-time,
+ *       DUAL_BANK_GOLDEN_SLOT_AVAILABLE below);
+ *   G2  the device really is in dual-bank mode: 1 MB of Flash *and* the
+ *       DUALBANK option bit set (FLASH_OPTR_DUALBANK);
  *   G3  the golden image carries a valid trailer (magic + length + CRC32 +
  *       inverted CRC32) and its CRC32 recomputes correctly;
  *   G4  the golden vector table is sane: MSP inside SRAM, reset vector inside
  *       the *linked* Flash window (0x08000000..0x0807FFFF — the golden image
  *       is linked for the bank-1 view because BFB2 remaps bank 2 there) with
  *       the Thumb bit set;
- *   G5  we are not already running from the golden image (no ping-pong).
+ *   G5  we are not already running from the golden image, and BFB2 is not
+ *       already armed in the option bytes (no ping-pong, no OB rewrite loop).
  *
  * If any gate fails the OBSW keeps running the primary image and reports the
  * degraded state through dual_bank_get_status() — degrade, never brick.
@@ -54,15 +77,24 @@
  * The LastStates forensic pool lives at 0x08080000 (8 KB) — which is exactly
  * the base of Flash bank 2, i.e. the address the boot ROM fetches the golden
  * vector table from after a BFB2 swap. A golden image and the LastStates pool
- * cannot both own that address. Until the pool is relocated (proposal: top of
- * bank 2, 0x080FE000, which requires App/memory/memory.c, the LASTSTATES
- * linker region and the ground forensics tooling to move together), gate G1
- * evaluates false at compile time and the switch is permanently inhibited:
- * the mechanism is built, exercised and self-testing, but it will never
- * program BFB2 into a configuration that cannot boot.
+ * cannot both own that address, so gate G1 evaluates false at compile time
+ * and the switch is permanently inhibited: the mechanism is built, exercised
+ * and self-testing, but it will never program BFB2 into a configuration that
+ * cannot boot.
  *
- * Once the pool is relocated, rebuild with (for example)
- *     -DDUAL_BANK_LASTSTATES_BASE=0x080FE000U
+ * Relocating the pool is what unlocks the fallback, and the *whole of bank 2*
+ * is reserved for the golden image (image at the bottom, descriptor trailer at
+ * the very top), so the pool has to leave bank 2 entirely. Viable targets:
+ *
+ *   - top of bank 1, e.g. 0x0807E000 (last 8 KB of bank 1), with the FLASH
+ *     region in STM32L496VGTX_FLASH.ld capped at 504 KB; or
+ *   - the external FRAM (App/memory FM24VN10-G pool), which removes the
+ *     Flash-endurance problem altogether.
+ *
+ * memory.c derives its pool base from DUAL_BANK_LASTSTATES_BASE, so a
+ * relocation is one define plus the matching LASTSTATES region in the linker
+ * script plus the ground forensics tooling — rebuild with (for example)
+ *     -DDUAL_BANK_LASTSTATES_BASE=0x0807E000U
  * and the fallback arms itself with no code change.
  * ------------------------------------------------------------------------- */
 
@@ -74,6 +106,11 @@
 #define DUAL_BANK_BANK_SIZE         (512U * 1024U)
 #endif
 #define DUAL_BANK_BANK2_BASE        (DUAL_BANK_FLASH_BASE + DUAL_BANK_BANK_SIZE)
+#define DUAL_BANK_BANK2_END         (DUAL_BANK_BANK2_BASE + DUAL_BANK_BANK_SIZE)
+
+/* Flash page size in dual-bank mode (RM0351 §3.3.1): 2 KB. Erase granularity,
+ * and therefore the granularity at which two Flash users may coexist. */
+#define DUAL_BANK_PAGE_SIZE         (2U * 1024U)
 
 /* Golden image slot: bank 2 base. This is not a free choice — the boot ROM
  * fetches the vector table from the base of the bank selected by BFB2. */
@@ -81,20 +118,45 @@
 #define DUAL_BANK_GOLDEN_BASE       DUAL_BANK_BANK2_BASE
 #endif
 
-/* LastStates forensic pool (App/memory/memory.c LASTSTATES_FLASH_BASE and the
- * LASTSTATES region in STM32L496VGTX_FLASH.ld must agree with this). */
+/* Extent the golden slot really occupies. The image is linked for the bank-1
+ * view and may grow to the full bank; its trailer sits at the very top of the
+ * bank (DUAL_BANK_TRAILER_ADDR). So the reserved extent is the whole of bank 2
+ * and G1 must be checked against *that*, not against the vector table page.
+ * Shrinking this is only legitimate if ground tooling guarantees a smaller
+ * maximum image — the trailer page always stays reserved (see the trailer
+ * overlap guard in dual_bank.c). */
+#ifndef DUAL_BANK_GOLDEN_MAX_SIZE
+#define DUAL_BANK_GOLDEN_MAX_SIZE   ((DUAL_BANK_BANK2_END) - (DUAL_BANK_GOLDEN_BASE))
+#endif
+#define DUAL_BANK_GOLDEN_END        ((DUAL_BANK_GOLDEN_BASE) + (DUAL_BANK_GOLDEN_MAX_SIZE))
+
+/* LastStates forensic pool (App/memory/memory.c derives LASTSTATES_FLASH_BASE
+ * from this macro and the LASTSTATES region in STM32L496VGTX_FLASH.ld must
+ * agree with it).
+ *
+ * WARNING — do NOT relocate the pool to 0x080FE000 (or anywhere else inside
+ * bank 2). That address was floated in an earlier revision of this file and is
+ * *not* a safe target: bank 2 is reserved end-to-end for the golden image, and
+ * 0x080FE000..0x08100000 covers exactly the golden trailer
+ * (DUAL_BANK_TRAILER_ADDR = 0x080FFFF0) plus the top of the image. Putting the
+ * pool there would make G1 pass while LastStates writes silently destroy the
+ * golden descriptor — i.e. it would arm BFB2 towards an image we can no longer
+ * validate. Relocate outside bank 2 (top of bank 1, e.g. 0x0807E000, with the
+ * FLASH region capped to 504 KB) or move the pool to FRAM. */
 #ifndef DUAL_BANK_LASTSTATES_BASE
 #define DUAL_BANK_LASTSTATES_BASE   0x08080000U
 #endif
 #define DUAL_BANK_LASTSTATES_SIZE   (8U * 1024U)
+#define DUAL_BANK_LASTSTATES_END    ((DUAL_BANK_LASTSTATES_BASE) + (DUAL_BANK_LASTSTATES_SIZE))
 
-/* Smallest credible golden image (vector table + a little code). Used for the
- * compile-time overlap test and to reject nonsense trailer lengths. */
+/* Smallest credible golden image (vector table + a little code). Used to
+ * reject nonsense trailer lengths. */
 #define DUAL_BANK_GOLDEN_MIN_SIZE   0x400U
 
-/* G1: golden slot must not overlap the LastStates pool. */
-#if ((DUAL_BANK_GOLDEN_BASE) < ((DUAL_BANK_LASTSTATES_BASE) + (DUAL_BANK_LASTSTATES_SIZE))) && \
-    (((DUAL_BANK_GOLDEN_BASE) + (DUAL_BANK_GOLDEN_MIN_SIZE)) > (DUAL_BANK_LASTSTATES_BASE))
+/* G1: the LastStates pool must not overlap the golden slot anywhere in its
+ * full extent (classic half-open interval overlap test). */
+#if ((DUAL_BANK_GOLDEN_BASE) < (DUAL_BANK_LASTSTATES_END)) && \
+    ((DUAL_BANK_GOLDEN_END)  > (DUAL_BANK_LASTSTATES_BASE))
 #define DUAL_BANK_GOLDEN_SLOT_AVAILABLE 0
 #else
 #define DUAL_BANK_GOLDEN_SLOT_AVAILABLE 1
@@ -115,16 +177,28 @@ typedef struct {
 } dual_bank_golden_trailer_t;
 
 #define DUAL_BANK_TRAILER_ADDR \
-    ((DUAL_BANK_BANK2_BASE) + (DUAL_BANK_BANK_SIZE) - sizeof(dual_bank_golden_trailer_t))
+    ((DUAL_BANK_BANK2_END) - sizeof(dual_bank_golden_trailer_t))
+
+/* The trailer's erase page is reserved too: anything sharing that page would
+ * be destroyed when ground re-uploads the descriptor. */
+#define DUAL_BANK_TRAILER_PAGE_BASE ((DUAL_BANK_BANK2_END) - (DUAL_BANK_PAGE_SIZE))
 
 /* ---------- Boot-fault counter ----------
  * Incremented by dual_bank_mark_boot_fault() from the HardFault/NMI handlers
  * while the kernel is not running yet, persisted to the LastStates pool on
  * the following boot, and cleared by dual_bank_boot_complete() once a boot
- * has reached the scheduler. Three consecutive failed boots is the standard
- * "the image cannot come up" evidence threshold. */
+ * has proved itself. Three consecutive failed boots is the standard "the
+ * image cannot come up" evidence threshold. */
 #ifndef DUAL_BANK_BOOT_FAULT_THRESHOLD
 #define DUAL_BANK_BOOT_FAULT_THRESHOLD  3U
+#endif
+
+/* A boot only counts as good once the scheduler has actually kept the system
+ * alive for this long (see dual_bank_boot_complete() and the watchdog monitor
+ * task). Declaring success at osKernelStart() would close the window before
+ * the tasks that usually break a boot have ever run. */
+#ifndef DUAL_BANK_BOOT_OK_UPTIME_MS
+#define DUAL_BANK_BOOT_OK_UPTIME_MS     5000U
 #endif
 
 /* ---------- Status ---------- */
@@ -144,7 +218,7 @@ typedef enum {
     DUAL_BANK_SWITCH_INHIBITED   = -1,  /* G1 failed                        */
     DUAL_BANK_SWITCH_NO_GOLDEN   = -2,  /* G3/G4 failed                     */
     DUAL_BANK_SWITCH_NOT_DUAL    = -3,  /* G2 failed                        */
-    DUAL_BANK_SWITCH_ALREADY     = -4,  /* G5: already on golden            */
+    DUAL_BANK_SWITCH_ALREADY     = -4,  /* G5: on golden, or BFB2 already on */
     DUAL_BANK_SWITCH_OB_FAILED   = -5,  /* option-byte programming failed   */
 } dual_bank_switch_err_t;
 
@@ -163,10 +237,24 @@ dual_bank_status_t dual_bank_init(void);
  * written through to the LastStates pool by the next dual_bank_init(). */
 void dual_bank_mark_boot_fault(void);
 
+/* Full fault-handler action: record the fault and reset the device so the
+ * next boot can persist and act on the evidence. Does not return (it either
+ * resets or, with -DDUAL_BANK_FAULT_NO_RESET, spins for the debugger).
+ * This is what makes the boot-fault threshold reachable without an IWDG. */
+void dual_bank_handle_boot_fault(void);
+
 /* Declare this boot successful: clears the RAM scratch and, if faults had
  * been persisted, appends a boot-OK marker to LastStates so the counter
- * restarts from zero. Call once, just before osKernelStart(). */
-void dual_bank_boot_complete(void);
+ * restarts from zero.
+ *
+ * Returns 0 when the boot-OK state is safely recorded (including the nominal
+ * case where there was nothing to clear) and -1 when the marker could not be
+ * persisted (LastStates pool exhausted). On -1 the evidence is left intact and
+ * the call should be retried later — dual_bank_boot_ok_pending() reports the
+ * outstanding state. Call from a running task once the system has proved
+ * itself (DUAL_BANK_BOOT_OK_UPTIME_MS), not from main() before the scheduler
+ * starts. */
+int dual_bank_boot_complete(void);
 
 /* Arm BFB2 and reset into the golden image. Runs gates G1..G5 first and
  * returns a negative dual_bank_switch_err_t if any of them fails; on success
@@ -179,6 +267,8 @@ uint32_t dual_bank_active_bank(void);        /* 1 = primary, 2 = golden       */
 uint32_t dual_bank_boot_fault_count(void);   /* faults since last good boot   */
 bool     dual_bank_golden_valid(void);       /* result of the last G3/G4 run  */
 uint32_t dual_bank_get_optr_snapshot(void);  /* user option bytes as read     */
+bool     dual_bank_bfb2_armed(void);         /* BFB2 set in the option bytes  */
+bool     dual_bank_boot_ok_pending(void);    /* boot-OK marker still unwritten */
 
 /* Re-run the golden-image validation (G3/G4). Read-only; exposed for ground
  * commanded self-tests and for unit testing. */
