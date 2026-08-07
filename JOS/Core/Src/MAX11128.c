@@ -12,8 +12,6 @@
  */
 #include "MAX11128.h"
 #include <stdint.h>
-#include <stdio.h>
-#include <math.h>
 
 void 	MAX11128_Initialize(MAX11128_t *adc, SPI_HandleTypeDef *spiHandle)  //Initialize SPI on MAX11128
 {	/* SET STRUCT PARAMETERS */
@@ -51,8 +49,6 @@ float	MAX11128_ADC_ReadVoltCH(MAX11128_t *adc,uint8_t CH) //Read voltage CHx on 
 	{  // Check if CH is <= 15 as we have 16 channel
 		uint16_t ADC_MODE = 0x0804|(CH<<7);
 		uint8_t ADC_MODE_CTRL[2],ADC_Receive[2];
-		uint16_t ADC_Value;
-		float ADC_CH;
 		ADC_MODE_CTRL[0] = (ADC_MODE&(0XFF00))>>8;
 		ADC_MODE_CTRL[1] = (ADC_MODE&(0X00FF));
 		// send ADC_Mode_Control the receive 16 bit data
@@ -64,6 +60,8 @@ float	MAX11128_ADC_ReadVoltCH(MAX11128_t *adc,uint8_t CH) //Read voltage CHx on 
 		// check if CHAN_ID is correct
 		if (CH == ((ADC_Receive[0]&(0xF0)) >> 4 ))
 		{
+			uint16_t ADC_Value;
+			float    ADC_CH;
 			ADC_Value = (((uint16_t)(ADC_Receive[0])) << 8 ) | ADC_Receive[1];
 			ADC_Value =  ADC_Value & (0x0FFF);	//remove CHAN_ID to get ADC 12 bit value
 			ADC_CH    = (float)(MAX1112XVREF * ADC_Value)/((1u << MAX1112XBIT) - 1);

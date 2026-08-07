@@ -7,59 +7,76 @@ on:
     branches: [main]
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Static analysis gate.
+  #
+  # SCOPE: first-party code ONLY -- `JOS/App` and the hand-written CubeMX
+  # `JOS/Core/Src` sources. The vendored trees (`JOS/Drivers` = STM32 HAL +
+  # CMSIS, `JOS/Middlewares` = FreeRTOS, `JOS/Core/Inc/RadioLib`) are NOT
+  # analysed; they are only on the include path so first-party headers resolve,
+  # and their findings are silenced with PATH-SCOPED suppressions so no check id
+  # is ever disabled for code we own.
+  #
+  # SINGLE SOURCE OF TRUTH: every flag, include path, define, exclusion and
+  # suppression lives in the `cppcheck` target of `JOS/Makefile`, derived from
+  # the same $(INCLUDES)/$(C_DEFS) the compiler uses. This workflow only calls
+  # `make`, so the gate cannot drift from the real build. Run
+  # `make -C JOS cppcheck-print` to see the exact command.
+  # ---------------------------------------------------------------------------
+  static-analysis:
+    # The runner image is PINNED (deliberately not `ubuntu-latest`): the
+    # cppcheck finding set is version dependent, so an image refresh must not be
+    # able to change the gate result behind our backs.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned cppcheck
+        run: |
+          sudo apt-get update
+          # PINNED VERSION. ubuntu-24.04 (noble/universe) ships exactly
+          # cppcheck 2.13.0-2ubuntu3. Pinning matters because a cppcheck bump
+          # can add, drop or retune checks (e.g. `constParameter` was split into
+          # `constParameterPointer` in 2.11+) and would silently change what
+          # this gate accepts. If this install ever fails, the archive moved:
+          # bump it here AND bump CPPCHECK_VERSION in JOS/Makefile in the same
+          # PR, after re-running the gate and triaging any new findings.
+          sudo apt-get install -y --no-install-recommends cppcheck=2.13.0-2ubuntu3
+          cppcheck --version
+
+      # Canary: proves the gate is still capable of failing BEFORE we trust a
+      # green result on the real tree. It generates a throwaway C file with an
+      # out-of-bounds array write and a NULL dereference, runs cppcheck over it
+      # with the EXACT same flags as the real gate, deletes the file, and exits
+      # non-zero if cppcheck came back clean.
+      #
+      # This is not theoretical: the first version of this gate suppressed
+      # `preprocessorErrorDirective` and never defined `__GNUC__`, so
+      # cmsis_compiler.h hit `#error Unknown compiler`, cppcheck abandoned the
+      # configuration without analysing anything and exited 0 on every run. The
+      # canary #includes main.h and FreeRTOS.h, so it walks the same
+      # HAL/CMSIS/FreeRTOS-portable include chain and reproduces that failure
+      # mode -- it is verified to go red under the old flags.
+      - name: Canary (assert the cppcheck gate can fail)
+        run: make -C JOS cppcheck-canary
+
+      - name: Static analysis (cppcheck, first-party only)
+        run: make -C JOS cppcheck
+
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ARM GCC toolchain and cppcheck
+      - name: Install ARM GCC toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-none-eabi \
             libnewlib-arm-none-eabi \
-            libstdc++-arm-none-eabi-newlib \
-            cppcheck
-
-      # Static analysis gate. Scope: first-party code only (JOS/App + the
-      # hand-written CubeMX Core sources). Vendored trees (RadioLib, STM32 HAL,
-      # FreeRTOS, the ST asm330lhh register driver) and the generated newlib
-      # syscall stubs are excluded: we do not own that code, and its findings
-      # would make the gate permanently red instead of actionable.
-      - name: Static analysis (cppcheck)
-        run: |
-          cppcheck --version
-          cppcheck --enable=all --std=c11 --error-exitcode=1 \
-            --inline-suppr \
-            --suppress=missingIncludeSystem \
-            --suppress=missingInclude \
-            --suppress=unusedFunction \
-            --suppress=checkersReport \
-            --suppress=unmatchedSuppression \
-            --suppress=toomanyconfigs \
-            --suppress=normalCheckLevelMaxBranches \
-            --suppress=preprocessorErrorDirective \
-            -DUSE_HAL_DRIVER -DSTM32L496xx \
-            -I JOS/Core/Inc \
-            -I JOS/App \
-            -I JOS/App/obsw \
-            -I JOS/App/bms \
-            -I JOS/App/memory \
-            -I JOS/App/comms \
-            -I JOS/App/aocs \
-            -I JOS/App/payloads \
-            -I JOS/Drivers/STM32L4xx_HAL_Driver/Inc \
-            -I JOS/Drivers/STM32L4xx_HAL_Driver/Inc/Legacy \
-            -I JOS/Drivers/CMSIS/Device/ST/STM32L4xx/Include \
-            -I JOS/Drivers/CMSIS/Include \
-            -I JOS/Middlewares/Third_Party/FreeRTOS/Source/include \
-            -I JOS/Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2 \
-            -i JOS/Core/Src/asm330lhh_reg.c \
-            -i JOS/Core/Src/syscalls.c \
-            -i JOS/Core/Src/sysmem.c \
-            -i JOS/Core/Src/system_stm32l4xx.c \
-            JOS/App JOS/Core/Src
+            libstdc++-arm-none-eabi-newlib
 
       - name: Build firmware
         working-directory: JOS
