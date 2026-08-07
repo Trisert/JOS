@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "state_machine.h"
 #include "watchdog.h"
+#include "boot_crc.h"
 #include "bms.h"
 #include "memory.h"
 #include "comms.h"
@@ -122,6 +123,24 @@ int main(void)
   MX_SPI2_Init();
   MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
+  /* Firmware image integrity check — ECSS-E-ST-40C 5.4 (software integrity),
+     NASA-STD-8739.8 (fault detection). Pure-software CRC32 over
+     [__fw_image_start, __fw_crc_start); no HAL/peripheral dependency and no
+     task exists yet, so a corrupted image is caught before osKernelStart().
+     The result is latched in boot_crc.c for beacon telemetry.
+     RedPill carries no golden image or bootloader, so a mismatch must NOT
+     brick the satellite: by default we boot and report, letting ground
+     re-upload. Build with -DBOOT_CRC_FATAL to halt in Error_Handler(). */
+  boot_crc_status_t img_integrity = boot_crc_verify();
+#ifdef BOOT_CRC_FATAL
+  if (img_integrity == BOOT_CRC_MISMATCH)
+  {
+    Error_Handler();
+  }
+#else
+  (void)img_integrity;
+#endif
+
   bms_init();
   fram_init();
   cyclic_buffer_init();
@@ -155,6 +174,12 @@ int main(void)
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
+  /* defaultTask is created by CubeIDE above; register it here so every
+     running task is watchdog-monitored (docs/dev/hardening.md 3.1). */
+  if (defaultTaskHandle != NULL)
+  {
+    (void)watchdog_register_task(defaultTaskHandle, WDG_PERIOD_DEFAULT_TASK_MS);
+  }
   state_machine_task_create();
   watchdog_task_create();
   lora_beacon_task_create();
@@ -628,6 +653,7 @@ void StartDefaultTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
+    watchdog_alive_self();
     osDelay(1);
   }
   /* USER CODE END 5 */
