@@ -35,8 +35,12 @@
  * The fake image. Deterministic pattern ((i * 7 + 3) ^ (i << 1)) & 0xFF, so
  * its CRC-32 is a fixed known-answer value (HOST_FW_IMAGE_CRC) obtained from
  * an independent implementation (Python zlib.crc32).
+ *
+ * `const` matches boot_crc.c's `extern const uint8_t __fw_image_start[]`
+ * exactly. Nothing ever writes through this symbol (it stands in for a Flash
+ * ORIGIN address), so there is no reason to drop the qualifier.
  * ------------------------------------------------------------------------- */
-uint8_t __fw_image_start[HOST_FW_IMAGE_LEN] = {
+const uint8_t __fw_image_start[HOST_FW_IMAGE_LEN] = {
     0x03u, 0x08u, 0x15u, 0x1Eu, 0x17u, 0x2Cu, 0x21u, 0x3Au,
     0x2Bu, 0x50u, 0x5Du, 0x46u, 0x4Fu, 0x44u, 0x79u, 0x72u,
     0x53u, 0x58u, 0xA5u, 0xAEu, 0xA7u, 0xBCu, 0xB1u, 0x8Au,
@@ -81,18 +85,23 @@ __asm__(".globl __fw_crc_start\n\t"
  * (e.g. test_laststates); an unresolved weak reference is simply NULL instead
  * of a link error.
  *
- * Casting the const away is deliberate and is precisely what the real flow
- * does: on target the word sits in Flash and is patched post-link by
- * tools/fw_crc_stamp.py. `volatile` keeps the compiler from caching it.
+ * The qualifier must NOT be dropped here: the section attributes of `.fw_crc`
+ * come from the *definition* in boot_crc.c, not from this declaration, and a
+ * declaration whose type disagrees with the definition is undefined behaviour
+ * (C11 6.2.7p2) that buys nothing.
  *
- * The page must be made writable first. Because the object is const-qualified,
- * the section flags GCC emits for `.fw_crc` are target dependent: on aarch64
- * the section comes out "WA" (writable) but on x86_64 it comes out "A"
- * (read-only), so a bare store segfaults there. One mprotect() on the
- * containing page makes the behaviour identical on both, which matters because
- * developers build on arm64 and CI runs on x86_64.
+ * Casting the const away in host_fw_crc_slot() is deliberate and is precisely
+ * what the real flow does: on target the word sits in Flash and is patched
+ * post-link by tools/fw_crc_stamp.py. The round trip through `uintptr_t`
+ * launders the qualifiers, so no -Wcast-qual diagnostic is triggered.
+ * `volatile` keeps the compiler from caching the value.
+ *
+ * The page still has to be made writable at run time: a const object is
+ * emitted into a read-only-mapped section, so a bare store would segfault.
+ * One mprotect() on the containing page is enough and behaves the same on
+ * aarch64 (developer machines) and x86_64 (CI).
  * ------------------------------------------------------------------------- */
-extern volatile uint32_t fw_crc_stored __attribute__((weak));
+extern const volatile uint32_t fw_crc_stored __attribute__((weak));
 
 static volatile uint32_t *host_fw_crc_slot(void)
 {

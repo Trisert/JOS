@@ -105,7 +105,13 @@ void test_boot_crc32_detects_single_bit_flip(void)
     TEST_ASSERT_NOT_EQUAL(clean, boot_crc32(buf, sizeof(buf)));
 }
 
-void test_boot_crc32_is_deterministic(void)
+/* Known-answer vector over a binary (non-ASCII) buffer, so the byte path is
+ * pinned for values above 0x7F as well. buf[i] = i * 7 + 3, i in [0, 32);
+ * both check values come from Python zlib.crc32(), an independent
+ * implementation. The flipped-bit variant is a second known answer, not just
+ * "different from the clean one": a corrupted block must hash to exactly this
+ * value, which also catches an implementation that merely scrambles input. */
+void test_boot_crc32_binary_ramp_known_answer(void)
 {
     uint8_t buf[32];
     int     i;
@@ -113,7 +119,25 @@ void test_boot_crc32_is_deterministic(void)
     for (i = 0; i < 32; i++) {
         buf[i] = (uint8_t)(i * 7 + 3);
     }
-    TEST_ASSERT_EQUAL_HEX32(boot_crc32(buf, sizeof(buf)), boot_crc32(buf, sizeof(buf)));
+
+    TEST_ASSERT_EQUAL_HEX32(0xA10E8695u, boot_crc32(buf, sizeof(buf)));
+
+    buf[17] ^= 0x01u;
+    TEST_ASSERT_EQUAL_HEX32(0x18F55D7Du, boot_crc32(buf, sizeof(buf)));
+}
+
+/* A truncated read of the same buffer must not produce the full-length CRC:
+ * length is part of the message, so short reads are detectable. */
+void test_boot_crc32_is_length_sensitive(void)
+{
+    uint8_t buf[32];
+    int     i;
+
+    for (i = 0; i < 32; i++) {
+        buf[i] = (uint8_t)(i * 7 + 3);
+    }
+
+    TEST_ASSERT_NOT_EQUAL(0xA10E8695u, boot_crc32(buf, sizeof(buf) - 1u));
 }
 
 /* Cross-check the host fixture itself: the expected image CRC baked into

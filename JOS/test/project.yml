@@ -34,10 +34,17 @@
 :paths:
   :test:
     - +:test/**
+  # Only modules that are host-compilable are on the source path. In
+  # particular ../Core/Src is NOT: it is CubeMX-generated (main.c,
+  # stm32l4xx_it.c, stm32l4xx_hal_msp.c, system_stm32l4xx.c, syscalls.c ...),
+  # it pulls the whole HAL/CMSIS/FreeRTOS tree, and Ceedling would happily
+  # feed main.c to the host gcc for any test that includes "main.h" (the test
+  # build uses fakes/main.h instead). If a Core/Src module ever becomes
+  # host-testable, add that one file explicitly under :files: :source: rather
+  # than putting the whole directory back on the path.
   :source:
     - ../App/obsw
     - ../App/memory
-    - ../Core/Src
   :include:
     - ../App
     - ../App/obsw
@@ -79,3 +86,30 @@
   :load_paths: []
   :enabled:
     - gcov
+
+# =============================================================================
+# Coverage
+# =============================================================================
+# `ceedling gcov:all` produces a real, enforced number: gcovr must be
+# installed (CI installs it) and the run fails if line or branch coverage of
+# the modules under test drops below the thresholds below. Reporting coverage
+# without a threshold is a gate that cannot fail, which is worse than no gate
+# because it looks like one.
+:gcov:
+  :summaries: TRUE
+  :report_task: FALSE
+  :utilities:
+    - gcovr
+  :reports:
+    - Text
+  :gcovr:
+    :report_root: ".."
+    :report_exclude: '^(test|build|Drivers|Middlewares|Core)[\\/]'
+    :sort_percentage: TRUE
+    :print_summary: TRUE
+    # Without :exception_on_fail the plugin only prints a warning and still
+    # exits 0, i.e. the threshold below would be decoration. TRUE turns a
+    # coverage regression into a failed build.
+    :exception_on_fail: TRUE
+    :fail_under_line: 90
+    :fail_under_branch: 75

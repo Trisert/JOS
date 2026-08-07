@@ -8,12 +8,21 @@
  *   4x FM24VN10-G (1 Mbit each, I2C interface) = 4 Mbit total.
  *   All four FM24VN10-G devices are on the OBC PCB.
  *
- * I2C addresses: 0x50, 0x51, 0x52, 0x53 (A0/A1 pins select chip).
+ * Device select byte: 1 0 1 0 A2 A1 A0 R/W, i.e. 7-bit addresses
+ * 0x50, 0x51, 0x52, 0x53 (A0/A1 pins select the chip).
+ *
+ * The STM32 HAL I2C API takes the device address *already shifted left by
+ * one* (the 8-bit form including the R/W bit position), so the values handed
+ * to HAL_I2C_Mem_Read/Write must be 0xA0, 0xA2, 0xA4, 0xA6 -- not the raw
+ * 7-bit ones. Passing 0x50 puts 0x28 on the bus and addresses nothing.
+ *
  * Each chip: 128 Kbit = 16 KB address space.
  * Total: 4 x 16 KB = 64 KB.
  */
 
-#define FM24VN_I2C_ADDR_BASE  0x50
+#define FM24VN_I2C_ADDR_7BIT  0x50            /* A2..A0 = 000 for the first chip */
+#define FM24VN_I2C_ADDR_BASE  (FM24VN_I2C_ADDR_7BIT << 1)   /* 0xA0, HAL 8-bit form */
+#define FM24VN_I2C_ADDR_STEP  (1u << 1)       /* one 7-bit address per chip */
 #define FM24VN_PAGE_SIZE      16
 #define FM24VN_CHIP_SIZE      (16UL * 1024)
 #define FM24VN_NUM_CHIPS      4
@@ -23,7 +32,8 @@ extern I2C_HandleTypeDef hi2c2;
 
 static uint8_t fram_addr_to_chip(uint32_t addr)
 {
-    return (uint8_t)((addr / FM24VN_CHIP_SIZE) + FM24VN_I2C_ADDR_BASE);
+    return (uint8_t)(FM24VN_I2C_ADDR_BASE +
+                     (addr / FM24VN_CHIP_SIZE) * FM24VN_I2C_ADDR_STEP);
 }
 
 static uint16_t fram_addr_to_offset(uint32_t addr)
@@ -198,11 +208,28 @@ int laststates_write(const laststates_entry_t *entry)
     return 0;
 }
 
+/* Serialise the whole pool into the caller's buffer.
+ *
+ * *len is IN/OUT: on entry it is the capacity of `out` in bytes, on a
+ * successful return it holds the number of bytes written. The pool can hold
+ * LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE = 8 KB, so a caller that
+ * sized `out` for a couple of entries must not be handed the whole pool:
+ * a too-small buffer is refused (-1) with *len set to the size required. */
 int laststates_dump_all(uint8_t *out, size_t *len)
 {
+    size_t needed;
+
     if (!out || !len) return -1;
-    *len = ls_count * LASTSTATES_ENTRY_SIZE;
-    memcpy(out, (const uint8_t *)LASTSTATES_FLASH_BASE, *len);
+
+    needed = (size_t)ls_count * LASTSTATES_ENTRY_SIZE;
+
+    if (*len < needed) {
+        *len = needed;          /* tell the caller how much it would take */
+        return -1;
+    }
+
+    memcpy(out, (const uint8_t *)LASTSTATES_FLASH_BASE, needed);
+    *len = needed;
     return 0;
 }
 

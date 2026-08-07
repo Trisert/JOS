@@ -35,6 +35,6 @@ Flash-backed ring buffer of state transitions — primary forensic tool.
 |----------|---------|
 | `laststates_write(state_entry_t *entry)` | Write one entry; erases/reclaims pool pages on wrap (STM32L4 **pages**, not sectors). Returns `int`. |
 | `laststates_log(...)` | Hook called on every transition; returns `int` so errors propagate to `try_transition`. |
-| `laststates_dump_all(uint8_t *out, size_t *len)` | Serialise pool for downlink (`SEND_DATA` with LastStates alias). |
+| `laststates_dump_all(uint8_t *out, size_t *len)` | Serialise pool for downlink (`SEND_DATA` with LastStates alias). `*len` is in/out: capacity in, bytes written out; a too-small buffer is refused with `-1` and `*len` set to the required size. |
 
 > Implemented (PR #1). Previously a stub.

@@ -63,11 +63,29 @@ jobs:
       - name: Install Ceedling
         run: gem install ceedling -v 1.1.3 --no-document
 
+      # gcovr is what actually computes the coverage numbers behind
+      # `ceedling gcov:all`. Without it installed the plugin degrades to a
+      # console summary that cannot fail, so this is a hard install step and
+      # the version is echoed into the log.
+      - name: Install gcovr
+        run: |
+          pipx install gcovr || python3 -m pip install --user gcovr
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Show coverage tool versions
+        run: |
+          gcovr --version
+          gcov --version | head -1
+
       - name: Run unit tests
         working-directory: JOS/test
         run: ceedling test:all
 
-      - name: Report code coverage
+      # Enforced gate: JOS/test/project.yml sets :fail_under_line /
+      # :fail_under_branch together with :exception_on_fail, so this step exits
+      # non-zero when coverage of the modules under test drops below the
+      # thresholds (verified locally: 99% threshold -> exit 1).
+      - name: Enforce code coverage thresholds
         working-directory: JOS/test
         run: ceedling gcov:all
 
@@ -77,4 +95,12 @@ jobs:
         with:
           name: unit-test-results
           path: JOS/test/build/test/results/
+          if-no-files-found: warn
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-coverage
+          path: JOS/test/build/artifacts/gcov/
           if-no-files-found: warn

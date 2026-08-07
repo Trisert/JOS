@@ -9,6 +9,7 @@ directory.
 
 ```sh
 gem install ceedling          # once; Unity and CMock come with the gem
+pipx install gcovr            # once; required by `ceedling gcov:all`
 cd JOS/test && ceedling test:all
 ```
 
@@ -48,16 +49,35 @@ the resulting failures look like flight-code bugs. One version, from one place.
 | `test_bad_region.c` | `App/obsw/boot_crc.c` | the `BOOT_CRC_BAD_REGION` guard, built with `-DHOST_FW_BAD_REGION` |
 | `test_laststates.c` | `App/memory/memory.c` | LastStates Flash round trip, wrap/erase protocol, FRAM + cyclic buffer |
 
-Coverage of the modules under test (`ceedling gcov:all`):
+## Coverage gate
+
+`ceedling gcov:all` is an **enforced** gate, not a report. `project.yml` sets
+
+```yaml
+:fail_under_line:   90
+:fail_under_branch: 75
+:exception_on_fail: TRUE     # without this the plugin only warns and exits 0
+```
+
+so the command exits non-zero when coverage of the modules under test drops
+below those numbers. It needs `gcovr` on `PATH`; CI installs it explicitly and
+prints its version, because a missing gcovr silently degrades the gate.
+
+Current numbers (gcovr, `App/obsw` + `App/memory` only):
 
 ```
-boot_crc.c | Lines executed: 90.00% of 30   Branches executed: 100.00% of 10
-memory.c   | Lines executed: 91.11% of 90   Branches executed: 100.00% of 46
+lines:     93.5% (116 / 124)
+functions: 100.0% (22 / 22)
+branches:  77.6% (45 / 58)
 ```
 
-(`boot_crc.c`'s remaining 10% is the `BOOT_CRC_BAD_REGION` block, which is
-covered by the separate `test_bad_region` executable — gcov reports the two
-executables separately.)
+(`boot_crc.c`'s uncovered lines in the `test_boot_crc` executable are the
+`BOOT_CRC_BAD_REGION` block, which is covered by the separate
+`test_bad_region` executable — gcov reports the two executables separately.)
+
+Only host-compilable modules are on the Ceedling source path. `../Core/Src` is
+deliberately **not**: it is CubeMX-generated and would let `main.c` be fed to
+the host gcc for any test that includes `main.h` (the tests use `fakes/main.h`).
 
 ## How the target-only bits are faked
 
@@ -81,9 +101,16 @@ Three things normally only exist after linking for the STM32L496VGTx:
    by absolute address (`laststates_dump_all()` memcpy's straight from
    `0x08080000`), so `support/host_flash.c` puts real writable pages there with
    `mmap(MAP_FIXED_NOREPLACE)` and reproduces NOR-Flash behaviour: erased is
-   `0xFF`, a double-word can only be programmed once per erase cycle, and the
-   Flash must be unlocked. That is what makes the erase-before-wrap path in
-   `laststates_write()` genuinely testable.
+   `0xFF`, a double-word can only be programmed once per erase cycle, and both
+   programming *and* page erase require the Flash to be unlocked (RM0351 3.3.5
+   — PG and PER/STRT are both in the write-protected FLASH_CR). That is what
+   makes the erase-before-wrap path in `laststates_write()` genuinely testable.
+
+4. **The FM24VN10-G FRAM behind `hi2c2`** — the doubles accept only the *8-bit*
+   (already left-shifted) device addresses the STM32 HAL expects: `0xA0`,
+   `0xA2`, `0xA4`, `0xA6`. The raw 7-bit values `0x50..0x53` are rejected, so a
+   driver that forgets the shift fails the tests instead of silently addressing
+   the wrong device on the real bus.
 
 ## References
 

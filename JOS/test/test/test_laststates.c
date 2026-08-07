@@ -14,6 +14,7 @@
 #include "unity.h"
 #include "memory.h"
 #include "obsw_types.h"
+#include "main.h"        /* fakes/main.h: HAL prototypes exercised directly */
 #include "host_support.h"
 
 #include <stdint.h>
@@ -64,7 +65,7 @@ void test_laststates_write_then_dump_round_trip(void)
     laststates_entry_t entry = make_entry(0x11223344u, STATE_INIT, STATE_READY,
                                           TRIGGER_BOOT, 0xA5u);
     uint8_t out[LASTSTATES_ENTRY_SIZE];
-    size_t  len = 0u;
+    size_t  len = sizeof(out);      /* in: capacity, out: bytes written */
 
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&entry));
     TEST_ASSERT_EQUAL_UINT32(1u, laststates_count());
@@ -91,7 +92,7 @@ void test_laststates_writes_are_sequential(void)
     laststates_entry_t a = make_entry(1u, STATE_OFF,  STATE_INIT,  TRIGGER_BOOT, 0x01u);
     laststates_entry_t b = make_entry(2u, STATE_INIT, STATE_READY, TRIGGER_ANTENNA_DONE, 0x02u);
     uint8_t out[2 * LASTSTATES_ENTRY_SIZE];
-    size_t  len = 0u;
+    size_t  len = sizeof(out);
 
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&a));
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&b));
@@ -113,10 +114,83 @@ void test_laststates_write_rejects_null_entry(void)
 void test_laststates_dump_all_rejects_null_arguments(void)
 {
     uint8_t out[LASTSTATES_ENTRY_SIZE];
-    size_t  len = 0u;
+    size_t  len = sizeof(out);
 
     TEST_ASSERT_EQUAL_INT(-1, laststates_dump_all(NULL, &len));
     TEST_ASSERT_EQUAL_INT(-1, laststates_dump_all(out, NULL));
+}
+
+/* *len is the capacity of the caller's buffer on entry. A buffer that cannot
+ * hold the whole pool must be refused, not overrun: with a full pool the copy
+ * would be 8 KB, which on the downlink path is a caller stack frame. The
+ * required size is reported back so the caller can retry with a real buffer.
+ *
+ * The canary bytes around the buffer pin "nothing was written" rather than
+ * just "an error was returned". */
+void test_laststates_dump_all_refuses_undersized_buffer(void)
+{
+    struct {
+        uint8_t guard_lo[16];
+        uint8_t out[2 * LASTSTATES_ENTRY_SIZE];
+        uint8_t guard_hi[16];
+    } framed;
+
+    size_t   len;
+    uint32_t i;
+
+    memset(&framed, 0x00, sizeof(framed));
+
+    for (i = 0u; i < (uint32_t)LASTSTATES_MAX_ENTRIES; i++) {
+        laststates_entry_t e = make_entry(i, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, (uint8_t)i);
+        TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+    }
+
+    len = sizeof(framed.out);       /* 256 B for an 8 KB pool */
+    TEST_ASSERT_EQUAL_INT(-1, laststates_dump_all(framed.out, &len));
+
+    /* Required size reported back ... */
+    TEST_ASSERT_EQUAL_size_t((size_t)LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE, len);
+
+    /* ... and not one byte was copied anywhere. */
+    for (i = 0u; i < (uint32_t)sizeof(framed.out); i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.out[i]);
+    }
+    for (i = 0u; i < (uint32_t)sizeof(framed.guard_lo); i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.guard_lo[i]);
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.guard_hi[i]);
+    }
+}
+
+/* An exactly-sized buffer is accepted and *len comes back as the byte count. */
+void test_laststates_dump_all_accepts_exactly_sized_buffer(void)
+{
+    uint8_t out[2 * LASTSTATES_ENTRY_SIZE];
+    size_t  len;
+
+    laststates_entry_t a = make_entry(11u, STATE_OFF,  STATE_INIT,  TRIGGER_BOOT, 0x11u);
+    laststates_entry_t b = make_entry(22u, STATE_INIT, STATE_READY, TRIGGER_BOOT, 0x22u);
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&a));
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&b));
+
+    len = sizeof(out);
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    TEST_ASSERT_EQUAL_size_t((size_t)(2 * LASTSTATES_ENTRY_SIZE), len);
+}
+
+/* An empty pool needs no space at all, so even a zero-capacity buffer is a
+ * legal (and side-effect free) request. */
+void test_laststates_dump_all_on_empty_pool_writes_nothing(void)
+{
+    uint8_t out[LASTSTATES_ENTRY_SIZE];
+    size_t  len = 0u;
+
+    memset(out, 0xC3, sizeof(out));
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    TEST_ASSERT_EQUAL_size_t(0u, len);
+    TEST_ASSERT_EQUAL_HEX8(0xC3u, out[0]);
 }
 
 /* Flash must be unlocked to program and re-locked afterwards; leaving the
@@ -200,6 +274,95 @@ void test_fram_rejects_out_of_range_access(void)
 
     TEST_ASSERT_EQUAL_INT(-1, fram_write(64u * 1024u, buf, sizeof(buf)));
     TEST_ASSERT_EQUAL_INT(-1, fram_read(64u * 1024u, buf, sizeof(buf)));
+}
+
+/* The STM32 HAL I2C API takes the device address already shifted left by one.
+ * The four FM24VN10-G parts are 7-bit 0x50..0x53, so the bytes that must reach
+ * HAL_I2C_Mem_Read/Write are 0xA0, 0xA2, 0xA4, 0xA6. Handing the HAL the raw
+ * 7-bit value would address 0x28 on the real bus, and no host double is
+ * allowed to paper over that. */
+void test_fram_uses_shifted_i2c_device_addresses(void)
+{
+    const uint16_t expected[4] = { 0xA0u, 0xA2u, 0xA4u, 0xA6u };
+    uint8_t        byte        = 0x5Au;
+    uint32_t       chip;
+
+    fram_init();
+
+    for (chip = 0u; chip < 4u; chip++) {
+        uint32_t addr = chip * 16u * 1024u;
+
+        TEST_ASSERT_EQUAL_INT(0, fram_write(addr, &byte, 1u));
+        TEST_ASSERT_EQUAL_HEX16(expected[chip], host_flash_last_i2c_addr());
+
+        TEST_ASSERT_EQUAL_INT(0, fram_read(addr, &byte, 1u));
+        TEST_ASSERT_EQUAL_HEX16(expected[chip], host_flash_last_i2c_addr());
+    }
+}
+
+/* Each chip is a separate 16 KB address space: byte 0 of chip 1 must not alias
+ * byte 0 of chip 0. This only holds if the chip-select arithmetic and the
+ * address shift agree. */
+void test_fram_chips_do_not_alias_each_other(void)
+{
+    const uint8_t marker0 = 0x11u;
+    const uint8_t marker1 = 0x22u;
+    uint8_t       readback = 0u;
+
+    fram_init();
+
+    TEST_ASSERT_EQUAL_INT(0, fram_write(0u, &marker0, 1u));
+    TEST_ASSERT_EQUAL_INT(0, fram_write(16u * 1024u, &marker1, 1u));
+
+    TEST_ASSERT_EQUAL_INT(0, fram_read(0u, &readback, 1u));
+    TEST_ASSERT_EQUAL_HEX8(marker0, readback);
+
+    TEST_ASSERT_EQUAL_INT(0, fram_read(16u * 1024u, &readback, 1u));
+    TEST_ASSERT_EQUAL_HEX8(marker1, readback);
+}
+
+/* =====================================================================
+ * Flash controller preconditions (RM0351 3.3.5: PG and PER both need the
+ * KEY1/KEY2 unlock). The doubles enforce them symmetrically, so a module that
+ * forgets HAL_FLASH_Unlock() around either operation fails here.
+ * ===================================================================== */
+
+void test_hal_flash_program_requires_unlock(void)
+{
+    TEST_ASSERT_FALSE(host_flash_is_unlocked());
+    TEST_ASSERT_EQUAL_INT(HAL_ERROR,
+                          HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                            HOST_FLASH_LASTSTATES_BASE,
+                                            0x0123456789ABCDEFULL));
+
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Unlock());
+    TEST_ASSERT_EQUAL_INT(HAL_OK,
+                          HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                            HOST_FLASH_LASTSTATES_BASE,
+                                            0x0123456789ABCDEFULL));
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Lock());
+}
+
+void test_hal_flash_erase_requires_unlock(void)
+{
+    FLASH_EraseInitTypeDef erase_init;
+    uint32_t               page_error = 0u;
+    const uint32_t         first_page =
+        (uint32_t)((HOST_FLASH_LASTSTATES_BASE - 0x08000000UL) / HOST_FLASH_PAGE_SIZE);
+
+    erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
+    erase_init.Banks     = FLASH_BANK_1;
+    erase_init.Page      = first_page;
+    erase_init.NbPages   = 1u;
+
+    TEST_ASSERT_FALSE(host_flash_is_unlocked());
+    TEST_ASSERT_EQUAL_INT(HAL_ERROR, HAL_FLASHEx_Erase(&erase_init, &page_error));
+    TEST_ASSERT_EQUAL_UINT32(0u, host_flash_erase_count());
+
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Unlock());
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASHEx_Erase(&erase_init, &page_error));
+    TEST_ASSERT_EQUAL_UINT32(1u, host_flash_erase_count());
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Lock());
 }
 
 void test_cyclic_buffer_write_advances_head_and_reads_back(void)

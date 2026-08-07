@@ -67,4 +67,9 @@ uint32_t host_flash_lock_count(void);
 /* TRUE while HAL_FLASH_Unlock() has not been balanced by HAL_FLASH_Lock(). */
 int host_flash_is_unlocked(void);
 
+/* Last I2C device address the code under test handed to HAL_I2C_Mem_Read/Write
+ * (0xFFFF after host_flash_reset()). The HAL takes the 8-bit, already shifted
+ * address, so a correct FM24VN10-G access is 0xA0/0xA2/0xA4/0xA6. */
+uint16_t host_flash_last_i2c_addr(void);
+
 #endif /* HOST_SUPPORT_H */
