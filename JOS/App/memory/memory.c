@@ -12,7 +12,7 @@
  * Each chip: 128 Kbit = 16 KB address space.
  * Total: 4 x 16 KB = 64 KB.
  *
- * FM24VN_CHIP_SIZE (16 B) is a power of two, so the address decode uses
+ * FM24VN_CHIP_SIZE (16 * 1024 B) is a power of two, so the address decode uses
  * shift/mask instead of division/modulo. This removes the only runtime
  * divisions in the memory module and therefore the divide-by-zero class
  * entirely (review M1).
@@ -20,8 +20,8 @@
 
 #define FM24VN_I2C_ADDR_BASE  0x50
 #define FM24VN_PAGE_SIZE      16
-#define FM24VN_CHIP_SIZE      16
-#define FM24VN_CHIP_SIZE_LOG2 4U     /* 16 B = 2^4 */
+#define FM24VN_CHIP_SIZE      (16U * 1024U)
+#define FM24VN_CHIP_SIZE_LOG2 14U    /* 16 KB = 2^14 */
 #define FM24VN_NUM_CHIPS      4
 #define FRAM_SIZE             (FM24VN_NUM_CHIPS * FM24VN_CHIP_SIZE)
 
@@ -123,7 +123,6 @@ uint32_t cyclic_buffer_head(void)
  * wraps back onto still-valid data. Erasing only that ONE page recycles the
  * OLDEST page and therefore never overwrites the newest valid record
  * (NASA-STD-8739.8 fault containment / ECSS-E-ST-80C post-mortem integrity).
- * Reviewed-and-fixed pass: C1 (readback scan) + C2 (DWT bounded wait) + M1 (div0 guard) applied.
  *
  * Because a subsequent write may land in a page whose other slots were just
  * erased, the pool is not always a contiguous run of valid records. Post-mortem
@@ -218,7 +217,15 @@ static int flash_write_dword_bounded(uint32_t addr, uint64_t data)
  * 0 on success, -1 on timeout/error. */
 static int flash_erase_page_bounded(uint32_t addr)
 {
+    dwt_cyccnt_enable();
     uint32_t start = DWT->CYCCNT;
+
+    /* Bounds guard (B3): only ever erase a page inside the LastStates pool.
+     * Refusing anything else prevents an errant call from wiping the vector
+     * table or any other Flash region. */
+    if (addr < LASTSTATES_FLASH_BASE || addr >= LASTSTATES_FLASH_END) {
+        return -1;
+    }
 
     uint32_t page_abs = (addr - 0x08000000U) >> LS_PAGE_SHIFT;
     uint32_t banks = FLASH_BANK_1;
