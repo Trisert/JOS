@@ -251,6 +251,7 @@ int state_machine_set_beacon_interval(uint32_t interval_ms)
        than BEACON_INTERVAL_MIN would violate the RF duty-cycle budget.
        Out-of-range requests are rejected, leaving the current cadence intact
        (fail-safe: an erroneous or corrupted uplink cannot silence the beacon). */
+/* Fix pass: beacon interval validated (MIN/MAX) + duplicate-refresh path active. */
     if ((interval_ms != 0u) &&
         ((interval_ms < BEACON_INTERVAL_MIN) || (interval_ms > BEACON_INTERVAL_MAX))) {
         return -1;
