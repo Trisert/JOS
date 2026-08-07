@@ -3,11 +3,13 @@ name: Build JOS firmware
 on:
   push:
     branches: [main]
+  # No base-branch filter: every pull request is gated, including ones that are
+  # stacked on another feature branch rather than targeting main directly.
   pull_request:
-    branches: [main]
 
 jobs:
   build:
+    name: Firmware build (arm-none-eabi)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -25,6 +27,10 @@ jobs:
         working-directory: JOS
         run: make all
 
+      - name: Stamp firmware image CRC
+        working-directory: JOS
+        run: make crc-stamp
+
       - name: Report size
         working-directory: JOS
         run: arm-none-eabi-size build/JOS.elf
@@ -38,3 +44,37 @@ jobs:
             JOS/build/JOS.hex
             JOS/build/JOS.bin
           if-no-files-found: error
+
+  unit-tests:
+    name: Host unit tests (Ceedling)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.1'
+
+      # Unity and CMock are taken from the Ceedling gem. There is deliberately
+      # no vendored Unity in the repository, so there is exactly one version in
+      # the build (see JOS/test/project.yml, :which_ceedling: gem).
+      - name: Install Ceedling
+        run: gem install ceedling -v 1.1.3 --no-document
+
+      - name: Run unit tests
+        working-directory: JOS/test
+        run: ceedling test:all
+
+      - name: Report code coverage
+        working-directory: JOS/test
+        run: ceedling gcov:all
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: JOS/test/build/test/results/
+          if-no-files-found: warn

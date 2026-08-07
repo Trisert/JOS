@@ -14,7 +14,9 @@ AS       := $(PREFIX)gcc -x assembler-with-cpp
 OBJCOPY  := $(PREFIX)objcopy
 OBJDUMP  := $(PREFIX)objdump
 SIZE     := $(PREFIX)size
+NM       := $(PREFIX)nm
 RM       := rm -rf
+PYTHON   ?= python3
 
 ##############################################################################
 # MCU flags
@@ -119,9 +121,48 @@ DEPS := $(C_DEPS) $(CXX_DEPS) $(ASM_DEPS)
 ##############################################################################
 # Default target
 ##############################################################################
-.PHONY: all clean flash sim sim-build sim-flash sim-monitor sim-clean sim-erase
+.PHONY: all clean flash test coverage crc-stamp sim sim-build sim-flash sim-monitor sim-clean sim-erase
 
 all: $(BUILD_DIR)/$(PROJECT_NAME).elf $(BUILD_DIR)/$(PROJECT_NAME).hex $(BUILD_DIR)/$(PROJECT_NAME).bin
+
+##############################################################################
+# Firmware image CRC stamping
+##############################################################################
+# boot_crc_verify() (App/obsw/boot_crc.c) compares a CRC-32 computed over
+# [__fw_image_start, __fw_crc_start) against the word stored in the .fw_crc
+# section. A freshly linked image still carries the 0xFFFFFFFF placeholder and
+# reports BOOT_CRC_UNSTAMPED; this target patches in the real value.
+#
+# The expected address of the .fw_crc word is read back out of the ELF so a
+# linker-script regression that stops .fw_crc being the last loaded section is
+# caught here rather than in flight (fw_crc_stamp.py cross-checks it).
+#
+# Usage:  make all && make crc-stamp
+#
+# Refs: ECSS-E-ST-40C 5.4 (software integrity), NASA-STD-8739.8.
+CRC_STAMP_TOOL := tools/fw_crc_stamp.py
+
+crc-stamp: $(BUILD_DIR)/$(PROJECT_NAME).bin $(BUILD_DIR)/$(PROJECT_NAME).hex
+	@crc_addr=$$($(NM) $(BUILD_DIR)/$(PROJECT_NAME).elf | awk '$$3 == "__fw_crc_start" { print "0x" $$1 }'); \
+	if [ -z "$$crc_addr" ]; then \
+		echo "error: __fw_crc_start not found in $(BUILD_DIR)/$(PROJECT_NAME).elf" >&2; \
+		echo "       is App/obsw/boot_crc.c linked and .fw_crc KEEP()t in $(LINKER_SCRIPT)?" >&2; \
+		exit 1; \
+	fi; \
+	$(PYTHON) $(CRC_STAMP_TOOL) $(BUILD_DIR)/$(PROJECT_NAME).bin \
+		--hex $(BUILD_DIR)/$(PROJECT_NAME).hex \
+		--crc-addr $$crc_addr --verify
+
+##############################################################################
+# Host unit tests (Ceedling + Unity/CMock from the gem)
+##############################################################################
+# Runs on the build host with the native gcc, not arm-none-eabi-gcc.
+# Install once with:  gem install ceedling
+test:
+	$(MAKE) -C test test
+
+coverage:
+	$(MAKE) -C test coverage
 
 ##############################################################################
 # Verification Simulation (dual ESP32)

@@ -1,0 +1,81 @@
+---
+# =============================================================================
+# Ceedling project configuration - RedPill / JOS host unit tests
+# =============================================================================
+# Host-side (x86_64/aarch64 gcc) unit tests for the flight software modules
+# that are pure logic or can be exercised against a faked HAL. The flight
+# build itself is unchanged and still built with arm-none-eabi-gcc via
+# ../Makefile.
+#
+# Unity/CMock come from the Ceedling *gem* (:which_ceedling: gem below).
+# There is deliberately NO vendored copy of Unity in this repository: two
+# Unity versions in one build produce silent ABI/macro mismatches.
+#
+# Run from JOS/test/:   ceedling test:all
+# Or from JOS/:         make test
+#
+# Refs: ECSS-E-ST-40C 5.5 (software validation), NASA-STD-8739.8 (unit test
+#       evidence), JPL-182 Rule 31 (all code exercised by tests).
+# =============================================================================
+
+:project:
+  :which_ceedling: gem          # use the installed gem's Unity/CMock, never a vendored copy
+  :use_exceptions: FALSE
+  :use_test_preprocessor: :none # no mocks are generated; fakes are hand written
+  :use_backtrace: :simple
+  :build_root: build
+  :test_file_prefix: test_
+  :default_tasks:
+    - test:all
+
+:extension:
+  :executable: .out
+
+:paths:
+  :test:
+    - +:test/**
+  :source:
+    - ../App/obsw
+    - ../App/memory
+    - ../Core/Src
+  :include:
+    - ../App
+    - ../App/obsw
+    - ../App/memory
+    - fakes
+    - support
+  :support:
+    - support
+
+:defines:
+  :test:
+    :*:
+      - HOST_UNIT_TEST
+    # test_bad_region.c links the same boot_crc.c but with the fake linker
+    # symbols laid out so that __fw_crc_start <= __fw_image_start, which is
+    # the only way to reach the BOOT_CRC_BAD_REGION branch on the host.
+    :test_bad_region:
+      - HOST_FW_BAD_REGION
+
+:flags:
+  :test:
+    :compile:
+      :*:
+        - -std=gnu11
+        - -Wall
+        - -Wextra
+        - -Wno-unused-parameter
+        - -Werror
+
+:cmock:
+  :mock_prefix: mock_
+  :when_no_prototypes: :warn
+  :enforce_strict_ordering: TRUE
+  :plugins:
+    - :ignore
+    - :callback
+
+:plugins:
+  :load_paths: []
+  :enabled:
+    - gcov
