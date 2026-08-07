@@ -241,9 +241,23 @@ uint32_t state_machine_get_beacon_interval(void)
     return interval;
 }
 
-void state_machine_set_beacon_interval(uint32_t interval_ms)
+int state_machine_set_beacon_interval(uint32_t interval_ms)
 {
+    /* Range check before the value can reach the beacon task or the watchdog.
+       0 is the documented "clear the override / revert to per-state default"
+       encoding. Any other value must be within the certified band: an
+       interval longer than BEACON_INTERVAL_MAX would out-run the beacon
+       watchdog period and permanently flag a healthy task, and one shorter
+       than BEACON_INTERVAL_MIN would violate the RF duty-cycle budget.
+       Out-of-range requests are rejected, leaving the current cadence intact
+       (fail-safe: an erroneous or corrupted uplink cannot silence the beacon). */
+    if ((interval_ms != 0u) &&
+        ((interval_ms < BEACON_INTERVAL_MIN) || (interval_ms > BEACON_INTERVAL_MAX))) {
+        return -1;
+    }
+
     osMutexAcquire(state_mutex, osWaitForever);
     beacon_interval_override = interval_ms;
     osMutexRelease(state_mutex);
+    return 0;
 }

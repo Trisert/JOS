@@ -21,7 +21,10 @@ int state_machine_request_transition(obw_state_t target, uint8_t trigger);
 /* Get the beacon interval for the current state */
 uint32_t state_machine_get_beacon_interval(void);
 
-/* Set a custom beacon interval override (ms), 0 = use default per-state */
-void state_machine_set_beacon_interval(uint32_t interval_ms);
+/* Set a custom beacon interval override (ms), 0 = use default per-state.
+   Non-zero values must lie within [BEACON_INTERVAL_MIN, BEACON_INTERVAL_MAX];
+   out-of-range requests are rejected and the current override is left intact.
+   Returns 0 on acceptance, -1 on rejection. */
+int state_machine_set_beacon_interval(uint32_t interval_ms);
 
 #endif /* STATE_MACHINE_H */
