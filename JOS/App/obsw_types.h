@@ -60,4 +60,18 @@ typedef struct {
 #define BEACON_INTERVAL_READY   ( 4UL * 60 * 1000)  /*  4 min */
 #define BEACON_INTERVAL_ACTIVE  ( 1UL * 60 * 1000)  /*  1 min default */
 
+/* Bounds accepted for a ground-commanded beacon interval override
+   (CMD_SET_BEACON_INTERVAL). Values outside this range are rejected, never
+   clamped silently, so an out-of-range telecommand is visible as a failure
+   instead of quietly changing the cadence.
+
+   - MIN protects the RF duty cycle and the TX chain from a command that would
+     make the beacon task hammer the radio.
+   - MAX is the slowest cadence the beacon watchdog is dimensioned for; it
+     bounds the worst-case liveness detection time (3 x MAX) and prevents an
+     uplinked interval from out-running the watchdog and permanently flagging
+     a healthy task. */
+#define BEACON_INTERVAL_MIN     (10UL * 1000)       /* 10 s  */
+#define BEACON_INTERVAL_MAX     BEACON_INTERVAL_CRIT /* 16 min */
+
 #endif /* OBW_TYPES_H */

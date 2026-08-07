@@ -18,7 +18,11 @@
 #define WDG_PERIOD_DEFAULT_TASK_MS   1000u
 #define WDG_PERIOD_STATE_MACHINE_MS   100u
 #define WDG_PERIOD_LORA_RX_MS         100u
-#define WDG_PERIOD_LORA_BEACON_MS   BEACON_INTERVAL_CRIT   /* slowest beacon */
+/* Bootstrap period for the beacon task only: the slowest cadence the beacon
+   is ever allowed to run at (see BEACON_INTERVAL_MAX). lora_beacon_task()
+   re-registers itself with the cadence actually in force on every change, so
+   this value only bounds the very first monitoring window. */
+#define WDG_PERIOD_LORA_BEACON_MS   BEACON_INTERVAL_MAX
 #define WDG_PERIOD_CLEAR_MS          1000u
 #define WDG_PERIOD_CLOUD_MS         (90UL * 60UL * 1000UL) /* once per orbit */
 #define WDG_PERIOD_AOCS_MS             20u
