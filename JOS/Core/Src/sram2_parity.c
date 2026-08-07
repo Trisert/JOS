@@ -215,18 +215,34 @@ int sram2_restore_from_image(void *obj, size_t len)
     const uint8_t *ram_start = (const uint8_t *)&_ssram2;
     const uint8_t *ram_end   = (const uint8_t *)&_esram2;
     const uint8_t *img_start = (const uint8_t *)&_sisram2;
-    uint8_t *dst = (uint8_t *)obj;
+    const uint8_t *dst = (const uint8_t *)obj;
+    uintptr_t dst_end;
 
     if ((obj == NULL) || (len == 0U)) {
         return -1;
     }
-    if ((dst < ram_start) || ((dst + len) > ram_end)) {
+    /* Overflow-safe bounds check: dst+len must not wrap the address space or
+       run past the end of the initialised .sram2 section. A flipped len could
+       otherwise make (dst + len) wrap to a small value and pass the check. */
+    if (__builtin_add_overflow((uintptr_t)dst, (uintptr_t)len, &dst_end) ||
+        (dst < ram_start) || (dst_end > ram_end)) {
         return -1;   /* not an object of the initialised .sram2 section */
     }
 
-    memcpy(dst, img_start + (size_t)(dst - ram_start), len);
+    memcpy((void *)dst, img_start + (size_t)(dst - ram_start), len);
     __DSB();
     return 0;
+}
+
+int sram2_section_contains(const void *obj)
+{
+    const uint8_t *p    = (const uint8_t *)obj;
+    const uint8_t *low  = (const uint8_t *)&_ssram2;
+    const uint8_t *high = (const uint8_t *)&_esram2;
+
+    /* True only for objects placed in the initialised .sram2 section (those
+       with a Flash load image). Objects in .sram2_noinit are excluded. */
+    return ((p >= low) && (p < high)) ? 1 : 0;
 }
 
 void sram2_parity_nmi_handler(void)

@@ -109,6 +109,14 @@ uint32_t sram2_parity_error_count(void);
 int sram2_restore_from_image(void *obj, size_t len);
 
 /**
+ * @brief  True when @p obj lies inside the initialised .sram2 section.
+ * @retval 1 if obj is an object that has a Flash load image (so it can be
+ *         restored from that image / contained by a reboot), 0 otherwise.
+ * @note   Excludes .sram2_noinit objects, which carry no load image.
+ */
+int sram2_section_contains(const void *obj);
+
+/**
   * @brief NMI back end: record the fault in LastStates and reset the OBSW.
   * @note  Called from NMI_Handler() in stm32l4xx_it.c. Does not return.
   */
