@@ -66,7 +66,7 @@ float	MAX11128_ADC_ReadVoltCH(MAX11128_t *adc,uint8_t CH) //Read voltage CHx on 
 		{
 			ADC_Value = (((uint16_t)(ADC_Receive[0])) << 8 ) | ADC_Receive[1];
 			ADC_Value =  ADC_Value & (0x0FFF);	//remove CHAN_ID to get ADC 12 bit value
-			ADC_CH    = (float)(MAX1112XVREF * ADC_Value)/(pow(2,MAX1112XBIT)-1);
+			ADC_CH    = (float)(MAX1112XVREF * ADC_Value)/((1u << MAX1112XBIT) - 1);
 			return ADC_CH;
 		}
 		// if CHAD_ID is wrong return 0;
