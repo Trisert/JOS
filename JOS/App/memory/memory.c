@@ -123,6 +123,7 @@ uint32_t cyclic_buffer_head(void)
  * wraps back onto still-valid data. Erasing only that ONE page recycles the
  * OLDEST page and therefore never overwrites the newest valid record
  * (NASA-STD-8739.8 fault containment / ECSS-E-ST-80C post-mortem integrity).
+ * Reviewed-and-fixed pass: C1 (readback scan) + C2 (DWT bounded wait) + M1 (div0 guard) applied.
  *
  * Because a subsequent write may land in a page whose other slots were just
  * erased, the pool is not always a contiguous run of valid records. Post-mortem
