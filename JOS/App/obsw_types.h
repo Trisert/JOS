@@ -49,6 +49,7 @@ enum {
     TRIGGER_FAULT           = 8,  /* Cortex-M4 fault exception (see faults.h) */
     TRIGGER_STACK_OVERFLOW  = 9,  /* FreeRTOS stack overflow hook             */
     TRIGGER_IMAGE_CRC_FAIL  = 10, /* boot CRC32 integrity fault */
+    TRIGGER_MPU_FAULT       = 11, /* MemManage fault recorded before reset */
 };
 
 /* ---------- BMS interface (stub for now) ---------- */

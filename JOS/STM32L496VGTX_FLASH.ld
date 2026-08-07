@@ -189,16 +189,21 @@ SECTIONS
 
   /* Data that must survive a warm reset (NVIC_SystemReset): the startup code
      only zeroes [_sbss,_ebss) and copies .data, so nothing here is touched.
-     NOLOAD keeps it out of the image. Used by the boot-CRC retry counter
-     (App/obsw/boot_crc.c) — see docs/dev/hardening.md 2.4. */
+     NOLOAD keeps it out of the image. Holds the boot-CRC retry counter
+     (App/obsw/boot_crc.c — docs/dev/hardening.md 2.4) and the MemManage fault
+     record staged by mpu_memmanage_fault() (W2-1), which is flushed to
+     LastStates by mpu_fault_log_flush() on the next boot.
+     8-byte aligned so the region can be covered by an MPU sub-region. */
+  . = ALIGN(8);
   .noinit (NOLOAD) :
   {
-    . = ALIGN(4);
     __noinit_start__ = .;
+    _snoinit = __noinit_start__;
     *(.noinit)
     *(.noinit*)
-    . = ALIGN(4);
+    . = ALIGN(8);
     __noinit_end__ = .;
+    _enoinit = __noinit_end__;
   } >RAM
 
   /* User_heap_stack section, used to check that there is enough "RAM" Ram  type memory left */

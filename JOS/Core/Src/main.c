@@ -145,6 +145,12 @@ int main(void)
   cyclic_buffer_init();
   laststates_init();
 
+  /* W2-1: if the previous run died on an MPU violation, the staged fault
+     record is persisted here, at task level, where flash programming is
+     bounded — never from the MemManage handler itself. Done before the boot
+     CRC policy below, which may reset and never return. */
+  (void)mpu_fault_log_flush();
+
   /* Act on the integrity result now that the fault can be persisted.
      BOOT_CRC_FATAL (=1 by default, see App/obsw/boot_crc.h): the fault is
      written to LastStates and the OBC resets up to

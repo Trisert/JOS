@@ -12,6 +12,8 @@
 #ifndef MPU_H
 #define MPU_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,6 +27,8 @@ extern "C" {
   *
   * Enforced policy (privileged background map left enabled, PRIVDEFENA=1):
   *   - Flash code/rodata (0x08000000, 512 KB) is read-only + executable.
+  *   - The LastStates flash pool (0x08080000, 8 KB) is read/write but
+  *     Execute-Never, so a persisted payload can never be fetched as code.
   *   - All SRAM (SRAM1, SRAM2 and its 0x20040000 alias) is read/write but
   *     Execute-Never: no code can be executed from RAM.
   *   - The peripheral aperture is Device + Execute-Never.
@@ -35,6 +39,19 @@ extern "C" {
   *       MemManage_Handler() instead of escalating straight to HardFault.
   */
 void mpu_init(void);
+
+/**
+  * @brief  Tell whether the kernel (MSP) stack guard band was installed.
+  *
+  * mpu_init() skips region #5 when the guard would land inside .bss or the
+  * newlib heap, so a large static footprint can never turn this hardening
+  * measure into a boot failure. The skip must not be silent: callers can use
+  * this to raise a housekeeping flag / telemetry point instead.
+  *
+  * @retval 1 the guard band is active, 0 it was skipped (or mpu_init() has
+  *         not run yet).
+  */
+uint8_t mpu_kernel_guard_installed(void);
 
 /**
   * @brief  Move the per-task stack guard region onto the given task stack.
@@ -54,6 +71,37 @@ void mpu_init(void);
   *                    run yet.
   */
 void mpu_task_stack_guard_set(const void *stack_base);
+
+/**
+  * @brief  MemManage fault entry point: stage the fault, then reset.
+  *
+  * Called from MemManage_Handler(). Captures the fault status registers and
+  * the exception stack frame into a reset-persistent RAM record, then issues
+  * NVIC_SystemReset(). It never returns and never spins: an MPU violation
+  * must not turn silent corruption into a silent hang (ECSS-E-ST-40C fault
+  * containment).
+  *
+  * The record is *not* written to flash here on purpose. Programming the
+  * LastStates pool means HAL_FLASH_Program(), whose completion poll is only
+  * bounded by HAL_GetTick() — and SysTick cannot preempt this handler, so the
+  * timeout can never expire. Persisting is therefore deferred to
+  * mpu_fault_log_flush() at task level on the next boot.
+  *
+  * @param  frame Exception stack frame (MSP or PSP, selected from EXC_RETURN).
+  */
+void mpu_memmanage_fault(const uint32_t *frame);
+
+/**
+  * @brief  Commit a staged MemManage fault record to the LastStates pool.
+  *
+  * Call once at boot, after laststates_init(), from task/thread context. If
+  * the previous run died on an MPU violation, one LastStates entry tagged
+  * TRIGGER_MPU_FAULT is written with CFSR / MMFAR / PC / LR / xPSR / SP.
+  *
+  * @retval 1 a record was found and persisted, 0 nothing was staged,
+  *         -1 the record was staged but could not be written to flash.
+  */
+int mpu_fault_log_flush(void);
 
 #ifdef __cplusplus
 }

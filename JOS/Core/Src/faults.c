@@ -28,6 +28,7 @@
 #include "stm32l4xx_it.h"   /* prototypes of the exception handlers          */
 #include "memory.h"         /* laststates_write()                            */
 #include "obsw_types.h"     /* laststates_entry_t, TRIGGER_*                 */
+#include "mpu.h"            /* mpu_memmanage_fault(): MemManage entry (W2-1) */
 
 #include <stddef.h>
 #include <string.h>
@@ -210,6 +211,25 @@ void fault_log_stack_overflow(const char *task_name)
     }
 
 FAULT_ENTRY_STUB(HardFault_Handler,  0)
-FAULT_ENTRY_STUB(MemManage_Handler,  1)
 FAULT_ENTRY_STUB(BusFault_Handler,   2)
 FAULT_ENTRY_STUB(UsageFault_Handler, 3)
+
+/* MemManage is the MPU's own fault (W2-1) and does NOT go through
+   fault_capture(): that path programs Flash from handler context, whose HAL
+   completion poll is bounded only by HAL_GetTick() — and SysTick cannot preempt
+   an exception handler, so the timeout could never expire. mpu_memmanage_fault()
+   instead stages the record (CFSR/MMFAR/PC/LR/xPSR/SP) in reset-persistent
+   .noinit, resets, and the record is committed to LastStates at task level by
+   mpu_fault_log_flush() early in the next boot. Same naked/EXC_RETURN contract
+   as the stubs above; it never returns and never spins. */
+__attribute__((naked)) void MemManage_Handler(void)
+{
+    __asm volatile (
+        ".syntax unified            \n"
+        "tst    lr, #4              \n"
+        "ite    eq                  \n"
+        "mrseq  r0, msp             \n"
+        "mrsne  r0, psp             \n"
+        "b      mpu_memmanage_fault \n"
+    );
+}
