@@ -11,8 +11,6 @@
 #define LORA_MAX_PACKET  64
 #define BEACON_SIZE      128
 
-#define CMD_SET_BEACON_INTERVAL  0x06
-
 extern SPI_HandleTypeDef hspi1;
 
 /* ---------- Stub implementations ---------- */
@@ -31,37 +29,46 @@ int lora_send_chunked(const uint8_t *data, size_t len)
     return 0;
 }
 
-void comms_dispatch_command(uint8_t cmd_id, const uint8_t *payload, size_t len)
+/* ---------- Telecommand dispatcher (private) ---------- */
+
+/**
+ * Execute an already-validated telecommand.
+ *
+ * Deliberately file-static and suffixed @c _unchecked: it performs NO
+ * structural validation of its own, so the only legal caller is
+ * comms_rx_handle_frame(), which runs comms_validate_tc() first (length, CRC,
+ * opcode whitelist, per-opcode payload size and parameter ranges).
+ * Exporting it would make the validation gate bypassable.
+ */
+static void comms_dispatch_command_unchecked(uint8_t cmd_id,
+                                             const uint8_t *payload,
+                                             size_t len)
 {
     switch (cmd_id) {
-    case 0x01:  /* RESET */
+    case COMMS_TC_RESET:
         NVIC_SystemReset();
         break;
-    case 0x02:  /* EXIT_STATE */
+    case COMMS_TC_EXIT_STATE:
         state_machine_request_transition(STATE_READY, TRIGGER_GROUND_CMD);
         break;
-    case 0x03:  /* SET_CONFIG */
+    case COMMS_TC_SET_CONFIG:
         /* TODO: apply config from payload */
         break;
-    case 0x04:  /* SEND_DATA */
+    case COMMS_TC_SEND_DATA:
         /* TODO: read FRAM and send chunked */
         break;
-    case 0x05:  /* ACTIVATE_PAYLOAD */
+    case COMMS_TC_ACTIVATE_PAYLOAD:
         state_machine_request_transition(STATE_ACTIVE, TRIGGER_GROUND_CMD);
         break;
-    case CMD_SET_BEACON_INTERVAL:  /* SET_BEACON_INTERVAL */
-        /* Uplinked data is untrusted: require the full 4-byte argument and let
-           the state machine range-check the value before it can affect the
-           beacon cadence or the beacon watchdog period. A rejected or
-           malformed command leaves the current cadence untouched. */
+    case COMMS_TC_SET_BEACON_INTERVAL:
         if ((payload != NULL) && (len >= 4U)) {
             uint32_t interval_ms = ((uint32_t)payload[0] << 24) |
                                    ((uint32_t)payload[1] << 16) |
                                    ((uint32_t)payload[2] << 8)  |
                                     (uint32_t)payload[3];
             /* Defence in depth: comms_validate_tc() already range-checked this,
-             * re-check here so a direct caller cannot bypass the bounds.
-             * NASA-PoT #1 / NASA-STD-8739.8. */
+             * re-check here so a future in-file caller cannot bypass the
+             * bounds. NASA-PoT #1 / NASA-STD-8739.8. */
             if ((interval_ms == 0UL) ||
                 ((interval_ms >= COMMS_TC_BEACON_MIN_MS) &&
                  (interval_ms <= COMMS_TC_BEACON_MAX_MS))) {
@@ -70,6 +77,8 @@ void comms_dispatch_command(uint8_t cmd_id, const uint8_t *payload, size_t len)
         }
         break;
     default:
+        /* Unreachable via comms_rx_handle_frame(): unknown opcodes are
+         * rejected by the whitelist. Kept as a defensive no-op. */
         break;
     }
 }
@@ -80,6 +89,11 @@ void comms_dispatch_command(uint8_t cmd_id, const uint8_t *payload, size_t len)
  * Validate a raw uplink frame and dispatch it only if it is well formed,
  * CRC-clean, of a known opcode and with in-range parameters. Every rejection
  * is counted (comms_rx_get_stats) and never reaches the dispatcher.
+ *
+ * Scope: this is *structural* validation (framing, CRC-16 integrity, opcode
+ * whitelist, parameter ranges). The CRC is unkeyed, so it detects corruption
+ * and malformed frames — it does NOT authenticate the sender and gives no
+ * replay protection. A keyed MAC + rolling counter would be needed for that.
  *
  * Standards: NASA-PoT #1 (bounds-checked, no overflow), NASA-STD-8739.8
  * (command validation before execution).
@@ -99,7 +113,7 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len)
         return result;   /* rejected — do NOT dispatch */
     }
 
-    comms_dispatch_command(opcode, payload, payload_len);
+    comms_dispatch_command_unchecked(opcode, payload, payload_len);
     return COMMS_TC_OK;
 }
 
@@ -162,18 +176,25 @@ static const osThreadAttr_t rx_attrs = {
     .priority   = osPriorityNormal,
 };
 
+/*
+ * NOT YET WIRED: the SX1268 driver is still a stub, so nothing calls
+ * comms_rx_handle_frame() on the flight target yet — the gate is dormant on
+ * hardware and only exercised by the ESP32 simulation bridge and host tests.
+ * When the radio driver lands, the ONLY permitted path from PHY payload to
+ * dispatcher is comms_rx_handle_frame().
+ */
 void lora_rx_task(void *arg)
 {
     (void)arg;
 
     for (;;) {
-        watchdog_alive_self();
-        /* TODO: enter RX mode, wait for interrupt, decode packet */
-        /* TODO: enter RX mode, wait for DIO1 IRQ, read the PHY payload into
-         *       rx_buf / rx_len, decrypt, then gate it through:
-         *           (void)comms_rx_handle_frame(rx_buf, rx_len);
+        /* TODO: enter RX mode, wait for the DIO1 IRQ, read the PHY payload into
+         *       rx_buf / rx_len, then gate it through:
+         *           comms_tc_result_t r = comms_rx_handle_frame(rx_buf, rx_len);
+         *           if (r != COMMS_TC_OK) { log comms_tc_result_str(r); }
          *       which performs structure + CRC + opcode + range validation and
-         *       dispatches only valid telecommands. */
+         *       dispatches only valid telecommands. The rejection reason must be
+         *       logged/telemetered, not discarded. */
         osDelay(pdMS_TO_TICKS(100));
     }
 }

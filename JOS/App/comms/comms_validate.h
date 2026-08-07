@@ -5,9 +5,16 @@
  * @file    comms_validate.h
  * @brief   Uplink telecommand (TC) validation for the LoRa SX1268 RX path.
  *
- * Every frame received on the uplink MUST pass comms_validate_tc() before it is
- * handed to comms_dispatch_command(). Validation is purely defensive and does
- * not modify the RX state machine.
+ * Every frame received on the uplink MUST pass comms_validate_tc() before it
+ * reaches the (file-static) dispatcher in comms.c; the single exported entry
+ * point is comms_rx_handle_frame(). Validation is purely defensive and does not
+ * modify the RX state machine.
+ *
+ * SCOPE — structural validation, NOT authentication: the CRC-16/CCITT-FALSE
+ * trailer is unkeyed, so it detects corruption and malformed frames only. Any
+ * transmitter that knows this frame format can forge a CRC-valid telecommand,
+ * and replayed frames are accepted. Authenticated uplink requires a keyed MAC
+ * and a monotonic counter — tracked separately, not provided here.
  *
  * Frame layout (big-endian on the wire):
  *
@@ -23,8 +30,8 @@
  * Standards:
  *   - NASA Power of Ten rule #1 / #5 : no unbounded arithmetic, all inputs
  *     bounds-checked before use; fixed upper bounds on every loop.
- *   - NASA-STD-8739.8 : command authentication / validation — malformed,
- *     oversized, unknown or out-of-range commands are rejected, never executed.
+ *   - NASA-STD-8739.8 : command validation — malformed, oversized, unknown or
+ *     out-of-range commands are rejected, never executed.
  */
 
 #include <stdbool.h>
@@ -45,7 +52,7 @@
 /** Largest payload that still fits inside COMMS_TC_MAX_FRAME. */
 #define COMMS_TC_MAX_PAYLOAD  (COMMS_TC_MAX_FRAME - COMMS_TC_OVERHEAD)
 
-/** Telecommand opcodes (mirrors comms_dispatch_command()). */
+/** Telecommand opcodes (mirrors the dispatcher in comms.c). */
 #define COMMS_TC_RESET                0x01U
 #define COMMS_TC_EXIT_STATE           0x02U
 #define COMMS_TC_SET_CONFIG           0x03U
@@ -82,6 +89,11 @@ typedef struct {
 
 /**
  * @brief CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection, no xorout).
+ *
+ * Defensive contract: @p data == NULL returns the init value 0xFFFF (which will
+ * not match a real frame trailer), and @p len is clamped to COMMS_TC_MAX_FRAME
+ * so the loop is always bounded. Callers must not use it as a general-purpose
+ * CRC over buffers larger than one uplink frame.
  */
 uint16_t comms_crc16_ccitt(const uint8_t *data, size_t len);
 

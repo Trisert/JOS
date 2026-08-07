@@ -3,9 +3,15 @@
  * @brief   Uplink telecommand validation — structure, CRC, opcode whitelist and
  *          per-opcode numeric parameter range checks.
  *
+ * Scope: STRUCTURAL validation only. The CRC-16/CCITT-FALSE trailer is unkeyed,
+ * so it detects corrupted/malformed frames but does NOT authenticate the sender
+ * and offers no replay protection — any transmitter that knows the frame format
+ * can produce a CRC-valid telecommand. Authentication would require a keyed MAC
+ * plus a monotonic counter / rolling code.
+ *
  * Standards: NASA Power of Ten #1 (bounded, overflow-free arithmetic; no
- * unchecked indexing), NASA-STD-8739.8 (command validation/authentication —
- * a malformed or out-of-range telecommand is rejected, never dispatched).
+ * unchecked indexing), NASA-STD-8739.8 (command validation — a malformed or
+ * out-of-range telecommand is rejected, never dispatched).
  */
 
 #include "comms_validate.h"
@@ -76,11 +82,16 @@ uint16_t comms_crc16_ccitt(const uint8_t *data, size_t len)
 {
     uint16_t crc = 0xFFFFU;
 
+    /* Defensive contract (documented in the header): a NULL buffer yields the
+     * CRC init value 0xFFFF and an over-long request is clamped to the frame
+     * budget, so the loop bound is always finite (NASA-PoT #2). Callers inside
+     * this module never rely on either path — comms_validate_tc() bounds `len`
+     * to COMMS_TC_MAX_FRAME before calling. */
     if (data == NULL) {
         return crc;
     }
-    if (len > COMMS_TC_MAX_FRAME) {   /* hard upper bound on the loop */
-        len = COMMS_TC_MAX_FRAME;
+    if (len > (size_t)COMMS_TC_MAX_FRAME) {   /* hard upper bound on the loop */
+        len = (size_t)COMMS_TC_MAX_FRAME;
     }
 
     for (size_t i = 0U; i < len; i++) {
@@ -118,13 +129,18 @@ comms_tc_result_t comms_validate_tc(const uint8_t   *frame,
     const uint8_t opcode      = frame[0];
     const size_t  payload_len = (size_t)frame[1];
 
-    /* Declared length must match the received length exactly. Both operands are
-     * already bounded (<= 64 and <= 255), so the addition cannot overflow. */
-    if ((payload_len + (size_t)COMMS_TC_OVERHEAD) != len) {
-        return COMMS_TC_ERR_LEN_MISMATCH;
-    }
+    /* Declared payload must fit the frame budget. Checked BEFORE the
+     * length-match test so this branch is reachable (MISRA C:2025 Rule 2.1 —
+     * no dead code): e.g. a 4-byte frame declaring 200 payload bytes lands
+     * here rather than in the mismatch case. */
     if (payload_len > (size_t)COMMS_TC_MAX_PAYLOAD) {
         return COMMS_TC_ERR_TOO_LONG;
+    }
+
+    /* Declared length must match the received length exactly. Both operands are
+     * already bounded (<= 60 and <= 64), so the addition cannot overflow. */
+    if ((payload_len + (size_t)COMMS_TC_OVERHEAD) != len) {
+        return COMMS_TC_ERR_LEN_MISMATCH;
     }
 
     /* (b) integrity: CRC-16/CCITT over header + payload, big-endian trailer */
@@ -185,7 +201,17 @@ const char *comms_tc_result_str(comms_tc_result_t result)
 
 /* ---------- Counters ---------- */
 
-static comms_rx_stats_t rx_stats;
+/*
+ * Single-writer counters: comms_rx_account() is called only from the LoRa RX
+ * path (one task / one simulation bridge task), so the read-modify-write
+ * increments never race with each other. Readers (telemetry) take a struct
+ * snapshot via comms_rx_get_stats(); on Cortex-M4 that copy is not atomic, so a
+ * snapshot taken while the RX task is mid-update may be one increment stale in
+ * one field. That is acceptable for diagnostics counters; if these ever become
+ * flight-critical they must be moved behind a critical section or made
+ * per-field atomics.
+ */
+static volatile comms_rx_stats_t rx_stats;
 
 void comms_rx_account(comms_tc_result_t result)
 {
@@ -213,6 +239,11 @@ void comms_rx_account(comms_tc_result_t result)
 void comms_rx_get_stats(comms_rx_stats_t *out)
 {
     if (out != NULL) {
-        *out = rx_stats;
+        out->accepted           = rx_stats.accepted;
+        out->rejected           = rx_stats.rejected;
+        out->rejected_crc       = rx_stats.rejected_crc;
+        out->rejected_malformed = rx_stats.rejected_malformed;
+        out->rejected_opcode    = rx_stats.rejected_opcode;
+        out->rejected_range     = rx_stats.rejected_range;
     }
 }
