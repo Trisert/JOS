@@ -89,11 +89,14 @@ static void fault_fill_scb(fault_record_t *rec)
 }
 
 /* Serialise the record into the LastStates pool.
-   Note: HAL_FLASH_Program() polls with HAL_GetTick()-based timeouts, and the
-   SysTick interrupt cannot preempt a fault handler, so the timeout cannot
-   expire here. The programming of one double word ends when the Flash BSY bit
-   clears (~100 us); a Flash controller that never clears BSY is covered by the
-   independent watchdog, not by this code path. */
+   The record is persisted here, in the exception path, because the only
+   recovery action is the reset below. To honour the "must not block
+   indefinitely" rule, laststates_write() bounds every Flash program/erase with
+   the DWT cycle counter (CPU-clock based) rather than HAL_GetTick(): the
+   SysTick interrupt cannot preempt a fault handler, so a GetTick()-based Flash
+   timeout would never fire and would block forever if the controller stuck.
+   The cycle-counter bound always advances, so a stuck controller is reported as
+   a write failure and the reset (the real containment) still happens. */
 static void fault_persist(const fault_record_t *rec, uint8_t trigger)
 {
     laststates_entry_t entry;
