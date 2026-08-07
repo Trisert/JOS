@@ -1,4 +1,5 @@
 # Build outputs
+build/
 Debug/
 Release/
 *.elf

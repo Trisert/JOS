@@ -14,6 +14,9 @@ AS       := $(PREFIX)gcc -x assembler-with-cpp
 OBJCOPY  := $(PREFIX)objcopy
 OBJDUMP  := $(PREFIX)objdump
 SIZE     := $(PREFIX)size
+NM       := $(PREFIX)nm
+HOSTCC   ?= cc
+PYTHON   ?= python3
 RM       := rm -rf
 
 ##############################################################################
@@ -57,7 +60,11 @@ INCLUDES := \
 ##############################################################################
 # Defines
 ##############################################################################
-C_DEFS  := -DDEBUG -DUSE_HAL_DRIVER -DSTM32L496xx
+# BOOT_CRC_FATAL=1 arms the boot-CRC fault policy (record to LastStates +
+# bounded NVIC_SystemReset + untrusted-image safe state). Override with
+# `make BOOT_CRC_FATAL=0 ...` for bench builds you want to keep debuggable.
+BOOT_CRC_FATAL ?= 1
+C_DEFS  := -DDEBUG -DUSE_HAL_DRIVER -DSTM32L496xx -DBOOT_CRC_FATAL=$(BOOT_CRC_FATAL)
 CXX_DEFS := -DDEBUG -DUSE_HAL_DRIVER -DSTM32L496xx -DRADIOLIB_STATIC_ONLY=1
 ASM_DEFS := -DDEBUG
 
@@ -319,9 +326,49 @@ DEPS := $(C_DEPS) $(CXX_DEPS) $(ASM_DEPS)
 ##############################################################################
 # Default target
 ##############################################################################
-.PHONY: all clean flash sim sim-build sim-flash sim-monitor sim-clean sim-erase
+.PHONY: all clean flash crc-stamp crc-check crc-selftest \
+        sim sim-build sim-flash sim-monitor sim-clean sim-erase
 
-all: $(BUILD_DIR)/$(PROJECT_NAME).elf $(BUILD_DIR)/$(PROJECT_NAME).hex $(BUILD_DIR)/$(PROJECT_NAME).bin
+# `all` deliberately depends on crc-stamp: an image whose .fw_crc word is
+# still the placeholder would make the boot-time integrity check a no-op, so
+# no build (local or CI) may produce an unstamped artefact. crc-stamp lists
+# the .bin/.hex as prerequisites, so ordering holds under `make -j`.
+all: $(BUILD_DIR)/$(PROJECT_NAME).elf $(BUILD_DIR)/$(PROJECT_NAME).hex $(BUILD_DIR)/$(PROJECT_NAME).bin crc-stamp
+
+##############################################################################
+# Firmware image CRC32 (App/obsw/boot_crc.c, docs/dev/hardening.md 2.4)
+#
+#   crc-stamp    write the real CRC32 into the .fw_crc word of the .bin and
+#                regenerate the .hex from the stamped image. The expected
+#                address of the word is derived from the ELF symbol table
+#                (__fw_crc_start) and cross-checked by the tool, so a linker
+#                script regression fails the build instead of shipping an
+#                image whose CRC word is not the last 4 bytes.
+#   crc-check    read-only gate: fail if the artefact is unstamped, erased or
+#                does not match its own contents (used in CI before upload).
+#   crc-selftest compile the *flight* CRC routine for the host and run it over
+#                the stamped image: proves boot_crc32() agrees with the
+#                zlib-based stamping tool, i.e. that the on-orbit check will
+#                actually pass on a good image.
+##############################################################################
+CRC_STAMP_TOOL := tools/fw_crc_stamp.py
+
+crc-stamp: $(BUILD_DIR)/$(PROJECT_NAME).bin $(BUILD_DIR)/$(PROJECT_NAME).hex
+	@crc_addr=`$(NM) $(BUILD_DIR)/$(PROJECT_NAME).elf | awk '$$3 == "__fw_crc_start" { print "0x" $$1 }'`; \
+	if [ -z "$$crc_addr" ]; then \
+	  echo "error: __fw_crc_start not found in $(BUILD_DIR)/$(PROJECT_NAME).elf"; \
+	  exit 1; \
+	fi; \
+	$(PYTHON) $(CRC_STAMP_TOOL) $(BUILD_DIR)/$(PROJECT_NAME).bin \
+	  --hex $(BUILD_DIR)/$(PROJECT_NAME).hex --crc-addr $$crc_addr --verify
+
+crc-check: $(BUILD_DIR)/$(PROJECT_NAME).bin
+	$(PYTHON) $(CRC_STAMP_TOOL) --check $(BUILD_DIR)/$(PROJECT_NAME).bin
+
+crc-selftest: $(BUILD_DIR)/$(PROJECT_NAME).bin
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -DBOOT_CRC_HOST_BUILD -IApp/obsw \
+	  -o $(BUILD_DIR)/crc_selftest tools/crc_selftest.c App/obsw/boot_crc.c
+	$(BUILD_DIR)/crc_selftest $(BUILD_DIR)/$(PROJECT_NAME).bin
 
 ##############################################################################
 # Verification Simulation (dual ESP32)

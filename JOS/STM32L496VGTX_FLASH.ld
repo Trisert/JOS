@@ -159,8 +159,9 @@ SECTIONS
   /* Firmware image CRC32 — MUST stay the last loaded section so that the
      checked region is exactly [__fw_image_start, __fw_crc_start) and the
      stored CRC word is the last 4 bytes of the .bin image.
-     Contents are the placeholder 0xFFFFFFFF until tools/fw_crc_stamp.py
-     patches the built binary. */
+     Contents are the placeholder 0x00000000 (deliberately NOT the erased
+     Flash pattern) until `make crc-stamp` / tools/fw_crc_stamp.py patches
+     the built binary. */
   .fw_crc :
   {
     . = ALIGN(4);
@@ -184,6 +185,20 @@ SECTIONS
     . = ALIGN(4);
     _ebss = .;         /* define a global symbol at bss end */
     __bss_end__ = _ebss;
+  } >RAM
+
+  /* Data that must survive a warm reset (NVIC_SystemReset): the startup code
+     only zeroes [_sbss,_ebss) and copies .data, so nothing here is touched.
+     NOLOAD keeps it out of the image. Used by the boot-CRC retry counter
+     (App/obsw/boot_crc.c) — see docs/dev/hardening.md 2.4. */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    __noinit_start__ = .;
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
+    __noinit_end__ = .;
   } >RAM
 
   /* User_heap_stack section, used to check that there is enough "RAM" Ram  type memory left */

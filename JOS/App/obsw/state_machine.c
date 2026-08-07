@@ -1,6 +1,7 @@
 #include "state_machine.h"
 #include "memory.h"        /* laststates_write(): LastStates pool API */
 #include "watchdog.h"
+#include "boot_crc.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
@@ -83,6 +84,15 @@ static int try_transition(obw_state_t target, uint8_t trigger)
 {
     bms_status_t bms;
     int ok = 0;
+
+    /* Boot-CRC safe state (docs/dev/hardening.md 2.4): while the running
+       image cannot be trusted the OBC is confined to STATE_CRIT — beacon
+       only, payloads and nominal ops inhibited — so ground can diagnose and
+       re-upload. Only CRIT (and the INIT boot bookkeeping) stay reachable. */
+    if ((boot_crc_image_trusted() == 0) &&
+        (target != STATE_CRIT) && (target != STATE_INIT)) {
+        return -1;
+    }
 
     switch (target) {
     case STATE_INIT:
@@ -167,7 +177,13 @@ static void state_machine_task(void *arg)
     osDelay(pdMS_TO_TICKS(500));   /* placeholder for init work */
 
     osMutexAcquire(state_mutex, osWaitForever);
-    try_transition(STATE_READY, TRIGGER_ANTENNA_DONE);
+    if (boot_crc_image_trusted() != 0) {
+        try_transition(STATE_READY, TRIGGER_ANTENNA_DONE);
+    } else {
+        /* Image integrity fault survived the reset budget: enter the safe
+           state instead of nominal ops (beacon-only, payloads inhibited). */
+        try_transition(STATE_CRIT, TRIGGER_IMAGE_CRC_FAIL);
+    }
     osMutexRelease(state_mutex);
 
     /* 10 Hz main loop */
@@ -251,7 +267,6 @@ int state_machine_set_beacon_interval(uint32_t interval_ms)
        than BEACON_INTERVAL_MIN would violate the RF duty-cycle budget.
        Out-of-range requests are rejected, leaving the current cadence intact
        (fail-safe: an erroneous or corrupted uplink cannot silence the beacon). */
-/* Fix pass: beacon interval validated (MIN/MAX) + duplicate-refresh path active. */
     if ((interval_ms != 0u) &&
         ((interval_ms < BEACON_INTERVAL_MIN) || (interval_ms > BEACON_INTERVAL_MAX))) {
         return -1;

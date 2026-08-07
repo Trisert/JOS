@@ -132,24 +132,27 @@ int main(void)
      NASA-STD-8739.8 (fault detection). Pure-software CRC32 over
      [__fw_image_start, __fw_crc_start); no HAL/peripheral dependency and no
      task exists yet, so a corrupted image is caught before osKernelStart().
-     The result is latched in boot_crc.c for beacon telemetry.
-     RedPill carries no golden image or bootloader, so a mismatch must NOT
-     brick the satellite: by default we boot and report, letting ground
-     re-upload. Build with -DBOOT_CRC_FATAL to halt in Error_Handler(). */
-  boot_crc_status_t img_integrity = boot_crc_verify();
-#ifdef BOOT_CRC_FATAL
-  if (img_integrity == BOOT_CRC_MISMATCH)
-  {
-    Error_Handler();
-  }
-#else
-  (void)img_integrity;
-#endif
+     The result is latched in boot_crc.c for beacon telemetry; the fault
+     policy is applied below, once the LastStates pool is available.
+     See docs/dev/hardening.md 2.4. */
+  (void)boot_crc_verify();
 
   bms_init();
   fram_init();
   cyclic_buffer_init();
   laststates_init();
+
+  /* Act on the integrity result now that the fault can be persisted.
+     BOOT_CRC_FATAL (=1 by default, see App/obsw/boot_crc.h): the fault is
+     written to LastStates and the OBC resets up to
+     BOOT_CRC_MAX_RESET_ATTEMPTS times to clear a transient corruption — this
+     call does not return in that case. When the budget is exhausted we keep
+     booting with the image marked untrusted, which confines the state machine
+     to STATE_CRIT (beacon-only, payloads inhibited) so ground can re-upload.
+     Deliberately never Error_Handler(): with no IWDG configured its
+     __disable_irq(); while(1) would be an unrecoverable brick. */
+  boot_crc_apply_policy();
+
   lora_init();
   state_machine_init();
   watchdog_monitor_init();

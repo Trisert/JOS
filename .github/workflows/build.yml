@@ -82,6 +82,27 @@ jobs:
         working-directory: JOS
         run: make all
 
+      # `make all` already depends on crc-stamp; re-running it here is
+      # idempotent and makes the stamping step explicit in the log. Without a
+      # stamp the .fw_crc word stays at the 0x00000000 placeholder and the
+      # boot-time integrity check degrades to a no-op.
+      - name: Stamp firmware image CRC32
+        working-directory: JOS
+        run: make crc-stamp
+
+      # Hard gate before upload: fails if the artefact is unstamped, carries
+      # the erased-Flash pattern, or does not match its own contents.
+      - name: Verify image is stamped and consistent
+        working-directory: JOS
+        run: make crc-check
+
+      # Runs the *flight* CRC routine (App/obsw/boot_crc.c) on the host over
+      # the stamped image, so the on-orbit check and the zlib-based stamping
+      # tool can never silently diverge.
+      - name: Boot-CRC self-test (flight routine vs stamped image)
+        working-directory: JOS
+        run: make crc-selftest
+
       - name: Report size
         working-directory: JOS
         run: arm-none-eabi-size build/JOS.elf

@@ -7,8 +7,11 @@
 #include <stddef.h>
 
 /* Maximum number of tasks that can be monitored.
-   Currently 7 tasks register (defaultTask, stateMachine, loraBeacon, loraRX,
-   clear, cloud, aocs); the monitor task itself is deliberately not monitored. */
+   Four tasks are monitored today (defaultTask, stateMachine, loraBeacon,
+   loraRX). clear/cloud/aocs register inside their *_task_create() helpers,
+   which main() does not call yet (payload/AOCS bring-up pending) — they are
+   covered the moment they are enabled. The monitor task itself is
+   deliberately not monitored. See docs/dev/hardening.md 3.1. */
 #define WDG_MAX_TASKS 12
 
 /* Nominal loop periods (ms) declared by each monitored task at registration.
