@@ -181,6 +181,41 @@ void test_laststates_dump_all_accepts_exactly_sized_buffer(void)
     TEST_ASSERT_EQUAL_size_t((size_t)(2 * LASTSTATES_ENTRY_SIZE), len);
 }
 
+/* Boundary of the capacity check: one byte short of the required size must
+ * still be refused with nothing copied. An off-by-one here (>= instead of >)
+ * is exactly the overrun the size parameter was introduced to prevent, and a
+ * test that only ever passes an oversized buffer cannot see it. */
+void test_laststates_dump_all_refuses_a_buffer_one_byte_short(void)
+{
+    uint8_t out[3 * LASTSTATES_ENTRY_SIZE];
+    size_t  len;
+    uint32_t i;
+
+    laststates_entry_t a = make_entry(1u, STATE_OFF,   STATE_INIT,  TRIGGER_BOOT, 0xA1u);
+    laststates_entry_t b = make_entry(2u, STATE_INIT,  STATE_READY, TRIGGER_BOOT, 0xB2u);
+    laststates_entry_t c = make_entry(3u, STATE_READY, STATE_ACTIVE, TRIGGER_BOOT, 0xC3u);
+
+    memset(out, 0x00, sizeof(out));
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&a));
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&b));
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&c));
+
+    len = sizeof(out) - 1u;                       /* one byte short */
+    TEST_ASSERT_EQUAL_INT(-1, laststates_dump_all(out, &len));
+    TEST_ASSERT_EQUAL_size_t((size_t)(3 * LASTSTATES_ENTRY_SIZE), len);
+    for (i = 0u; i < (uint32_t)sizeof(out); i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00u, out[i]);    /* nothing copied */
+    }
+
+    len = sizeof(out);                            /* exactly enough */
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    TEST_ASSERT_EQUAL_size_t((size_t)(3 * LASTSTATES_ENTRY_SIZE), len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&c,
+                                  out + (2 * LASTSTATES_ENTRY_SIZE),
+                                  LASTSTATES_ENTRY_SIZE);
+}
+
 /* An empty pool needs no space at all, so even a zero-capacity buffer is a
  * legal (and side-effect free) request. */
 void test_laststates_dump_all_on_empty_pool_writes_nothing(void)
