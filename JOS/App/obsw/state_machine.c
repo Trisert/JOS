@@ -14,6 +14,16 @@
 static osMutexId_t state_mutex;
 static osThreadId_t sm_task_handle;
 
+/* Latched when the OBSW is confined to the safe state because of an SRAM2
+   parity finding at boot (Kilo #14, finding 4). Set BEFORE the
+   try_transition() that records it in LastStates, because that call returns
+   -1 both when the transition is refused and when the Flash write fails:
+   gating the latch on a successful return would leave the safe-state
+   decision unrecorded exactly when the record could not be persisted. A
+   parity finding is not cleared by a battery recovery, so this also keeps
+   the autonomous battery logic from pulling the OBSW back out of CRIT. */
+static uint8_t parity_safe_latched = 0U;
+
 /* ---------- Critical OBSW state (SRAM2, hardware parity) ----------
    Operational state, beacon override and the last BMS snapshot decide every
    autonomous action of the spacecraft, so they live in the parity-protected
@@ -195,7 +205,12 @@ static void check_battery_autonomous(void)
         try_transition(STATE_CRIT, TRIGGER_BATTERY_LOW);
     } else if (obsw_state.current_state == STATE_CRIT &&
                bms.soc >= default_thresholds.b_opok) {
-        try_transition(STATE_READY, TRIGGER_BATTERY_OK);
+        /* A parity fault latched us into the safe state: a battery recovery
+           does not clear a memory-integrity finding, so only a power-on reset
+           (which clears the reset-stable store) releases it. */
+        if (parity_safe_latched == 0U) {
+            try_transition(STATE_READY, TRIGGER_BATTERY_OK);
+        }
     }
 }
 
@@ -222,6 +237,18 @@ static void state_machine_task(void *arg)
            state instead of nominal ops (beacon-only, payloads inhibited). */
         try_transition(STATE_CRIT, TRIGGER_IMAGE_CRC_FAIL);
     }
+
+    /* SRAM2 parity boot fault (Kilo #14, findings 3 & 4): if the reset-stable
+       store reports the previous run ended on a parity finding (or the boot
+       erase never completed), the OBSW must come up in the safe state, not in
+       READY on data whose integrity is not established. The flag survives the
+       reset in .noinit (see sram2_parity_boot_fault()), so it is still
+       visible here. Latch it FIRST, then attempt the recorded transition. */
+    if (sram2_parity_boot_fault() != 0) {
+        parity_safe_latched = 1U;
+        try_transition(STATE_CRIT, TRIGGER_SRAM2_PARITY);
+    }
+
     osMutexRelease(state_mutex);
 
     /* 10 Hz main loop */
