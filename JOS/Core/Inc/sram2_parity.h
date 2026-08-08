@@ -47,11 +47,22 @@ typedef enum {
 
 /* ---------- Event ids recorded in the LastStates pool ---------- */
 enum {
-    SRAM2_EVENT_PARITY_NMI = 0U,  /* NMI with SYSCFG_CFGR2.SPF set           */
-    SRAM2_EVENT_OTHER_NMI  = 1U,  /* NMI from another source (e.g. RCC CSS)  */
-    SRAM2_EVENT_BOOT_LATCH = 2U,  /* SPF already latched when init() ran     */
-    SRAM2_EVENT_ERASE_FAIL = 3U,  /* SRAM2 hardware erase never completed    */
+    SRAM2_EVENT_PARITY_NMI      = 0U,  /* NMI with SYSCFG_CFGR2.SPF set      */
+    SRAM2_EVENT_OTHER_NMI       = 1U,  /* NMI from another source (RCC CSS)  */
+    SRAM2_EVENT_BOOT_LATCH      = 2U,  /* SPF already latched when init() ran */
+    SRAM2_EVENT_ERASE_FAIL      = 3U,  /* SRAM2 erase was never acknowledged */
+    SRAM2_EVENT_ERASE_BUSY      = 4U,  /* erase still running after both
+                                          bounded waits - the block is under
+                                          the erase engine and must not be
+                                          written to                          */
+    SRAM2_EVENT_PARITY_DISABLED = 5U,  /* SRAM2_PE option byte not programmed:
+                                          the hardware check is OFF, so the
+                                          parity NMI can never fire           */
+    SRAM2_EVENT_STORE_LOST      = 6U,  /* reset-stable store failed validation */
 };
+
+/* Highest defined event id, used to sanity-check a salvaged store. */
+#define SRAM2_EVENT_LAST        SRAM2_EVENT_STORE_LOST
 
 /* Marker so ground can find these records inside a LastStates context blob. */
 #define SRAM2_PARITY_RECORD_MAGIC   0x53503245U   /* "SP2E" */
@@ -95,11 +106,15 @@ void sram2_parity_init(void);
 /**
   * @brief  Flush the boot-time parity records captured by sram2_parity_init().
   *
-  * Must be called after laststates_init(), which (re)sets the LastStates pool
-  * write index: a record persisted before that call is overwritten by the
-  * first transition logged after boot. The records were fully built at
-  * detection time - every status register was sampled before it was cleared -
-  * so deferring the Flash write does not change their contents.
+  * Called after laststates_init(), which establishes the LastStates pool write
+  * index. The deferral is about ORDERING of the forensic trail, not about a
+  * write hazard: laststates_write() re-derives the cursor via
+  * laststates_resync() whenever the target slot is not erased, so a record
+  * written at detection time would neither fail nor overwrite anything - it
+  * would just land ahead of the boot bookkeeping and leave ground reading the
+  * trail out of order. The records were fully built at detection time (every
+  * status register was sampled before it was cleared), so deferring the Flash
+  * write does not change their contents.
   *
   * @retval >=0 number of records written, 0 when nothing was pending.
   * @retval -1  at least one Flash write failed (records are dropped, one shot:
@@ -116,8 +131,28 @@ int sram2_parity_persist_boot_records(void);
   *         complete. The state machine uses it to start in the safe state
   *         (STATE_CRIT) instead of continuing to READY on data whose
   *         integrity is not established.
+  * @note   sram2_parity_init() only READS the reset-stable half of this flag.
+  *         Release it with sram2_parity_boot_fault_ack() once the safe state
+  *         has actually been entered - see that function.
   */
 int sram2_parity_boot_fault(void);
+
+/**
+  * @brief  Release the reset-stable boot-fault latch after the safe state has
+  *         actually been taken.
+  *
+  * The finding must outlive every reset that can happen between
+  * sram2_parity_init() and the state machine acting on it - dual_bank_init()
+  * can OB_Launch and never return, boot_crc_apply_policy() reboots up to
+  * BOOT_CRC_MAX_RESET_ATTEMPTS times, and any fault handler resets. Consuming
+  * the flag at init would hand the only surviving copy to a .bss variable the
+  * next reset zeroes, and the boot after that would come up nominal on a
+  * spacecraft with an unresolved memory-integrity finding.
+  *
+  * @note Call ONLY after the OBSW is in STATE_CRIT. The in-run flag reported
+  *       by sram2_parity_boot_fault() stays set for the rest of this boot.
+  */
+void sram2_parity_boot_fault_ack(void);
 
 /**
   * @brief  Parity-triggered system resets seen since the last power-on.
@@ -126,6 +161,26 @@ int sram2_parity_boot_fault(void);
   *         Only a power-on / brown-out reset clears it.
   */
 uint32_t sram2_parity_reset_count(void);
+
+/**
+  * @brief  Reboots taken because the SRAM2 hardware erase was still running
+  *         after both bounded waits (SRAM2_EVENT_ERASE_BUSY).
+  * @note   Bounded by SRAM2_ERASE_BUSY_RESET_LIMIT: once the budget is spent
+  *         boot continues with SRAM2 left untouched and the boot-fault latch
+  *         confines the OBSW to STATE_CRIT, rather than looping through reset
+  *         forever on a wedged erase engine.
+  */
+uint32_t sram2_parity_erase_busy_resets(void);
+
+/**
+  * @brief  Last SRAM2_EVENT_* recorded in the reset-stable store.
+  * @retval SRAM2_EVENT_STORE_LOST when the store itself failed validation.
+  * @note   SRAM2_EVENT_PARITY_DISABLED here means the SRAM2_PE user option
+  *         byte is not programmed, i.e. the hardware parity check is OFF and
+  *         the NMI this module is built around can never fire. The module
+  *         then only prepares and records; it cannot detect.
+  */
+uint32_t sram2_parity_last_event(void);
 
 /**
   * @brief  LastStates records the fault path could not write (Flash busy or

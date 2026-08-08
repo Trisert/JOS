@@ -15,13 +15,23 @@ static osMutexId_t state_mutex;
 static osThreadId_t sm_task_handle;
 
 /* Latched when the OBSW is confined to the safe state because of an SRAM2
-   parity finding at boot (Kilo #14, finding 4). Set BEFORE the
-   try_transition() that records it in LastStates, because that call returns
-   -1 both when the transition is refused and when the Flash write fails:
-   gating the latch on a successful return would leave the safe-state
-   decision unrecorded exactly when the record could not be persisted. A
-   parity finding is not cleared by a battery recovery, so this also keeps
-   the autonomous battery logic from pulling the OBSW back out of CRIT. */
+   parity finding at boot.
+
+   Enforced centrally in try_transition() (Kilo #23, comment id 3740885216),
+   next to the boot-CRC confinement, so EVERY caller is covered: the previous
+   version consulted it only from the battery-recovery branch while the comms
+   path walked straight into try_transition() with STATE_READY / STATE_ACTIVE,
+   both legal from CRIT. Two safety latches, only one of which confined
+   anything.
+
+   Lifetime: the finding itself lives in a reset-stable .noinit store, and
+   sram2_parity_init() no longer consumes it - it is released by
+   sram2_parity_boot_fault_ack(), which the boot sequence below calls only
+   after the OBSW has actually reached STATE_CRIT. So a warm reset before that
+   point (watchdog, boot-CRC policy, COMMS_TC_RESET, dual-bank reboot)
+   re-enters the safe state instead of silently clearing it. This .bss copy is
+   the in-run half and lasts for this boot; a battery recovery does not clear
+   a memory-integrity finding. */
 static uint8_t parity_safe_latched = 0U;
 
 /* ---------- Critical OBSW state (SRAM2, hardware parity) ----------
@@ -138,6 +148,16 @@ static int try_transition(obw_state_t target, uint8_t trigger)
         return -1;
     }
 
+    /* SRAM2 parity confinement, enforced in the same central place and for
+       the same reason (Kilo #23, comment id 3740885216): a memory-integrity
+       finding is not something a battery recovery or a ground command may
+       walk out of. Only CRIT (and the INIT boot bookkeeping) stay reachable
+       while the latch is held; see the declaration for its lifetime. */
+    if ((parity_safe_latched != 0U) &&
+        (target != STATE_CRIT) && (target != STATE_INIT)) {
+        return -1;
+    }
+
     switch (target) {
     case STATE_INIT:
         /* Only valid from OFF (boot) */
@@ -196,6 +216,26 @@ static int try_transition(obw_state_t target, uint8_t trigger)
     return 0;
 }
 
+/* ---------- Unconditional safe-state entry ----------
+   try_transition() returns -1 both when a transition is refused AND when
+   laststates_log() fails - and in the latter case it returns BEFORE assigning
+   current_state (Kilo #23, comment id 3740885211). So on a Flash-sick,
+   parity-faulted boot the OBSW used to stay in whatever state it had just
+   entered, running nominal ops on memory whose integrity is explicitly not
+   established, accompanied by a very well documented flag saying we intended
+   otherwise. The LastStates record is best effort; the containment is not, so
+   force the state through the SEU pair when the recorded transition does not
+   take. */
+static void enter_safe_state(uint8_t trigger)
+{
+    if (try_transition(STATE_CRIT, trigger) != 0) {
+        seu_mitigation_lock();
+        obsw_state.current_state = STATE_CRIT;
+        (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+        seu_mitigation_unlock();
+    }
+}
+
 /* ---------- Autonomous battery check ---------- */
 static void check_battery_autonomous(void)
 {
@@ -205,12 +245,10 @@ static void check_battery_autonomous(void)
         try_transition(STATE_CRIT, TRIGGER_BATTERY_LOW);
     } else if (obsw_state.current_state == STATE_CRIT &&
                bms.soc >= default_thresholds.b_opok) {
-        /* A parity fault latched us into the safe state: a battery recovery
-           does not clear a memory-integrity finding, so only a power-on reset
-           (which clears the reset-stable store) releases it. */
-        if (parity_safe_latched == 0U) {
-            try_transition(STATE_READY, TRIGGER_BATTERY_OK);
-        }
+        /* No parity check here any more: it lives in try_transition(), which
+           covers this caller and every other one (Kilo #23, id 3740885216).
+           A refused recovery simply leaves the OBSW in CRIT. */
+        try_transition(STATE_READY, TRIGGER_BATTERY_OK);
     }
 }
 
@@ -230,23 +268,39 @@ static void state_machine_task(void *arg)
     osDelay(pdMS_TO_TICKS(500));   /* placeholder for init work */
 
     osMutexAcquire(state_mutex, osWaitForever);
-    if (boot_crc_image_trusted() != 0) {
-        try_transition(STATE_READY, TRIGGER_ANTENNA_DONE);
-    } else {
-        /* Image integrity fault survived the reset budget: enter the safe
-           state instead of nominal ops (beacon-only, payloads inhibited). */
-        try_transition(STATE_CRIT, TRIGGER_IMAGE_CRC_FAIL);
-    }
 
-    /* SRAM2 parity boot fault (Kilo #14, findings 3 & 4): if the reset-stable
-       store reports the previous run ended on a parity finding (or the boot
-       erase never completed), the OBSW must come up in the safe state, not in
-       READY on data whose integrity is not established. The flag survives the
-       reset in .noinit (see sram2_parity_boot_fault()), so it is still
-       visible here. Latch it FIRST, then attempt the recorded transition. */
+    /* Latch the SRAM2 parity finding BEFORE any boot transition is attempted.
+       The confinement in try_transition() has to be in force when the READY
+       transition is evaluated, otherwise the OBSW enters READY first and is
+       only dragged back afterwards - which is exactly what happened when the
+       latch was set after the boot transition. */
     if (sram2_parity_boot_fault() != 0) {
         parity_safe_latched = 1U;
-        try_transition(STATE_CRIT, TRIGGER_SRAM2_PARITY);
+    }
+
+    if (boot_crc_image_trusted() == 0) {
+        /* Image integrity fault survived the reset budget: enter the safe
+           state instead of nominal ops (beacon-only, payloads inhibited). */
+        enter_safe_state(TRIGGER_IMAGE_CRC_FAIL);
+    } else if (parity_safe_latched != 0U) {
+        /* SRAM2 reported a parity finding, or the boot erase never completed:
+           come up in the safe state, not in READY on data whose integrity is
+           not established. */
+        enter_safe_state(TRIGGER_SRAM2_PARITY);
+    } else {
+        try_transition(STATE_READY, TRIGGER_ANTENNA_DONE);
+    }
+
+    if (parity_safe_latched != 0U) {
+        /* The OBSW is now in STATE_CRIT (enter_safe_state() forces it if the
+           recorded transition failed), so the reset-stable half of the flag
+           has done its job and can be released. Releasing it only HERE - and
+           not in sram2_parity_init() - is what makes the evidence survive
+           dual_bank_init()'s OB_Launch, boot_crc_apply_policy()'s reset
+           budget and any fault handler in between (Kilo #23, id 3740885202).
+           parity_safe_latched stays set for this run, so the confinement in
+           try_transition() outlives the acknowledgement. */
+        sram2_parity_boot_fault_ack();
     }
 
     osMutexRelease(state_mutex);

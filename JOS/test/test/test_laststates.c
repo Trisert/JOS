@@ -182,38 +182,113 @@ void test_laststates_dump_all_accepts_exactly_sized_buffer(void)
 }
 
 /* Boundary of the capacity check: one byte short of the required size must
- * still be refused with nothing copied. An off-by-one here (>= instead of >)
- * is exactly the overrun the size parameter was introduced to prevent, and a
- * test that only ever passes an oversized buffer cannot see it. */
+ * still be refused with nothing copied. A capacity check that is one byte too
+ * LAX (accepting capacity == needed - 1, e.g. comparing against `capacity + 1`
+ * or against `needed - 1` entries) is exactly the overrun the size parameter
+ * was introduced to prevent, and a test that only ever passes an oversized
+ * buffer cannot see it.
+ *
+ * The opposite mutation - a check one byte too STRICT, refusing the exactly
+ * sized buffer - cannot overrun anything and is already covered by
+ * test_laststates_dump_all_accepts_exactly_sized_buffer above. This test is
+ * single-purpose: refusal only, no accept half.
+ *
+ * Guard bands frame the buffer, as in
+ * test_laststates_dump_all_refuses_undersized_buffer: with a bare array the
+ * declared capacity is one byte below the array size, so a copy that runs one
+ * byte past the capacity lands harmlessly inside the array, and a copy that
+ * runs past `needed` bytes redecorates the stack without failing a single
+ * assertion. The canaries turn "we infer nothing was written" into "nothing
+ * was written". */
 void test_laststates_dump_all_refuses_a_buffer_one_byte_short(void)
 {
-    uint8_t out[3 * LASTSTATES_ENTRY_SIZE];
-    size_t  len;
+    struct {
+        uint8_t guard_lo[16];
+        uint8_t out[3 * LASTSTATES_ENTRY_SIZE];
+        uint8_t guard_hi[16];
+    } framed;
+
+    size_t   len;
     uint32_t i;
 
-    laststates_entry_t a = make_entry(1u, STATE_OFF,   STATE_INIT,  TRIGGER_BOOT, 0xA1u);
-    laststates_entry_t b = make_entry(2u, STATE_INIT,  STATE_READY, TRIGGER_BOOT, 0xB2u);
+    laststates_entry_t a = make_entry(1u, STATE_OFF,   STATE_INIT,   TRIGGER_BOOT, 0xA1u);
+    laststates_entry_t b = make_entry(2u, STATE_INIT,  STATE_READY,  TRIGGER_BOOT, 0xB2u);
     laststates_entry_t c = make_entry(3u, STATE_READY, STATE_ACTIVE, TRIGGER_BOOT, 0xC3u);
 
-    memset(out, 0x00, sizeof(out));
+    memset(&framed, 0x00, sizeof(framed));
 
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&a));
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&b));
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&c));
 
-    len = sizeof(out) - 1u;                       /* one byte short */
-    TEST_ASSERT_EQUAL_INT(-1, laststates_dump_all(out, &len));
-    TEST_ASSERT_EQUAL_size_t((size_t)(3 * LASTSTATES_ENTRY_SIZE), len);
-    for (i = 0u; i < (uint32_t)sizeof(out); i++) {
-        TEST_ASSERT_EQUAL_HEX8(0x00u, out[i]);    /* nothing copied */
-    }
+    len = sizeof(framed.out) - 1u;                /* one byte short */
+    TEST_ASSERT_EQUAL_INT(-1, laststates_dump_all(framed.out, &len));
 
-    len = sizeof(out);                            /* exactly enough */
-    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    /* Required size reported back for the caller's retry ... */
     TEST_ASSERT_EQUAL_size_t((size_t)(3 * LASTSTATES_ENTRY_SIZE), len);
-    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&c,
-                                  out + (2 * LASTSTATES_ENTRY_SIZE),
+
+    /* ... and nothing was copied: not into the buffer, and - the point of the
+     * canaries - not one byte past either end of it. */
+    for (i = 0u; i < (uint32_t)sizeof(framed.out); i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.out[i]);
+    }
+    for (i = 0u; i < (uint32_t)sizeof(framed.guard_lo); i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.guard_lo[i]);
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.guard_hi[i]);
+    }
+}
+
+/* The accept side of the same boundary, one byte up: a buffer of exactly the
+ * required size copies every entry and touches nothing beyond it.
+ *
+ * Distinct from test_laststates_dump_all_accepts_exactly_sized_buffer, which
+ * checks the return value and *len on a two-entry pool: this one pins the
+ * CONTENT of all three entries at their exact offsets (a dump that returned
+ * the right byte count with the entries transposed, or that only got the last
+ * one right, would pass there and fail here) and adds the upper guard band to
+ * prove the copy stopped at `needed` bytes rather than merely at the array
+ * boundary. */
+void test_laststates_dump_all_capacity_boundary_accepts_exact_fit(void)
+{
+    struct {
+        uint8_t guard_lo[16];
+        uint8_t out[3 * LASTSTATES_ENTRY_SIZE];
+        uint8_t guard_hi[16];
+    } framed;
+
+    size_t   len;
+    uint32_t i;
+
+    laststates_entry_t a = make_entry(1u, STATE_OFF,   STATE_INIT,   TRIGGER_BOOT, 0xA1u);
+    laststates_entry_t b = make_entry(2u, STATE_INIT,  STATE_READY,  TRIGGER_BOOT, 0xB2u);
+    laststates_entry_t c = make_entry(3u, STATE_READY, STATE_ACTIVE, TRIGGER_BOOT, 0xC3u);
+
+    memset(&framed, 0x00, sizeof(framed));
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&a));
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&b));
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&c));
+
+    len = sizeof(framed.out);                     /* exactly enough */
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(framed.out, &len));
+    TEST_ASSERT_EQUAL_size_t((size_t)(3 * LASTSTATES_ENTRY_SIZE), len);
+
+    /* Every entry, at its own offset, in write order. */
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&a,
+                                  framed.out + (0 * LASTSTATES_ENTRY_SIZE),
                                   LASTSTATES_ENTRY_SIZE);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&b,
+                                  framed.out + (1 * LASTSTATES_ENTRY_SIZE),
+                                  LASTSTATES_ENTRY_SIZE);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&c,
+                                  framed.out + (2 * LASTSTATES_ENTRY_SIZE),
+                                  LASTSTATES_ENTRY_SIZE);
+
+    /* The copy stopped exactly at the capacity it was given. */
+    for (i = 0u; i < (uint32_t)sizeof(framed.guard_lo); i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.guard_lo[i]);
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.guard_hi[i]);
+    }
 }
 
 /* An empty pool needs no space at all, so even a zero-capacity buffer is a
