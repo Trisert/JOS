@@ -170,7 +170,6 @@ static laststates_mirror_t ls_mirror = {
     .count = 0U,   /* number of entries written */
     .idx   = 0U,   /* next write index (circular) */
 };
->>>>>>> e66cae8 (feat: SEU mitigation via periodic scrub + parity NMI (W2-5))
 
 /* Compile-time guards against the divide-by-zero class in this module (M1). */
 _Static_assert(LASTSTATES_MAX_ENTRIES > 0U, "LASTSTATES_MAX_ENTRIES must be > 0");
@@ -355,7 +354,7 @@ static uint32_t laststates_resync(void)
     }
     /* A completely full pool wraps to slot 0; the next write recycles the
      * oldest page there. */
-    ls_idx = (idx >= LASTSTATES_MAX_ENTRIES) ? 0U : idx;
+    ls_mirror.idx = (idx >= LASTSTATES_MAX_ENTRIES) ? 0U : idx;
     return idx;
 }
 
@@ -412,8 +411,10 @@ int laststates_write(const laststates_entry_t *entry)
        silently dead. So whenever the target slot has moved under us, re-derive
        the cursor from Flash before deciding anything (W2-2 review C2). Only if
        the pool is genuinely full does the ring wrap and recycle a page. */
+    uint32_t ls_idx = ls_mirror.idx;  /* local cursor = SEU mirror cursor */
     if (!slot_is_erased(ls_idx)) {
         (void)laststates_resync();
+        ls_idx = ls_mirror.idx;  /* resync may have moved the cursor */
     }
 
     uint32_t addr = LASTSTATES_FLASH_BASE + ls_idx * LASTSTATES_ENTRY_SIZE;
