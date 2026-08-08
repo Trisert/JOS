@@ -106,10 +106,12 @@ boot_crc_status_t boot_crc_verify(void)
     crc_expected   = fw_crc_stored;
 
     if (crc_expected == BOOT_CRC_UNSTAMPED_VALUE) {
-        /* Deliberate placeholder: image was never stamped (bench build
-           flashed straight from the .elf). Nothing to compare against —
-           report, do not fail. CI never ships such an artefact: `make all`
-           depends on crc-stamp and the workflow re-runs `make crc-check`. */
+        /* Deliberate placeholder: the image was never stamped (flashed
+           straight from the .elf by CubeIDE / OpenOCD, or `make crc-stamp`
+           was skipped). There is nothing to compare against, so the image
+           carries NO integrity evidence — whether that is tolerated is the
+           BOOT_CRC_TRUST_UNSTAMPED policy decision taken in
+           boot_crc_image_trusted(), not something this verdict hides. */
         crc_status = BOOT_CRC_UNSTAMPED;
     } else if (crc_expected == BOOT_CRC_ERASED_VALUE) {
         /* Erased Flash where a stamp should be: the image tail was never
@@ -126,8 +128,20 @@ boot_crc_status_t boot_crc_verify(void)
 
 int boot_crc_image_trusted(void)
 {
-    return ((crc_status == BOOT_CRC_OK) || (crc_status == BOOT_CRC_UNSTAMPED))
-           ? 1 : 0;
+    if (crc_status == BOOT_CRC_OK) {
+        return 1;
+    }
+
+#if BOOT_CRC_TRUST_UNSTAMPED
+    /* Bench opt-in only (see boot_crc.h): an unstamped image is treated as
+       "nothing to check". Never enabled in the flight/CI build, where an
+       unstamped image must not silently pass the integrity gate. */
+    if (crc_status == BOOT_CRC_UNSTAMPED) {
+        return 1;
+    }
+#endif
+
+    return 0;
 }
 
 /* Persist the integrity fault so it survives the reset and is downlinkable

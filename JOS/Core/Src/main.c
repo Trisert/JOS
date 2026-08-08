@@ -701,7 +701,13 @@ void StartDefaultTask(void *argument)
   for(;;)
   {
     watchdog_alive_self();
-    osDelay(1);
+    /* One liveness report per declared period, not one per tick.
+       osDelay(1) meant a 1 kHz loop that took the watchdog mutex 1000
+       times a second (and blocked every other task on it) just to prove
+       an idle task was alive, while it registers itself with
+       WDG_PERIOD_DEFAULT_TASK_MS = 1 s. The kick cadence now matches the
+       declared period, which is what the monitor checks against. */
+    osDelay(pdMS_TO_TICKS(WDG_PERIOD_DEFAULT_TASK_MS));
   }
   /* USER CODE END 5 */
 }

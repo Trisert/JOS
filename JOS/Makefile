@@ -59,7 +59,47 @@ INCLUDES := \
 ##############################################################################
 # Defines
 ##############################################################################
+# ---------------------------------------------------------------------------
+# Boot-integrity build policy (see App/obsw/boot_crc.h, docs/dev/hardening.md)
+#
+# Both switches are deliberately assigned with `:=` and NOT with `?=`: with
+# `?=` an exported environment variable (a stale shell export, a CI runner
+# default, a Docker ENV) silently wins over the makefile and compiles the
+# boot-integrity policy out of the flight image without a single warning.
+# A `:=` assignment is overridden only by an explicit `make VAR=value` on the
+# command line, which is a deliberate act, and even that has to survive the
+# 0/1 validation below and prints a banner.
+#
+#   BOOT_CRC_FATAL=1        reset (bounded) on an untrusted image  [flight]
+#   BOOT_CRC_FATAL=0        record + degrade, never reset          [bench]
+#   BOOT_CRC_TRUST_UNSTAMPED=0  an unstamped image is NOT trusted  [flight]
+#   BOOT_CRC_TRUST_UNSTAMPED=1  unstamped == "nothing to check"    [bench]
+# ---------------------------------------------------------------------------
+BOOT_CRC_FATAL           := 1
+BOOT_CRC_TRUST_UNSTAMPED := 0
+
+# Validation: anything other than 0/1 (typo, empty, "yes", "true") is a hard
+# build error instead of a define that quietly evaluates to 0 in #if.
+ifneq ($(filter-out 0 1,$(BOOT_CRC_FATAL)),)
+  $(error BOOT_CRC_FATAL must be 0 or 1, got '$(BOOT_CRC_FATAL)')
+endif
+ifneq ($(filter-out 0 1,$(BOOT_CRC_TRUST_UNSTAMPED)),)
+  $(error BOOT_CRC_TRUST_UNSTAMPED must be 0 or 1, got '$(BOOT_CRC_TRUST_UNSTAMPED)')
+endif
+ifeq ($(BOOT_CRC_FATAL),0)
+  $(warning *** BOOT_CRC_FATAL=0: the boot-integrity recovery reset is compiled OUT.)
+  $(warning *** BENCH BUILD ONLY - this image must never be flashed to flight hardware.)
+endif
+ifeq ($(BOOT_CRC_TRUST_UNSTAMPED),1)
+  $(warning *** BOOT_CRC_TRUST_UNSTAMPED=1: an unstamped image is treated as trusted.)
+  $(warning *** BENCH BUILD ONLY - `make crc-stamp` is what a flight image needs.)
+endif
+
+BOOT_CRC_DEFS := -DBOOT_CRC_FATAL=$(BOOT_CRC_FATAL) \
+                 -DBOOT_CRC_TRUST_UNSTAMPED=$(BOOT_CRC_TRUST_UNSTAMPED)
+
 C_DEFS  := -DDEBUG -DUSE_HAL_DRIVER -DSTM32L496xx
+C_DEFS  += $(BOOT_CRC_DEFS)
 CXX_DEFS := -DDEBUG -DUSE_HAL_DRIVER -DSTM32L496xx -DRADIOLIB_STATIC_ONLY=1
 ASM_DEFS := -DDEBUG
 
@@ -69,6 +109,11 @@ ASM_DEFS := -DDEBUG
 CFLAGS  := $(MCU) $(C_DEFS)
 CFLAGS += -std=gnu11 -g3 -O0
 CFLAGS += -Wall -ffunction-sections -fdata-sections
+# -Wundef: a policy switch that is misspelled or never defined must not
+# silently evaluate to 0 inside #if. Applied to App/ only (see APP_CFLAGS
+# below); the vendored HAL/CMSIS/FreeRTOS trees rely on undefined macros in
+# #if by design and would drown the build in warnings.
+APP_WFLAGS := -Wundef
 CFLAGS += $(INCLUDES)
 
 ##############################################################################
@@ -242,6 +287,13 @@ $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c -MMD -MP -MF"$(@:.o=.d)" $< -o $@
 
+# Flight application code (App/) is held to the stricter warning set: -Wundef
+# turns a misspelled or never-defined policy switch (`#if BOOT_CRC_FATL`) into
+# a visible warning instead of a silent "0". Scoped to App/ objects only —
+# the vendored HAL/CMSIS/FreeRTOS headers pulled in by Core/Src, Drivers/ and
+# Middlewares/ use undefined macros in #if by design.
+$(filter $(BUILD_DIR)/App/%,$(C_OBJECTS)): CFLAGS += $(APP_WFLAGS)
+
 ##############################################################################
 # Compile C++ files
 ##############################################################################
@@ -274,7 +326,13 @@ $(BUILD_DIR)/$(PROJECT_NAME).list: $(BUILD_DIR)/$(PROJECT_NAME).elf
 ##############################################################################
 # Flash (uses st-link by default, adjust if you use openocd or other)
 ##############################################################################
-flash: $(BUILD_DIR)/$(PROJECT_NAME).hex
+# Depends on crc-stamp, never on the raw .bin: flashing an unstamped image
+# leaves the CRC word at BOOT_CRC_UNSTAMPED_VALUE, and with the flight policy
+# (BOOT_CRC_TRUST_UNSTAMPED=0) the board comes up untrusted and confined to
+# STATE_CRIT. `make flash` therefore always programs the stamped binary.
+# CubeIDE / OpenOCD "Run" flash the freshly linked ELF and bypass this target
+# entirely — see docs/dev/hardening.md 2.4 ("Flashing from the IDE").
+flash: crc-stamp
 	st-flash write $(BUILD_DIR)/$(PROJECT_NAME).bin 0x08000000
 
 ##############################################################################
