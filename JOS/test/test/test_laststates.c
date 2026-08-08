@@ -485,3 +485,122 @@ void test_laststates_mirror_region_tracks_the_ring_bookkeeping(void)
     TEST_ASSERT_EQUAL_UINT32(1u, m->idx);      /* cursor advanced by one slot */
     TEST_ASSERT_EQUAL_UINT32(laststates_count(), m->count);
 }
+
+/* =====================================================================
+ * Torn (partially programmed) records - Kilo review of PR #9, finding C4
+ *
+ * A 128 B record is programmed as 16 separate double words. A reset (or a
+ * bounded-wait timeout) between them leaves a slot whose first double word is
+ * programmed and whose tail is still erased. Testing only double word 0 - the
+ * previous implementation - reported such a half-record as a perfectly valid
+ * entry, so ground would reconstruct the anomaly timeline from a record whose
+ * payload is 0xFF filler.
+ * ===================================================================== */
+
+/* Program one double word straight through the HAL doubles, bypassing
+ * laststates_write(), to build the torn-slot fixture. */
+static void program_raw_dword(uint32_t byte_offset, uint64_t value)
+{
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Unlock());
+    TEST_ASSERT_EQUAL_INT(HAL_OK,
+                          HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                            (uint32_t)flash_base + byte_offset,
+                                            value));
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Lock());
+}
+
+void test_laststates_torn_record_is_not_reported_as_valid(void)
+{
+    uint8_t out[LASTSTATES_ENTRY_SIZE];
+    size_t  len = sizeof(out);
+
+    program_raw_dword(0u, 0x0000000102030405ULL);   /* only dword 0 of slot 0 */
+    laststates_init();                              /* rescan after the reset */
+
+    TEST_ASSERT_EQUAL_UINT32(0u, laststates_count());
+
+    memset(out, 0xC3, sizeof(out));
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    TEST_ASSERT_EQUAL_size_t(0u, len);
+    TEST_ASSERT_EQUAL_HEX8(0xC3u, out[0]);          /* nothing copied out */
+}
+
+/* Only the LAST double word missing is still a torn record: the completeness
+ * rule is "the tail is programmed", not "something is programmed". */
+void test_laststates_record_missing_only_its_tail_is_skipped(void)
+{
+    uint32_t d;
+
+    for (d = 0u; d < (LASTSTATES_ENTRY_SIZE / 8u) - 1u; d++) {
+        program_raw_dword(d * 8u, 0x1122334455667788ULL);
+    }
+    laststates_init();
+
+    TEST_ASSERT_EQUAL_UINT32(0u, laststates_count());
+}
+
+/* The torn slot must not be handed back to the programmer either: re-writing
+ * a non-erased double word fails with PROGERR on the real part and would kill
+ * every later write. The cursor skips it and the next record lands in slot 1,
+ * with no page erase (the newer records must survive). */
+void test_laststates_write_skips_a_torn_slot(void)
+{
+    laststates_entry_t e = make_entry(0x55u, STATE_READY, STATE_ACTIVE,
+                                      TRIGGER_BOOT, 0x5Au);
+
+    program_raw_dword(0u, 0x0000000102030405ULL);
+    laststates_init();
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+
+    TEST_ASSERT_EQUAL_UINT32(0u, host_flash_erase_count());
+    TEST_ASSERT_EQUAL_UINT32(1u, laststates_count());
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&e,
+                                  host_flash_pool() + LASTSTATES_ENTRY_SIZE,
+                                  LASTSTATES_ENTRY_SIZE);
+}
+
+/* A complete record is still reported next to a torn one. */
+void test_laststates_dump_returns_only_the_complete_record(void)
+{
+    laststates_entry_t e = make_entry(0x99u, STATE_INIT, STATE_READY,
+                                      TRIGGER_BOOT, 0x42u);
+    uint8_t out[2 * LASTSTATES_ENTRY_SIZE];
+    size_t  len = sizeof(out);
+
+    program_raw_dword(0u, 0x0000000102030405ULL);
+    laststates_init();
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    TEST_ASSERT_EQUAL_size_t((size_t)LASTSTATES_ENTRY_SIZE, len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&e, out, LASTSTATES_ENTRY_SIZE);
+}
+
+/* =====================================================================
+ * Flash page-erase bounds guard - Kilo review of PR #9, finding C2
+ *
+ * The target path drives FLASH->CR directly, so an out-of-pool address would
+ * erase 2 KB of whatever it points at: the vector table, the running image or
+ * the dual-bank golden image. Only page-aligned addresses inside
+ * [pool_base, pool_end) may be erased.
+ * ===================================================================== */
+void test_laststates_erase_guard_only_accepts_pool_pages(void)
+{
+    const uintptr_t base = flash_base;
+    const uintptr_t end  = base + (uintptr_t)LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE;
+
+    /* first and last page of the pool */
+    TEST_ASSERT_TRUE(laststates_erase_addr_allowed(base));
+    TEST_ASSERT_TRUE(laststates_erase_addr_allowed(end - HOST_FLASH_PAGE_SIZE));
+
+    /* one page below the pool, and the first page past it */
+    TEST_ASSERT_FALSE(laststates_erase_addr_allowed(base - HOST_FLASH_PAGE_SIZE));
+    TEST_ASSERT_FALSE(laststates_erase_addr_allowed(end));
+
+    /* inside the pool but not on a page boundary */
+    TEST_ASSERT_FALSE(laststates_erase_addr_allowed(base + LASTSTATES_ENTRY_SIZE));
+
+    /* the vector table, i.e. the worst case this guard exists for */
+    TEST_ASSERT_FALSE(laststates_erase_addr_allowed((uintptr_t)0x08000000UL));
+}
