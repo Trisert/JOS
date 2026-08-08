@@ -1,5 +1,6 @@
 #include "memory.h"
 #include "main.h"
+#include "dual_bank.h"
 #include <string.h>
 #include <stdint.h>
 
@@ -130,14 +131,34 @@ uint32_t cyclic_buffer_head(void)
  * pool for valid slots rather than trusting a cached count.
  */
 
-#define LASTSTATES_FLASH_BASE  0x08080000U
+/* Single source of truth for the pool base: Core/Inc/dual_bank.h. The
+   dual-bank fallback validates the golden-image slot against this address
+   (gate G1) and appends boot-fault markers to the same pool, so the two must
+   never drift apart. Relocating the pool means changing
+   DUAL_BANK_LASTSTATES_BASE, the LASTSTATES region in STM32L496VGTX_FLASH.ld
+   and the ground forensics tooling together — see the warning in dual_bank.h
+   (0x080FE000 is NOT a valid target). */
+#define LASTSTATES_FLASH_BASE  DUAL_BANK_LASTSTATES_BASE
 #define LASTSTATES_FLASH_END   (LASTSTATES_FLASH_BASE + LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE)
 #define LS_PAGE_SHIFT          11U   /* STM32L4 Flash page = 2 KB = 2^11 (HAL FLASH_PAGE_SIZE) */
 
 /* A freshly-erased Flash double-word reads as all ones; a programmed slot is
- * never all-ones (the trigger byte is always 0..9), so testing the first
- * double-word reliably distinguishes a free slot from a valid one. */
+ * never all-ones (the trigger byte is always a small enum value), so testing
+ * the first double-word reliably distinguishes a free slot from a valid one. */
 #define SLOT_ERASED_DWORD      0xFFFFFFFFFFFFFFFFULL
+
+/* Compile-time guards tying the ring to the dual-bank pool description, so the
+   two writers of this pool (here and Core/Src/dual_bank.c) can never drift
+   apart or straddle the bank boundary (W2-2 review C3). */
+_Static_assert((LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE)
+               <= DUAL_BANK_LASTSTATES_SIZE,
+               "LastStates ring does not fit the reserved pool");
+_Static_assert(((LASTSTATES_FLASH_BASE - DUAL_BANK_FLASH_BASE)
+                % DUAL_BANK_PAGE_SIZE) == 0U,
+               "LastStates pool must start on a Flash page boundary");
+_Static_assert(((LASTSTATES_FLASH_BASE - DUAL_BANK_FLASH_BASE) / DUAL_BANK_BANK_SIZE)
+               == (((LASTSTATES_FLASH_END - 1U) - DUAL_BANK_FLASH_BASE) / DUAL_BANK_BANK_SIZE),
+               "LastStates pool must not straddle the bank boundary");
 
 /* Compile-time guards against the divide-by-zero class in this module (M1). */
 _Static_assert(LASTSTATES_MAX_ENTRIES > 0U, "LASTSTATES_MAX_ENTRIES must be > 0");
@@ -296,6 +317,32 @@ static int flash_write_row(uint32_t addr, const uint8_t *data, size_t len)
     return rc;
 }
 
+/* Re-derive the write cursor from Flash. The pool is always written in order,
+ * so the first erased slot is the next free one.
+ *
+ * This is also what makes the pool safe to SHARE with a second writer: the
+ * dual-bank fallback (Core/Src/dual_bank.c) appends boot-fault / boot-OK
+ * markers (tagged 'DBNK') outside laststates_write(), both before
+ * laststates_init() runs and later from a task. Re-deriving the cursor means
+ * those appends are simply picked up here instead of colliding with a stale
+ * in-RAM index (W2-2 review C2). Returns the number of occupied slots.
+ */
+static uint32_t laststates_resync(void)
+{
+    uint32_t idx = 0U;
+
+    while (idx < LASTSTATES_MAX_ENTRIES) {
+        if (slot_is_erased(idx)) {
+            break;
+        }
+        idx++;
+    }
+    /* A completely full pool wraps to slot 0; the next write recycles the
+     * oldest page there. */
+    ls_idx = (idx >= LASTSTATES_MAX_ENTRIES) ? 0U : idx;
+    return idx;
+}
+
 void laststates_init(void)
 {
     dwt_cyccnt_enable();
@@ -305,14 +352,7 @@ void laststates_init(void)
      * existing trail after the reboot (review C1). If the pool is completely
      * full we wrap to index 0 and the next write will recycle the oldest page.
      */
-    uint32_t idx = 0U;
-    while (idx < LASTSTATES_MAX_ENTRIES) {
-        if (slot_is_erased(idx)) {
-            break;
-        }
-        idx++;
-    }
-    ls_idx = idx;
+    (void)laststates_resync();
 }
 
 int laststates_write(const laststates_entry_t *entry)
@@ -325,12 +365,26 @@ int laststates_write(const laststates_entry_t *entry)
         ls_idx = 0U;
     }
 
+    /* The pool has a second writer: Core/Src/dual_bank.c appends boot-fault
+       and boot-OK markers (tagged 'DBNK') outside laststates_write(), both
+       before laststates_init() runs and later from a task. Programming a slot
+       that is no longer erased fails on STM32L4 and, because the cursor never
+       advanced, every later write would fail too — the forensic log would be
+       silently dead. So whenever the target slot has moved under us, re-derive
+       the cursor from Flash before deciding anything (W2-2 review C2). Only if
+       the pool is genuinely full does the ring wrap and recycle a page. */
+    if (!slot_is_erased(ls_idx)) {
+        (void)laststates_resync();
+    }
+
     uint32_t addr = LASTSTATES_FLASH_BASE + ls_idx * LASTSTATES_ENTRY_SIZE;
 
-    /* If the target slot still holds a valid (programmed) record, the ring has
-     * wrapped: recycle the OLDEST page it belongs to. Erasing only that page
-     * preserves every newer page, so the newest valid record is never lost
-       (review C1). */
+    /* If the target slot STILL holds a valid (programmed) record after the
+     * resync, the ring really has wrapped: recycle the OLDEST page it belongs
+     * to. Erasing only that page preserves every newer page, so the newest
+     * valid record is never lost (review C1). Note this can drop dual-bank
+     * boot-fault evidence — fail-safe by design: a lost counter can only
+     * inhibit a fallback, never trigger one. */
     if (!slot_is_erased(ls_idx)) {
         uint32_t page_addr = addr & ~(((uint32_t)1U << LS_PAGE_SHIFT) - 1U);
         if (flash_erase_page_bounded(page_addr) != 0) {

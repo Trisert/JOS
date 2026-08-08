@@ -25,6 +25,7 @@
 #include "state_machine.h"
 #include "watchdog.h"
 #include "boot_crc.h"
+#include "dual_bank.h"
 #include "bms.h"
 #include "memory.h"
 #include "comms.h"
@@ -140,6 +141,14 @@ int main(void)
      See docs/dev/hardening.md 2.4. */
   (void)boot_crc_verify();
 
+  /* Dual-bank golden-image fallback — NASA-STD-8739.8 (graceful
+     degradation), ECSS-Q-ST-80C 6.2.6 (fault tolerance). Reads the option
+     bytes, folds the persisted boot-fault evidence and, if the primary image
+     is corrupt or keeps faulting during boot, reboots into the verified
+     golden image in bank 2. Every unsafe case degrades instead of switching
+     (see Core/Inc/dual_bank.h, gates G1..G5). */
+  (void)dual_bank_init();
+
   bms_init();
   fram_init();
   cyclic_buffer_init();
@@ -206,6 +215,14 @@ int main(void)
   /* USER CODE BEGIN RTOS_EVENTS */
   /* add events, ... */
   /* USER CODE END RTOS_EVENTS */
+
+  /* NOTE: the boot is NOT declared good here. dual_bank_boot_complete() used
+     to run at this point, which closed the boot-fault window before a single
+     task had executed: an image that crashed as soon as the scheduler started
+     would still have been recorded as a healthy boot and the golden-image
+     fallback could never have armed. The declaration now happens from the
+     watchdog monitor task once the system has stayed alive for
+     DUAL_BANK_BOOT_OK_UPTIME_MS (App/obsw/watchdog.c). */
 
   /* Start scheduler */
   osKernelStart();

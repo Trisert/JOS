@@ -63,6 +63,48 @@ Five-state FSM; all transitions logged to the LastStates pool.
 Linker script: `JOS/STM32L496VGTX_FLASH.ld` (FLASH capped at 512K; `LASTSTATES`
 region 8K at `0x08080000`).
 
+### Dual-bank golden-image fallback (W2-2)
+
+The STM32L496VGTx is permanently dual bank: bank 1 = `0x08000000`..`0x0807FFFF`
+(primary image), bank 2 = `0x08080000`..`0x080FFFFF` (golden image slot). The
+`BFB2` option bit makes the boot ROM swap the two banks in the address map, so
+the golden image is *linked for `0x08000000`* even though it is stored in
+bank 2. `Core/Src/dual_bank.c` falls back to it when the primary image fails
+its boot CRC32 or has taken three consecutive boot-phase faults
+(NASA-STD-8739.8 graceful degradation, ECSS-Q-ST-80C §6.2.6).
+
+Golden image descriptor (written by ground tooling), last 16 bytes of bank 2:
+`magic 'GLDN'` + `length` + `crc32` + `~crc32`.
+
+**Boot-fault path (no IWDG in this build).** `HAL_IWDG_MODULE_ENABLED` is off,
+so nothing external can reset a spinning fault handler. `NMI`, `HardFault`,
+`MemManage`, `BusFault` and `UsageFault` therefore call
+`dual_bank_handle_boot_fault()`, which records the fault in the warm-reset RAM
+scratch (`.boot_fault`, NOLOAD, SRAM1 — survives a system reset) and issues
+`NVIC_SystemReset()`. The next boot persists the evidence to LastStates in
+`dual_bank_init()`; after `DUAL_BANK_BOOT_FAULT_THRESHOLD` (3) failed boots the
+fallback arms. Build with `-DDUAL_BANK_FAULT_NO_RESET` to keep the old
+spin-forever behaviour on the bench (the fallback is then inert).
+
+A boot is declared good only after `DUAL_BANK_BOOT_OK_UPTIME_MS` (5 s) of
+scheduler uptime, from the watchdog monitor task — not at `osKernelStart()`,
+which would close the window before any task had run.
+
+**Open layout conflict:** the LastStates pool occupies `0x08080000`, i.e. the
+exact address the boot ROM fetches the golden vector table from after a `BFB2`
+swap. The two cannot share it, so the fallback is *compile-time inhibited*
+(`DUAL_BANK_GOLDEN_SLOT_AVAILABLE == 0`) and will never arm `BFB2` into an
+unbootable configuration.
+
+Gate G1 reserves the **whole of bank 2** for the golden image (image at the
+bottom, descriptor trailer at `0x080FFFF0`), so the pool must leave bank 2
+entirely. `0x080FE000` — floated as a relocation target in an earlier
+revision — is **not** valid: it covers the trailer and the top of the image.
+Valid targets are the top of bank 1 (e.g. `0x0807E000`, with the `FLASH` region
+capped to 504 K) or the external FRAM. `App/memory/memory.c` derives its pool
+base from `DUAL_BANK_LASTSTATES_BASE`, so a relocation is that define plus the
+`LASTSTATES` linker region plus the ground forensics tooling.
+
 ## TT&C Layer
 
 - **Modulation:** LoRa (CSS), 436 MHz (TBC), SF10, BW125, CR4/8, 610 b/s

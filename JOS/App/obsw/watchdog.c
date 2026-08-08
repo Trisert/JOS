@@ -2,6 +2,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
+#include "dual_bank.h"
 
 /* ---------- Monitored task entry ---------- */
 typedef struct {
@@ -87,12 +88,52 @@ void watchdog_alive_self(void)
 }
 
 /* ---------- Monitor task ---------- */
+
+/* Boot-success declaration (W2-2, dual-bank fallback).
+ *
+ * The boot-fault window must stay open until the system has proved it can
+ * actually run, not merely reach osKernelStart(): the faults that matter
+ * (task creation, driver bring-up, first payload access) happen after the
+ * scheduler starts. The monitor task therefore declares the boot good only
+ * once DUAL_BANK_BOOT_OK_UPTIME_MS of scheduler uptime has elapsed, and
+ * retries a bounded number of times if the marker cannot be persisted
+ * (LastStates pool exhausted) instead of dropping the failure on the floor. */
+#define WDG_BOOT_OK_MAX_RETRIES  3U
+
+static void watchdog_declare_boot_ok_if_due(uint32_t uptime_ms)
+{
+    static uint8_t boot_ok_done    = 0U;
+    static uint8_t boot_ok_retries = 0U;
+
+    if (boot_ok_done) {
+        return;
+    }
+    if (uptime_ms < DUAL_BANK_BOOT_OK_UPTIME_MS) {
+        return;
+    }
+
+    if (dual_bank_boot_complete() == 0) {
+        boot_ok_done = 1U;
+        return;
+    }
+
+    /* Could not persist the boot-OK marker. dual_bank keeps the pending flag
+       and stops trusting the frozen Flash evidence, so the failure is safe —
+       but do not retry for ever. */
+    boot_ok_retries++;
+    if (boot_ok_retries >= WDG_BOOT_OK_MAX_RETRIES) {
+        boot_ok_done = 1U;
+    }
+}
+
 static void watchdog_monitor_task(void *arg)
 {
     (void)arg;
 
     for (;;) {
         uint32_t now = xTaskGetTickCount();
+
+        watchdog_declare_boot_ok_if_due(now * portTICK_PERIOD_MS);
 
         osMutexAcquire(wdg_mutex, osWaitForever);
         for (int i = 0; i < WDG_MAX_TASKS; i++) {
