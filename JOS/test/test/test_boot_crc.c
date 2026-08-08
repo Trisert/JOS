@@ -20,6 +20,7 @@
 #include "unity.h"
 #include "boot_crc.h"
 #include "host_support.h"
+#include "memory.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -183,13 +184,24 @@ void test_boot_crc_verify_rejects_corrupted_image(void)
     TEST_ASSERT_EQUAL_HEX32(HOST_FW_IMAGE_CRC, boot_crc_get_computed());
 }
 
-/* A stored word that happens to be zero is still a mismatch, not "unstamped":
- * only 0xFFFFFFFF means unstamped. */
-void test_boot_crc_verify_treats_zero_stored_word_as_mismatch(void)
+/* The two reserved stored-word values are distinguished, and neither is
+ * reported as a plain mismatch (boot_crc.h, "Stored-word conventions"):
+ *
+ *   0x00000000 = BOOT_CRC_UNSTAMPED_VALUE - deliberate placeholder, the image
+ *                was flashed straight from the .elf and never stamped;
+ *   0xFFFFFFFF = BOOT_CRC_ERASED_VALUE    - erased Flash where a stamp should
+ *                be, i.e. the image tail was never programmed.
+ *
+ * Collapsing either into BOOT_CRC_MISMATCH would make a bench build look
+ * corrupted and a truncated image look merely mis-stamped, and the reset
+ * policy keys off exactly this distinction. */
+void test_boot_crc_verify_distinguishes_reserved_stored_words(void)
 {
     host_fw_crc_stamp(0x00000000u);
+    TEST_ASSERT_EQUAL_INT(BOOT_CRC_UNSTAMPED, boot_crc_verify());
 
-    TEST_ASSERT_EQUAL_INT(BOOT_CRC_MISMATCH, boot_crc_verify());
+    host_fw_crc_stamp(0xFFFFFFFFu);
+    TEST_ASSERT_EQUAL_INT(BOOT_CRC_ERASED, boot_crc_verify());
 }
 
 /* =====================================================================

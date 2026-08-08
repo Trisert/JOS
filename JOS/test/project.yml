@@ -85,6 +85,13 @@
 :plugins:
   :load_paths: []
   :enabled:
+    # report_tests_pretty_stdout is what registers a failed test as a BUILD
+    # FAILURE, which is what makes `ceedling test:all` exit non-zero. Listing
+    # :enabled: replaces Ceedling's defaults wholesale, so leaving it out (as
+    # this file first did) produced a run that printed "1 Failures" and still
+    # exited 0 - a CI step that cannot fail. Verified by mutation: exit 1 with
+    # a broken test, exit 0 clean.
+    - report_tests_pretty_stdout
     - gcov
 
 # =============================================================================

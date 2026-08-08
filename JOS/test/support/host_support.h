@@ -49,6 +49,11 @@ uint32_t host_fw_crc_stamped_value(void);
 #define HOST_FLASH_LASTSTATES_BASE 0x08080000UL
 #define HOST_FLASH_PAGE_SIZE       2048u   /* STM32L4 bank-1 page size */
 
+/* Actual base address of the emulated pool. Equals HOST_FLASH_LASTSTATES_BASE
+ * when the fixed mmap succeeds, or a malloc'd address when it does not (CI).
+ * memory.c reads this via its extern declaration; tests should too. */
+extern uintptr_t flash_base;
+
 /* Map (once) and return the LastStates pool to the erased state (all 0xFF),
  * clear the FRAM contents and zero all call counters. Call from setUp().
  * Aborts the test with a readable message if the fixed mapping is refused. */

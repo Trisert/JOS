@@ -48,6 +48,11 @@
 #define POOL_SIZE          ((size_t)LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE)
 #define ERASED_DWORD       0xFFFFFFFFFFFFFFFFULL
 
+/* Flash base address, relocatable for the host test build. host_flash.c
+ * owns the definition and points it at a malloc'd buffer when mmap at the
+ * real address 0x08080000 is unavailable (CI runners, vm.mmap_min_addr). */
+uintptr_t flash_base = HOST_FLASH_LASTSTATES_BASE;
+
 /* ---------- emulated devices ---------- */
 
 /* memory.c declares `extern I2C_HandleTypeDef hi2c2;`; provide the object. */
@@ -77,13 +82,50 @@ static void host_flash_map_once(void)
                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
 
     if (addr == MAP_FAILED || addr != (void *)POOL_BASE) {
-        TEST_FAIL_MESSAGE("host_flash: could not map the LastStates pool at "
-                          "0x08080000 (address already in use, or "
-                          "vm.mmap_min_addr too high)");
-        return; /* not reached; TEST_FAIL_MESSAGE long-jumps out */
+        /* CI runners often forbid fixed maps at 0x08080000 (vm.mmap_min_addr
+         * or the address is reserved). Fall back to an anonymous mapping and
+         * relocate the pool base so memory.c still finds it. The emulation
+         * semantics (erased = 0xFF, program-once, unlock-gated) are unchanged. */
+        addr = mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (addr == MAP_FAILED) {
+            TEST_FAIL_MESSAGE("host_flash: could not allocate the LastStates pool");
+            return;
+        }
+        flash_base = (uintptr_t)addr;
     }
 
     pool = (uint8_t *)addr;
+    memset(pool, 0xFF, POOL_SIZE);          /* erased Flash */
+}
+
+/* Map the pool before main() runs. boot_crc.c reaches laststates_write() from
+ * boot_crc_apply_policy(), i.e. from test files whose setUp() never calls
+ * host_flash_reset(); without this constructor those tests would dereference
+ * an unmapped 0x08080000 and segfault instead of failing. */
+__attribute__((constructor))
+static void host_flash_ctor(void)
+{
+    host_flash_map_once();
+}
+
+/* Byte offset of `addr` inside the emulated pool.
+ *
+ * The HAL takes a uint32_t address, but on a 64-bit host the pool may sit
+ * anywhere (see the fallback above), so the caller's address is the low 32
+ * bits of the real one. Subtracting the equally-truncated base in uint32
+ * arithmetic is exact modulo 2^32 and therefore recovers the true offset for
+ * any pool smaller than 4 GB. */
+static uint32_t pool_offset(uint32_t addr)
+{
+    return addr - (uint32_t)flash_base;
+}
+
+/* Absolute Flash page index of the first page of the pool, computed exactly
+ * the way memory.c and the tests compute it. */
+static uint32_t pool_first_page(void)
+{
+    return (uint32_t)((flash_base - FLASH_BASE_ADDR) / HOST_FLASH_PAGE_SIZE);
 }
 
 void host_flash_reset(void)
@@ -129,7 +171,7 @@ HAL_StatusTypeDef HAL_FLASH_Lock(void)
 
 HAL_StatusTypeDef HAL_FLASH_Program(uint32_t TypeProgram, uint32_t Address, uint64_t Data)
 {
-    size_t   offset;
+    uint32_t offset;
     uint64_t current;
 
     if (pool == NULL || !flash_unlocked) {
@@ -141,11 +183,12 @@ HAL_StatusTypeDef HAL_FLASH_Program(uint32_t TypeProgram, uint32_t Address, uint
     if ((Address % 8U) != 0U) {
         return HAL_ERROR;                     /* PGAERR: misaligned */
     }
-    if (Address < POOL_BASE || (Address + 8U) > (POOL_BASE + POOL_SIZE)) {
+
+    offset = pool_offset(Address);
+    if (offset > (uint32_t)(POOL_SIZE - 8U)) {
         return HAL_ERROR;                     /* outside the emulated pool */
     }
 
-    offset = (size_t)(Address - POOL_BASE);
     memcpy(&current, pool + offset, sizeof(current));
     if (current != ERASED_DWORD) {
         return HAL_ERROR;                     /* PROGERR: row not erased */
@@ -159,6 +202,7 @@ HAL_StatusTypeDef HAL_FLASH_Program(uint32_t TypeProgram, uint32_t Address, uint
 HAL_StatusTypeDef HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *pEraseInit, uint32_t *PageError)
 {
     uint32_t i;
+    uint32_t first_page;
 
     if (pEraseInit == NULL || PageError == NULL || pool == NULL) {
         return HAL_ERROR;
@@ -170,16 +214,18 @@ HAL_StatusTypeDef HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *pEraseInit, uint32_t
         return HAL_ERROR;
     }
 
-    for (i = 0U; i < pEraseInit->NbPages; i++) {
-        uint32_t page_addr = FLASH_BASE_ADDR +
-                             (pEraseInit->Page + i) * HOST_FLASH_PAGE_SIZE;
+    first_page = pool_first_page();
 
-        if (page_addr < POOL_BASE ||
-            (page_addr + HOST_FLASH_PAGE_SIZE) > (POOL_BASE + POOL_SIZE)) {
-            *PageError = page_addr;           /* outside the emulated pool */
+    for (i = 0U; i < pEraseInit->NbPages; i++) {
+        uint32_t page   = pEraseInit->Page + i;
+        uint32_t offset = (page - first_page) * HOST_FLASH_PAGE_SIZE;
+
+        if ((page - first_page) >= (uint32_t)(POOL_SIZE / HOST_FLASH_PAGE_SIZE)) {
+            /* outside the emulated pool (unsigned wrap covers page < first) */
+            *PageError = page;
             return HAL_ERROR;
         }
-        memset(pool + (page_addr - POOL_BASE), 0xFF, HOST_FLASH_PAGE_SIZE);
+        memset(pool + offset, 0xFF, HOST_FLASH_PAGE_SIZE);
     }
 
     *PageError = 0xFFFFFFFFU;                 /* HAL's "no failing page" value */

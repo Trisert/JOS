@@ -14,7 +14,8 @@
 #include "unity.h"
 #include "memory.h"
 #include "obsw_types.h"
-#include "main.h"        /* fakes/main.h: HAL prototypes exercised directly */
+#include "main.h"             /* fakes/main.h: HAL prototypes exercised directly */
+#include "seu_mitigation.h"   /* fakes/: lock/commit contract of W2-5 */
 #include "host_support.h"
 
 #include <stdint.h>
@@ -37,6 +38,7 @@ static laststates_entry_t make_entry(uint32_t timestamp, uint8_t from, uint8_t t
 void setUp(void)
 {
     host_flash_reset();
+    seu_stub_reset();
     laststates_init();
 }
 
@@ -222,11 +224,16 @@ void test_laststates_fills_pool_without_erasing(void)
     TEST_ASSERT_EQUAL_UINT32(0u, host_flash_erase_count());
 }
 
-/* Wrapping past the last slot must erase the pool first. Without the erase the
- * program would fail on a non-erased row (PROGERR), silently losing the
- * transition record -- this is the regression this test pins down. */
+/* Wrapping past the last slot must erase before reusing slot 0. Without the
+ * erase the program would fail on a non-erased row (PROGERR), silently losing
+ * the transition record -- this is the regression this test pins down.
+ *
+ * Only the ONE page the slot belongs to is recycled (16 slots of 128 B in a
+ * 2 KB page), never the whole pool: erasing the pool would throw away the 48
+ * newer records the post-mortem downlink exists to recover. */
 void test_laststates_wrap_erases_pool_before_reuse(void)
 {
+    const uint32_t slots_per_page = HOST_FLASH_PAGE_SIZE / LASTSTATES_ENTRY_SIZE;
     laststates_entry_t wrapped;
     uint32_t i;
 
@@ -242,7 +249,9 @@ void test_laststates_wrap_erases_pool_before_reuse(void)
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&wrapped));
 
     TEST_ASSERT_EQUAL_UINT32(1u, host_flash_erase_count());
-    TEST_ASSERT_EQUAL_UINT32((uint32_t)LASTSTATES_MAX_ENTRIES, laststates_count());
+    /* One page recycled (16 slots gone) and slot 0 immediately rewritten. */
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)LASTSTATES_MAX_ENTRIES - slots_per_page + 1u,
+                             laststates_count());
     /* The wrapped entry is back at slot 0 ... */
     TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&wrapped,
                                   host_flash_pool(), LASTSTATES_ENTRY_SIZE);
@@ -332,13 +341,13 @@ void test_hal_flash_program_requires_unlock(void)
     TEST_ASSERT_FALSE(host_flash_is_unlocked());
     TEST_ASSERT_EQUAL_INT(HAL_ERROR,
                           HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
-                                            HOST_FLASH_LASTSTATES_BASE,
+                                            (uint32_t)flash_base,
                                             0x0123456789ABCDEFULL));
 
     TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Unlock());
     TEST_ASSERT_EQUAL_INT(HAL_OK,
                           HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
-                                            HOST_FLASH_LASTSTATES_BASE,
+                                            (uint32_t)flash_base,
                                             0x0123456789ABCDEFULL));
     TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Lock());
 }
@@ -348,7 +357,7 @@ void test_hal_flash_erase_requires_unlock(void)
     FLASH_EraseInitTypeDef erase_init;
     uint32_t               page_error = 0u;
     const uint32_t         first_page =
-        (uint32_t)((HOST_FLASH_LASTSTATES_BASE - 0x08000000UL) / HOST_FLASH_PAGE_SIZE);
+        (uint32_t)((flash_base - 0x08000000UL) / HOST_FLASH_PAGE_SIZE);
 
     erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
     erase_init.Banks     = FLASH_BANK_1;
@@ -391,4 +400,53 @@ void test_cyclic_buffer_zero_length_write_is_a_no_op(void)
 
     TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(&dummy, 0u));
     TEST_ASSERT_EQUAL_UINT32(0u, cyclic_buffer_head());
+}
+
+/* ---------------------------------------------------------------------------
+ * SEU ownership contract (W2-5)
+ *
+ * Core/Inc/seu_mitigation.h requires every legitimate update of a
+ * SEU_POLICY_GOLDEN region to happen inside seu_mitigation_lock()/unlock()
+ * and to be followed by seu_mitigation_commit(); a missing commit makes the
+ * scrubber revert the update at the next pass (i.e. it would silently rewind
+ * the LastStates write cursor). support/seu_stubs.c counts the calls so the
+ * contract is asserted here rather than assumed.
+ * ------------------------------------------------------------------------- */
+void test_laststates_updates_commit_the_seu_mirror_under_lock(void)
+{
+    laststates_entry_t entry = make_entry(0xDEADBEEFu, STATE_READY, STATE_CRIT,
+                                          TRIGGER_FAULT, 0x77u);
+
+    /* setUp() ran laststates_init(), which resyncs the mirror from Flash. */
+    TEST_ASSERT_EQUAL_INT(1, seu_stub_commit_count());
+    TEST_ASSERT_EQUAL_INT((int)SEU_REGION_LASTSTATES, seu_stub_last_commit_region());
+    TEST_ASSERT_EQUAL_INT(0, seu_stub_lock_depth());   /* balanced lock/unlock */
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&entry));
+
+    TEST_ASSERT_EQUAL_INT(2, seu_stub_commit_count());
+    TEST_ASSERT_EQUAL_INT((int)SEU_REGION_LASTSTATES, seu_stub_last_commit_region());
+    TEST_ASSERT_EQUAL_INT(0, seu_stub_lock_depth());
+}
+
+/* The region handed to seu_mitigation_register_region() must be the live
+ * bookkeeping itself: right size, right magic, and a cursor/count that track
+ * the writes. A stale or bogus region would make the scrubber vote on the
+ * wrong bytes. */
+void test_laststates_mirror_region_tracks_the_ring_bookkeeping(void)
+{
+    laststates_entry_t entry = make_entry(7u, STATE_INIT, STATE_READY,
+                                          TRIGGER_BOOT, 0x11u);
+    size_t len = 0u;
+    const laststates_mirror_t *m = laststates_mirror_region(&len);
+
+    TEST_ASSERT_NOT_NULL(m);
+    TEST_ASSERT_EQUAL_size_t(sizeof(laststates_mirror_t), len);
+    TEST_ASSERT_EQUAL_HEX32(LASTSTATES_MIRROR_MAGIC, m->magic);
+    TEST_ASSERT_EQUAL_UINT32(0u, m->idx);
+    TEST_ASSERT_EQUAL_UINT32(0u, m->count);
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&entry));
+    TEST_ASSERT_EQUAL_UINT32(1u, m->idx);      /* cursor advanced by one slot */
+    TEST_ASSERT_EQUAL_UINT32(laststates_count(), m->count);
 }

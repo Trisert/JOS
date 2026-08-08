@@ -47,7 +47,16 @@ HAL_StatusTypeDef HAL_I2C_Mem_Write(I2C_HandleTypeDef *hi2c, uint16_t DevAddress
 #define FLASH_TYPEPROGRAM_DOUBLEWORD  0x00000000U
 #define FLASH_TYPEERASE_PAGES         0x00000000U
 #define FLASH_BANK_1                  0x00000001U
+#define FLASH_BANK_2                  0x00000002U
+#define FLASH_FLAG_EOP                0x00000001U
 #define FLASH_FLAG_ALL_ERRORS         0x0000C3FBU
+
+/* STM32L4 bank page size, needed by memory.c's compile-time pool guards. */
+#define FLASH_PAGE_SIZE               2048U
+
+/* __HAL_FLASH_GET_FLAG reads a status register on target; on host it returns
+ * 0 (no flags pending) so the polling loops in memory.c fall through. */
+#define __HAL_FLASH_GET_FLAG(__FLAG__)  (0U)
 
 typedef struct {
     uint32_t TypeErase;
@@ -60,6 +69,15 @@ HAL_StatusTypeDef HAL_FLASH_Unlock(void);
 HAL_StatusTypeDef HAL_FLASH_Lock(void);
 HAL_StatusTypeDef HAL_FLASH_Program(uint32_t TypeProgram, uint32_t Address, uint64_t Data);
 HAL_StatusTypeDef HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *pEraseInit, uint32_t *PageError);
+
+/* Host test doubles for CMSIS/HAL symbols used by the modules under test.
+ * On target these live in cmsis_gcc.h / stm32l4xx_hal.c; here they are
+ * explicit, documented no-ops so the firmware compiles on the x86-64 runner.
+ * (NASA-STD-8739.8: test doubles must be explicit, never silent.) */
+uint32_t HAL_GetTick(void);
+#define __DSB()  do { __asm__ volatile ("" ::: "memory"); } while (0)
+#define __ISB()  do { __asm__ volatile ("" ::: "memory"); } while (0)
+void    NVIC_SystemReset(void);
 
 /* Error-flag clearing is a register write on target; a no-op on the host. */
 #define __HAL_FLASH_CLEAR_FLAG(__FLAG__)  do { (void)(__FLAG__); } while (0)

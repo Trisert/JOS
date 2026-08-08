@@ -17,6 +17,7 @@
 #include "unity.h"
 #include "boot_crc.h"
 #include "host_support.h"
+#include "memory.h"
 
 #include <stdint.h>
 
