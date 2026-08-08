@@ -159,8 +159,29 @@ _Static_assert(sizeof(sram2_parity_record_t) <=
    Only a store with BOTH magic words wrong is treated as
    a cold start: that is indistinguishable from uninitialised .noinit after a
    power-on / brown-out reset, and believing a garbage boot_fault there would
-   park a perfectly healthy spacecraft in STATE_CRIT at first switch-on. */
+   park a perfectly healthy spacecraft in STATE_CRIT at first switch-on.
+
+   The store is also VERSIONED (Kilo #26, comment id 3741226504). The magic
+   pair only says "these words are ours"; it says nothing about their layout.
+   Every time a field was appended - erase_busy_resets, then clock_faults /
+   first_busy_scsr / first_busy_cfgr2 - the checksum changed shape, so a store
+   written by the PREVIOUS image failed sram2_store_is_valid() on the first
+   boot after a firmware update and the recovery below threw away every
+   salvaged counter: a reset-stable store that does not survive an OTA is not
+   reset-stable, it is just slow to lose data. The version word makes the
+   layout explicit, and sram2_store_recover() recognises the pre-version
+   layout and MIGRATES it (authenticating it with the old checksum formula
+   when that layout carried one) instead of calling it garbage. Bump
+   SRAM2_STORE_VERSION on any future field change and teach the migration
+   path about the layout it replaces. */
 #define SRAM2_STORE_MAGIC       0x53324653U   /* "S2FS" */
+
+/* Layout id of sram2_fault_store_t. Version 1 is every pre-version layout
+   (no version word): the 6-word shape that flew first (magic pair, boot_fault,
+   last_event, parity_resets, dropped_records - no checksum at all) and the
+   8-word shape that added erase_busy_resets + chk. Version 2 is the struct
+   below. */
+#define SRAM2_STORE_VERSION     2U
 
 /* Counter values above this are not credible for a single mission run, so a
    salvaged word beyond it is corruption rather than history. A uniformly
@@ -170,6 +191,7 @@ _Static_assert(sizeof(sram2_parity_record_t) <=
 typedef struct {
     uint32_t magic;             /* SRAM2_STORE_MAGIC                        */
     uint32_t magic_inv;         /* ~SRAM2_STORE_MAGIC                       */
+    uint32_t version;           /* SRAM2_STORE_VERSION: layout marker       */
     uint32_t boot_fault;        /* 1: last run ended on a parity finding    */
     uint32_t last_event;        /* SRAM2_EVENT_* of that finding            */
     uint32_t parity_resets;     /* parity-triggered resets since power-on   */
@@ -181,8 +203,35 @@ typedef struct {
     uint32_t chk;               /* XOR of the payload words above           */
 } sram2_fault_store_t;
 
-static volatile sram2_fault_store_t sram2_store
+/* The version-1 (pre-version-word) layout, kept ONLY so the first boot after
+   a firmware update can read what the previous image left behind. The 6-word
+   shape stops after dropped_records, so erase_busy_resets/chk then alias
+   whatever follows in .noinit and must not be believed unless chk validates
+   them (see sram2_store_v1_checksum()). */
+typedef struct {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t boot_fault;
+    uint32_t last_event;
+    uint32_t parity_resets;
+    uint32_t dropped_records;
+    uint32_t erase_busy_resets;
+    uint32_t chk;
+} sram2_fault_store_v1_t;
+
+/* One object, two views. A union (rather than a cast of &sram2_store) keeps
+   both layouts at the same .noinit address without type-punning through an
+   incompatible pointer. */
+typedef union {
+    sram2_fault_store_t    v2;
+    sram2_fault_store_v1_t v1;
+} sram2_store_image_t;
+
+static volatile sram2_store_image_t sram2_store_image
     __attribute__((section(".noinit"), used));
+
+/* Every access site in this file reads and writes the CURRENT layout. */
+#define sram2_store             (sram2_store_image.v2)
 
 /* ---------- Module state ----------
    Deliberately in SRAM1 (default .bss / .data): memory that has just reported
@@ -209,10 +258,26 @@ static uint8_t  sram2_region_usable = 1U;
 
 static uint32_t sram2_store_checksum(void)
 {
-    return sram2_store.boot_fault      ^ sram2_store.last_event ^
-           sram2_store.parity_resets   ^ sram2_store.dropped_records ^
-           sram2_store.erase_busy_resets ^ sram2_store.clock_faults ^
-           sram2_store.first_busy_scsr ^ sram2_store.first_busy_cfgr2 ^
+    return sram2_store.version         ^ sram2_store.boot_fault ^
+           sram2_store.last_event      ^ sram2_store.parity_resets ^
+           sram2_store.dropped_records ^ sram2_store.erase_busy_resets ^
+           sram2_store.clock_faults    ^ sram2_store.first_busy_scsr ^
+           sram2_store.first_busy_cfgr2 ^
+           SRAM2_STORE_MAGIC;
+}
+
+/* The checksum formula of the version-1 layout (payload words only, no
+   version word, three fields short). Used exclusively to authenticate a store
+   left behind by the previous firmware image before migrating it: a match
+   means those words really are the old store and not .noinit debris that
+   happens to carry our magic. */
+static uint32_t sram2_store_v1_checksum(void)
+{
+    return sram2_store_image.v1.boot_fault        ^
+           sram2_store_image.v1.last_event        ^
+           sram2_store_image.v1.parity_resets     ^
+           sram2_store_image.v1.dropped_records   ^
+           sram2_store_image.v1.erase_busy_resets ^
            SRAM2_STORE_MAGIC;
 }
 
@@ -228,6 +293,7 @@ static int sram2_store_is_valid(void)
 {
     return ((sram2_store.magic == SRAM2_STORE_MAGIC) &&
             (sram2_store.magic_inv == (uint32_t)~SRAM2_STORE_MAGIC) &&
+            (sram2_store.version == SRAM2_STORE_VERSION) &&
             (sram2_store.chk == sram2_store_checksum())) ? 1 : 0;
 }
 
@@ -249,51 +315,108 @@ static void sram2_store_recover(void)
     if (sram2_store.magic_inv == (uint32_t)~SRAM2_STORE_MAGIC)   { magic_words++; }
 
     if (magic_words != 0) {
-        /* The struct was recognisably ours, so an upset hit the magic pair
-           and/or the payload rather than this being a cold start. Salvage the
-           counters within a plausibility bound instead of wiping the "one
-           upset vs dead cell" evidence, and resolve boot_fault upwards: a
-           finding that may exist is treated as a finding, because losing it
-           is the fail-open direction. */
-        resets  = sram2_store.parity_resets;
-        dropped = sram2_store.dropped_records;
-        busy    = sram2_store.erase_busy_resets;
-        clocks  = sram2_store.clock_faults;
-        event   = sram2_store.last_event;
-        fault   = (sram2_store.boot_fault != 0U) ? 1U : 0U;
+        if (sram2_store.version != SRAM2_STORE_VERSION) {
+            /* ---- Pre-version layout: a firmware update, not corruption ----
+               The words are ours (magic) but they were written by an image
+               whose struct was three fields shorter, so the current checksum
+               could never match. Treating that as garbage silently dropped
+               every counter on the first boot after every OTA - the "survives
+               a reset" store not surviving a firmware update (Kilo #26,
+               comment id 3741226504). Migrate instead.
 
-        /* SATURATE, never zero (Kilo #26, comment id 3741110977). An
-           implausible value is still evidence that something went badly
-           wrong here; 0 is not, and for erase_busy_resets it would re-arm
-           the very reboot budget that keeps a wedged erase engine from
-           turning the spacecraft into a reset loop. */
-        if (resets  > SRAM2_STORE_COUNT_SANE) { resets  = SRAM2_STORE_COUNT_SANE; }
-        if (dropped > SRAM2_STORE_COUNT_SANE) { dropped = SRAM2_STORE_COUNT_SANE; }
-        if (busy    > SRAM2_STORE_COUNT_SANE) { busy    = SRAM2_STORE_COUNT_SANE; }
-        if (clocks  > SRAM2_STORE_COUNT_SANE) { clocks  = SRAM2_STORE_COUNT_SANE; }
+               erase_busy_resets only exists in the 8-word shape of version 1;
+               in the original 6-word shape that word aliases unrelated
+               .noinit content, so it is carried over ONLY when the old
+               checksum authenticates it. Zeroing it there is not the
+               evidence-deleting move roast 3741110977 is about: the counter
+               genuinely did not exist in that layout, so there is no history
+               to preserve and no budget being re-armed by a corruption. */
+            const int v1_authentic =
+                (magic_words == 2) &&
+                (sram2_store_image.v1.chk == sram2_store_v1_checksum());
 
-        /* Register snapshots: every 32-bit value is a legal reading, so there
-           is no plausibility bound to apply - carry them through untouched. */
-        bscsr  = sram2_store.first_busy_scsr;
-        bcfgr2 = sram2_store.first_busy_cfgr2;
+            resets  = sram2_store_image.v1.parity_resets;
+            dropped = sram2_store_image.v1.dropped_records;
+            event   = sram2_store_image.v1.last_event;
+            fault   = (sram2_store_image.v1.boot_fault != 0U) ? 1U : 0U;
+            busy    = (v1_authentic != 0)
+                          ? sram2_store_image.v1.erase_busy_resets : 0U;
+            /* clock_faults / first_busy_* had no equivalent in version 1. */
+            clocks  = 0U;
+            bscsr   = 0U;
+            bcfgr2  = 0U;
 
-        if (event > (uint32_t)SRAM2_EVENT_LAST) {
-            event = (uint32_t)SRAM2_EVENT_STORE_LOST;
-        } else if (event == (uint32_t)SRAM2_EVENT_PARITY_NMI) {
-            /* A GENUINELY recorded parity NMI corroborates the flag. This is
-               only sound because "nothing recorded yet" is SRAM2_EVENT_NONE
-               and not id 0 (Kilo #26, comment id 3741110976): while the two
-               shared the value 0, one upset in dropped_records on a pristine
-               unit failed the checksum, landed here, read event == 0 and
-               forced STATE_CRIT on a perfectly healthy spacecraft. The rule
-               now fires on evidence, not on silence. */
-            fault = 1U;
+            if (resets  > SRAM2_STORE_COUNT_SANE) { resets  = SRAM2_STORE_COUNT_SANE; }
+            if (dropped > SRAM2_STORE_COUNT_SANE) { dropped = SRAM2_STORE_COUNT_SANE; }
+            if (busy    > SRAM2_STORE_COUNT_SANE) { busy    = SRAM2_STORE_COUNT_SANE; }
+
+            if (event > (uint32_t)SRAM2_EVENT_LAST) {
+                event = (uint32_t)SRAM2_EVENT_STORE_LOST;
+            } else if ((event == (uint32_t)SRAM2_EVENT_PARITY_NMI) &&
+                       (fault == 0U)) {
+                /* Version 1 had no SRAM2_EVENT_NONE: id 0 meant BOTH "a
+                   parity NMI was recorded" and "nothing has ever been
+                   recorded" (the cold-start store was all zeros). Migrating
+                   that ambiguity verbatim would re-import the exact fail-open
+                   this branch removed - a later checksum failure would read
+                   event == PARITY_NMI, corroborate the flag out of silence
+                   and park a healthy spacecraft in STATE_CRIT (Kilo #26,
+                   comment id 3741110976). A genuinely recorded parity NMI
+                   always came with boot_fault set, so only the boot_fault==0
+                   case is re-labelled. */
+                event = (uint32_t)SRAM2_EVENT_NONE;
+            }
+            /* Any other recorded event id survives the migration unchanged:
+               ids 0..6 mean the same thing in both layouts. */
+        } else {
+            /* The struct was recognisably ours AND laid out the way this image
+               expects, so an upset hit the magic pair and/or the payload rather
+               than this being a cold start. Salvage the counters within a
+               plausibility bound instead of wiping the "one upset vs dead cell"
+               evidence, and resolve boot_fault upwards: a finding that may exist
+               is treated as a finding, because losing it is the fail-open
+               direction. */
+            resets  = sram2_store.parity_resets;
+            dropped = sram2_store.dropped_records;
+            busy    = sram2_store.erase_busy_resets;
+            clocks  = sram2_store.clock_faults;
+            event   = sram2_store.last_event;
+            fault   = (sram2_store.boot_fault != 0U) ? 1U : 0U;
+
+            /* SATURATE, never zero (Kilo #26, comment id 3741110977). An
+               implausible value is still evidence that something went badly
+               wrong here; 0 is not, and for erase_busy_resets it would re-arm
+               the very reboot budget that keeps a wedged erase engine from
+               turning the spacecraft into a reset loop. */
+            if (resets  > SRAM2_STORE_COUNT_SANE) { resets  = SRAM2_STORE_COUNT_SANE; }
+            if (dropped > SRAM2_STORE_COUNT_SANE) { dropped = SRAM2_STORE_COUNT_SANE; }
+            if (busy    > SRAM2_STORE_COUNT_SANE) { busy    = SRAM2_STORE_COUNT_SANE; }
+            if (clocks  > SRAM2_STORE_COUNT_SANE) { clocks  = SRAM2_STORE_COUNT_SANE; }
+
+            /* Register snapshots: every 32-bit value is a legal reading, so there
+               is no plausibility bound to apply - carry them through untouched. */
+            bscsr  = sram2_store.first_busy_scsr;
+            bcfgr2 = sram2_store.first_busy_cfgr2;
+
+            if (event > (uint32_t)SRAM2_EVENT_LAST) {
+                event = (uint32_t)SRAM2_EVENT_STORE_LOST;
+            } else if (event == (uint32_t)SRAM2_EVENT_PARITY_NMI) {
+                /* A GENUINELY recorded parity NMI corroborates the flag. This is
+                   only sound because "nothing recorded yet" is SRAM2_EVENT_NONE
+                   and not id 0 (Kilo #26, comment id 3741110976): while the two
+                   shared the value 0, one upset in dropped_records on a pristine
+                   unit failed the checksum, landed here, read event == 0 and
+                   forced STATE_CRIT on a perfectly healthy spacecraft. The rule
+                   now fires on evidence, not on silence. */
+                fault = 1U;
+            }
         }
     }
 
     /* Field-wise, not memset(): the object is volatile. */
     sram2_store.magic             = SRAM2_STORE_MAGIC;
     sram2_store.magic_inv         = (uint32_t)~SRAM2_STORE_MAGIC;
+    sram2_store.version           = SRAM2_STORE_VERSION;
     sram2_store.boot_fault        = fault;
     sram2_store.last_event        = event;
     sram2_store.parity_resets     = resets;
