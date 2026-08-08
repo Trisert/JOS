@@ -75,21 +75,53 @@
 void NMI_Handler(void)
 {
   /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
-  /* Record the boot-phase fault for the dual-bank fallback and reset (W2-2).
-     Recording is RAM-only and ISR-safe (no Flash, no HAL, no blocking); the
-     reset is issued here because this build has no IWDG to do it for us, so
-     the loop below would otherwise be a permanent silent hang and the
-     fallback threshold could never be reached. See Core/Inc/dual_bank.h. */
-  dual_bank_handle_boot_fault();
-  /* SRAM2 parity error (SYSCFG_CFGR2.SPF) and the RCC clock security
-     system both vector here. sram2_parity_nmi_handler() records the
-     failure context in the LastStates pool and resets the OBSW; it
-     never returns, so the spin below is unreachable (W2-3). */
-  /* Count the upset in the RTC backup domain first: the call below
-     records the context and resets, so an in-RAM counter would not
-     survive its own event (W2-5). */
+  /* NMI is NOT a synonym for "the software did something dumb" on an
+     STM32L4. It is raised by at least four distinct sources, and they need
+     different treatment (W2-2 review):
+
+       - SRAM2 parity error         (SYSCFG_CFGR2.SPF, W2-3)
+       - Flash double-bit ECC error (FLASH_ECCR.ECCD, RM0351 3.3)
+       - RCC clock security system  (HSE failure)
+       - an early-boot software fault (the dual-bank case)
+
+     Feeding a parity or ECC NMI into dual_bank_mark_boot_fault() fabricates
+     exactly the evidence that arms the golden-image switch: boot -> pool scan
+     -> ECC NMI -> "boot fault" -> reset -> boot ... i.e. a self-sustaining
+     reset loop that swaps banks on evidence it manufactured itself. So
+     discriminate the source FIRST. Each branch below records its own
+     evidence and resets; none of them returns, so the spin further down is
+     only reachable in the -DDUAL_BANK_FAULT_NO_RESET bench build. */
+
+  /* Count the upset in the RTC backup domain first: every branch below
+     records the context and resets, so an in-RAM counter would not survive
+     its own event (W2-5). */
   seu_mitigation_nmi_hook();
-  sram2_parity_nmi_handler();
+
+  if (__HAL_SYSCFG_GET_FLAG(SYSCFG_FLAG_SRAM2_PE) != 0U)
+  {
+    /* SRAM2 parity error: records the failure context in the LastStates pool,
+       clears SPF and resets the OBSW (W2-3). */
+    sram2_parity_nmi_handler();
+  }
+  else if (__HAL_FLASH_GET_FLAG(FLASH_FLAG_ECCD) != 0U)
+  {
+    /* Flash double-bit ECC error on a read: a memory defect, not a boot
+       fault. Clear the latch so a transient cannot re-storm, record it
+       through the generic NMI record (SRAM2_EVENT_OTHER_NMI) and reset —
+       deliberately WITHOUT touching the dual-bank boot-fault counter. */
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ECCD);
+    sram2_parity_nmi_handler();
+  }
+  else
+  {
+    /* RCC CSS or an early-boot software fault: this is the dual-bank
+       boot-fault path. Recording is RAM-only and ISR-safe (no Flash, no HAL,
+       no blocking); the reset is issued there because this build has no IWDG
+       to do it for us, so the loop below would otherwise be a permanent
+       silent hang and the fallback threshold could never be reached.
+       See Core/Inc/dual_bank.h. */
+    dual_bank_handle_boot_fault();
+  }
   /* USER CODE END NonMaskableInt_IRQn 0 */
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
    while (1)

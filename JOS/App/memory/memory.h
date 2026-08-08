@@ -22,6 +22,34 @@ int      laststates_write(const laststates_entry_t *entry);
 int      laststates_dump_all(uint8_t *out, size_t *len);
 uint32_t laststates_count(void);
 
+/* ---------- LastStates pool lock (W2-2 review, CRITICAL) ----------
+   The pool has TWO independent writers that each run the full
+   "pick the first erased slot -> HAL_FLASH_Unlock() -> program 16
+   double-words -> HAL_FLASH_Lock()" sequence:
+
+     - laststates_write() above, from stateMachine (osPriorityAboveNormal)
+       and loraRX;
+     - dual_bank.c:ls_append(), from the watchdog monitor task
+       (osPriorityHigh) once it declares the boot successful.
+
+   configUSE_PREEMPTION is 1, so with no serialisation the high-priority
+   writer can preempt the other one and either claim the same "first erased"
+   slot (-> PROGERR) or slam HAL_FLASH_Lock() shut between two of its
+   double-words (-> PGSERR and a permanently torn 128-byte entry).
+
+   One mutex therefore owns the whole select-slot/erase/program sequence in
+   BOTH writers, and each writer re-checks that its target slot is still
+   erased while holding it.
+
+   laststates_pool_lock() returns 1 when it actually took the mutex and 0 when
+   no lock was needed or possible: in ISR context (the fault, MPU and parity
+   handlers log through here and then reset — they must never block) and
+   before the scheduler runs (boot is single-threaded). The result MUST be
+   handed back to laststates_pool_unlock() so it can never release a mutex it
+   does not own. */
+int      laststates_pool_lock(void);
+void     laststates_pool_unlock(int held);
+
 /* ---------- LastStates bookkeeping mirror (SEU scrubbing, W2-5) ----------
    The write index and the entry count decide where the next post-mortem
    record lands: a bit flip there silently overwrites history, or skips the

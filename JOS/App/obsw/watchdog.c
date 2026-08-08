@@ -157,7 +157,12 @@ osThreadId_t watchdog_task_create(void)
 {
     static const osThreadAttr_t attrs = {
         .name       = "watchdog",
-        .stack_size = 128 * 4,
+        /* 1 KB, not 512 B: this task calls dual_bank_boot_complete() ->
+           ls_append(), whose Flash-programming path stacks HAL frames and can
+           take an exception frame (up to 104 B with FPU) on top (W2-2
+           review). The 128-byte LastStates entry itself is no longer a local
+           (see dual_bank.c), but the margin is still needed. */
+        .stack_size = 256 * 4,
         .priority   = osPriorityHigh,
     };
     return osThreadNew(watchdog_monitor_task, NULL, &attrs);
