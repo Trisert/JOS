@@ -59,10 +59,25 @@ enum {
                                           the hardware check is OFF, so the
                                           parity NMI can never fire           */
     SRAM2_EVENT_STORE_LOST      = 6U,  /* reset-stable store failed validation */
+    SRAM2_EVENT_CLOCK_NMI       = 7U,  /* RCC CSS: the HSE oscillator died.
+                                          NOT a memory event - it is recorded
+                                          under TRIGGER_CLOCK_FAULT and never
+                                          touches the parity counters or the
+                                          boot-fault latch (Kilo #26, comment
+                                          id 3741110986)                      */
+    SRAM2_EVENT_NONE            = 8U,  /* SENTINEL: nothing has been recorded
+                                          in the reset-stable store yet.
+                                          Deliberately NOT 0: id 0 is a real
+                                          parity NMI, so a store that had
+                                          never recorded anything used to
+                                          corroborate a parity finding out of
+                                          pure silence and park a healthy
+                                          spacecraft in STATE_CRIT (Kilo #26,
+                                          comment id 3741110976)              */
 };
 
 /* Highest defined event id, used to sanity-check a salvaged store. */
-#define SRAM2_EVENT_LAST        SRAM2_EVENT_STORE_LOST
+#define SRAM2_EVENT_LAST        SRAM2_EVENT_NONE
 
 /* Marker so ground can find these records inside a LastStates context blob. */
 #define SRAM2_PARITY_RECORD_MAGIC   0x53503245U   /* "SP2E" */
@@ -175,6 +190,9 @@ uint32_t sram2_parity_erase_busy_resets(void);
 /**
   * @brief  Last SRAM2_EVENT_* recorded in the reset-stable store.
   * @retval SRAM2_EVENT_STORE_LOST when the store itself failed validation.
+  * @retval SRAM2_EVENT_NONE when nothing has ever been recorded (a healthy
+  *         unit that has never faulted). This is NOT id 0: reporting a
+  *         pristine store as "parity NMI" is how silence became bad news.
   * @note   SRAM2_EVENT_PARITY_DISABLED here means the SRAM2_PE user option
   *         byte is not programmed, i.e. the hardware parity check is OFF and
   *         the NMI this module is built around can never fire. The module
@@ -199,10 +217,29 @@ int sram2_parity_is_enabled(void);
 uint32_t sram2_parity_error_count(void);
 
 /**
+  * @brief  Is the SRAM2 block safe to read from and write to?
+  * @retval 1 the block has a defined value and valid parity for every byte,
+  * @retval 0 the hardware erase was STILL running when both bounded waits
+  *           expired and the reboot budget was already spent, so the block is
+  *           under the erase engine.
+  *
+  * @note   0 means NOTHING may touch .sram2: a read can raise a parity NMI
+  *         (an endless NMI/reset loop, because the budget is spent), and
+  *         anything written is zeroed - with perfectly valid parity - when
+  *         the erase finally completes, producing the all-zero critical state
+  *         that looks pristine. Every .sram2 consumer must run from its SRAM1
+  *         defaults in STATE_CRIT instead; sram2_parity_boot_fault() is set in
+  *         this case, so the confinement is already in force.
+  *         (Kilo #26, comment id 3741110981.)
+  */
+int sram2_parity_region_usable(void);
+
+/**
   * @brief  Restore an SRAM2_CRITICAL object from its Flash load image.
   * @param  obj  address of an object placed in the .sram2 section.
   * @param  len  size of that object in bytes.
-  * @retval 0 on success, -1 if [obj, obj+len) is not inside .sram2.
+  * @retval 0 on success, -1 if [obj, obj+len) is not inside .sram2 or the
+  *         block is not usable (see sram2_parity_region_usable()).
   * @note   The load image is the immutable copy the linker kept in Flash, so
   *         this re-establishes the compile-time defaults (and valid parity)
   *         for a structure found corrupted at runtime. Also the building
@@ -223,6 +260,23 @@ int sram2_section_contains(const void *obj);
   * @note  Called from NMI_Handler() in stm32l4xx_it.c. Does not return.
   */
 void sram2_parity_nmi_handler(void);
+
+/**
+  * @brief NMI back end for an RCC clock-security (CSS) event: the HSE
+  *        oscillator failed and the hardware has already fallen back to HSI16.
+  *
+  * Deliberately NOT sram2_parity_nmi_handler(): a dead crystal is not a memory
+  * fault. Routing it there filed the record under TRIGGER_SRAM2_PARITY and
+  * inflated sram2_parity_events, so ground diagnosed RAM degradation for an
+  * oscillator failure (Kilo #26, comment id 3741110986).
+  *
+  * @note  RETURNS (unlike the parity handler). The core is already running on
+  *        the HSI fallback, and no reset can resurrect a crystal, so resetting
+  *        would only loop forever and burn the LastStates pool. The record is
+  *        bounded by SRAM2_CLOCK_FAULT_RECORD_LIMIT in the reset-stable store;
+  *        beyond it the flag is cleared and the event counted but not written.
+  */
+void sram2_clock_fault_nmi_handler(void);
 
 #if defined(SRAM2_PARITY_PROGRAM_OPTION_BYTE) && (SRAM2_PARITY_PROGRAM_OPTION_BYTE == 1)
 /**

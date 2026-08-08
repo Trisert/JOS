@@ -106,6 +106,14 @@ _Static_assert(sizeof(sram2_parity_record_t) <=
    is supposed to be counting. */
 #define SRAM2_ERASE_BUSY_RESET_LIMIT  2U
 
+/* How many LastStates records an RCC clock-security (CSS) failure may burn.
+   A dead crystal is permanent, the NMI is level-triggered off CSSF and the
+   hardware keeps running on the HSI fallback, so an unbounded record path
+   would program the whole pool away and destroy the forensic trail it is
+   meant to preserve. Counted in the reset-stable store because a warm reset
+   from any other subsystem must not re-arm the budget. */
+#define SRAM2_CLOCK_FAULT_RECORD_LIMIT  3U
+
 /* ---------- Reset-stable fault store (SRAM1, .noinit) ----------
    A parity NMI records the event and resets, so whatever the next boot needs
    to know has to survive that reset. A flag in .bss cannot: the startup code
@@ -141,7 +149,14 @@ _Static_assert(sizeof(sram2_parity_record_t) <=
    dropped_records / erase_busy_resets are the history ground needs to tell
    "one upset" from "this cell has died", so they are salvaged whenever the
    struct was recognisably ours (at least one magic word intact) and the value
-   is still plausible. Only a store with BOTH magic words wrong is treated as
+   is still plausible. An implausible value is SATURATED at
+   SRAM2_STORE_COUNT_SANE, never reset to 0 (Kilo #26, comment id 3741110977):
+   zeroing deletes the very evidence the salvage exists to protect, and for
+   erase_busy_resets it also hands the wedged-erase path a brand new
+   SRAM2_ERASE_BUSY_RESET_LIMIT budget on exactly the corrupted-memory boots
+   where an unbounded reset loop is least affordable - the recovery disarming
+   the bound. "Implausibly large" still carries signal; 0 carries none.
+   Only a store with BOTH magic words wrong is treated as
    a cold start: that is indistinguishable from uninitialised .noinit after a
    power-on / brown-out reset, and believing a garbage boot_fault there would
    park a perfectly healthy spacecraft in STATE_CRIT at first switch-on. */
@@ -160,6 +175,9 @@ typedef struct {
     uint32_t parity_resets;     /* parity-triggered resets since power-on   */
     uint32_t dropped_records;   /* LastStates writes the fault path lost    */
     uint32_t erase_busy_resets; /* resets taken on an SRAM2 erase still busy */
+    uint32_t clock_faults;      /* RCC CSS NMIs seen (record budget)        */
+    uint32_t first_busy_scsr;   /* SYSCFG->SCSR at the FIRST erase-busy hit */
+    uint32_t first_busy_cfgr2;  /* SYSCFG->CFGR2 at that same first hit     */
     uint32_t chk;               /* XOR of the payload words above           */
 } sram2_fault_store_t;
 
@@ -178,13 +196,24 @@ static laststates_entry_t sram2_pending[SRAM2_PENDING_MAX];
 static uint32_t sram2_pending_count = 0U;
 static uint8_t  sram2_boot_fault_flag = 0U;
 
+/* 0 once the SRAM2 hardware erase has been found still running after both
+   bounded waits AND the reboot budget is spent: the block is under the erase
+   engine, so it must not be read (parity NMI) nor written (the erase zeroes
+   it afterwards with valid parity). Latched for the rest of the boot and
+   published through sram2_parity_region_usable(); see that declaration.
+   Defaults to 1 so a build that never calls sram2_parity_init() - the host
+   unit tests - behaves exactly as before. */
+static uint8_t  sram2_region_usable = 1U;
+
 /* ---------- Helpers ---------- */
 
 static uint32_t sram2_store_checksum(void)
 {
     return sram2_store.boot_fault      ^ sram2_store.last_event ^
            sram2_store.parity_resets   ^ sram2_store.dropped_records ^
-           sram2_store.erase_busy_resets ^ SRAM2_STORE_MAGIC;
+           sram2_store.erase_busy_resets ^ sram2_store.clock_faults ^
+           sram2_store.first_busy_scsr ^ sram2_store.first_busy_cfgr2 ^
+           SRAM2_STORE_MAGIC;
 }
 
 /* Publish the payload: stamp the checksum, then a barrier so the whole store
@@ -207,10 +236,13 @@ static int sram2_store_is_valid(void)
 static void sram2_store_recover(void)
 {
     uint32_t fault   = 0U;
-    uint32_t event   = 0U;
+    uint32_t event   = (uint32_t)SRAM2_EVENT_NONE;
     uint32_t resets  = 0U;
     uint32_t dropped = 0U;
     uint32_t busy    = 0U;
+    uint32_t clocks  = 0U;
+    uint32_t bscsr   = 0U;
+    uint32_t bcfgr2  = 0U;
     int magic_words  = 0;
 
     if (sram2_store.magic == SRAM2_STORE_MAGIC)                  { magic_words++; }
@@ -226,17 +258,36 @@ static void sram2_store_recover(void)
         resets  = sram2_store.parity_resets;
         dropped = sram2_store.dropped_records;
         busy    = sram2_store.erase_busy_resets;
+        clocks  = sram2_store.clock_faults;
         event   = sram2_store.last_event;
         fault   = (sram2_store.boot_fault != 0U) ? 1U : 0U;
 
-        if (resets  > SRAM2_STORE_COUNT_SANE) { resets  = 0U; }
-        if (dropped > SRAM2_STORE_COUNT_SANE) { dropped = 0U; }
-        if (busy    > SRAM2_STORE_COUNT_SANE) { busy    = 0U; }
+        /* SATURATE, never zero (Kilo #26, comment id 3741110977). An
+           implausible value is still evidence that something went badly
+           wrong here; 0 is not, and for erase_busy_resets it would re-arm
+           the very reboot budget that keeps a wedged erase engine from
+           turning the spacecraft into a reset loop. */
+        if (resets  > SRAM2_STORE_COUNT_SANE) { resets  = SRAM2_STORE_COUNT_SANE; }
+        if (dropped > SRAM2_STORE_COUNT_SANE) { dropped = SRAM2_STORE_COUNT_SANE; }
+        if (busy    > SRAM2_STORE_COUNT_SANE) { busy    = SRAM2_STORE_COUNT_SANE; }
+        if (clocks  > SRAM2_STORE_COUNT_SANE) { clocks  = SRAM2_STORE_COUNT_SANE; }
+
+        /* Register snapshots: every 32-bit value is a legal reading, so there
+           is no plausibility bound to apply - carry them through untouched. */
+        bscsr  = sram2_store.first_busy_scsr;
+        bcfgr2 = sram2_store.first_busy_cfgr2;
 
         if (event > (uint32_t)SRAM2_EVENT_LAST) {
             event = (uint32_t)SRAM2_EVENT_STORE_LOST;
         } else if (event == (uint32_t)SRAM2_EVENT_PARITY_NMI) {
-            fault = 1U;   /* the recorded event corroborates the flag */
+            /* A GENUINELY recorded parity NMI corroborates the flag. This is
+               only sound because "nothing recorded yet" is SRAM2_EVENT_NONE
+               and not id 0 (Kilo #26, comment id 3741110976): while the two
+               shared the value 0, one upset in dropped_records on a pristine
+               unit failed the checksum, landed here, read event == 0 and
+               forced STATE_CRIT on a perfectly healthy spacecraft. The rule
+               now fires on evidence, not on silence. */
+            fault = 1U;
         }
     }
 
@@ -248,6 +299,9 @@ static void sram2_store_recover(void)
     sram2_store.parity_resets     = resets;
     sram2_store.dropped_records   = dropped;
     sram2_store.erase_busy_resets = busy;
+    sram2_store.clock_faults      = clocks;
+    sram2_store.first_busy_scsr   = bscsr;
+    sram2_store.first_busy_cfgr2  = bcfgr2;
     sram2_store_seal();
 }
 
@@ -270,7 +324,14 @@ static void sram2_store_note_event(uint32_t event_id)
     sram2_store_seal();
 }
 
-/* Latch a parity fault for the *next* boot. */
+/* Latch a parity fault for the *next* boot AND count the parity-triggered
+   reset that is about to be taken.
+
+   parity_resets is documented as "parity-triggered system resets since the
+   last power-on" and is ground's only "one upset vs a dead cell"
+   discriminator, so ONLY a real parity NMI that actually resets may call
+   this. Anything else must use sram2_store_note_boot_fault() below
+   (Kilo #26, comment id 3741110980). */
 static void sram2_store_note_fault(uint32_t event_id)
 {
     sram2_store_validate();
@@ -280,11 +341,34 @@ static void sram2_store_note_fault(uint32_t event_id)
     sram2_store_seal();
 }
 
-/* Latch an SRAM2 erase that was still running when the bounded waits expired,
-   and count the reset this boot is about to take because of it. */
-static void sram2_store_note_erase_busy(void)
+/* Latch a boot fault WITHOUT touching parity_resets: the finding confines the
+   OBSW to the safe state on the next boot, but it is neither a parity error
+   nor a reset. Padding parity_resets from here inflated the discriminator and
+   then reseeded sram2_parity_events from the inflated number on every
+   subsequent boot, compounding the lie (Kilo #26, comment id 3741110980). */
+static void sram2_store_note_boot_fault(uint32_t event_id)
 {
     sram2_store_validate();
+    sram2_store.boot_fault = 1U;
+    sram2_store.last_event = event_id;
+    sram2_store_seal();
+}
+
+/* Latch an SRAM2 erase that was still running when the bounded waits expired,
+   and count the reset this boot is about to take because of it.
+
+   The register snapshot of the FIRST occurrence is stashed here as well. The
+   sram2_parity_record_t built around it lives on the stack and the pending
+   queue is in .bss, so both die in the reset below: without this, the
+   diagnostically interesting first two occurrences were discarded and only
+   the final give-up pass ever reached ground (Kilo #26, id 3741110980). */
+static void sram2_store_note_erase_busy(uint32_t scsr, uint32_t cfgr2)
+{
+    sram2_store_validate();
+    if (sram2_store.erase_busy_resets == 0U) {
+        sram2_store.first_busy_scsr  = scsr;
+        sram2_store.first_busy_cfgr2 = cfgr2;
+    }
     sram2_store.boot_fault = 1U;
     sram2_store.last_event = (uint32_t)SRAM2_EVENT_ERASE_BUSY;
     sram2_store.erase_busy_resets++;
@@ -448,15 +532,20 @@ static void sram2_fill_record(sram2_parity_record_t *rec, uint32_t event_id)
 
 /* Wrap a record in a LastStates entry. Every status register is sampled by
    sram2_fill_record() before the flags are cleared, so an entry built here can
-   be written to Flash later without losing information. */
+   be written to Flash later without losing information.
+
+   The trigger is a PARAMETER, not a hard-coded TRIGGER_SRAM2_PARITY: filing a
+   dead HSE crystal under "SRAM2 parity" made ground diagnose memory
+   degradation for an oscillator failure (Kilo #26, comment id 3741110986). */
 static void sram2_fill_entry(laststates_entry_t *entry,
-                             const sram2_parity_record_t *rec)
+                             const sram2_parity_record_t *rec,
+                             uint8_t trigger)
 {
     memset(entry, 0, sizeof(*entry));
     entry->timestamp  = HAL_GetTick();
     entry->state_from = SRAM2_STATE_UNKNOWN;
     entry->state_to   = SRAM2_STATE_UNKNOWN;
-    entry->trigger    = TRIGGER_SRAM2_PARITY;
+    entry->trigger    = trigger;
     memcpy(entry->context, rec, sizeof(*rec));
 }
 
@@ -466,7 +555,8 @@ static void sram2_queue_boot_record(const sram2_parity_record_t *rec)
     if (sram2_pending_count >= SRAM2_PENDING_MAX) {
         return;   /* keep the oldest: it carries the first cause */
     }
-    sram2_fill_entry(&sram2_pending[sram2_pending_count], rec);
+    sram2_fill_entry(&sram2_pending[sram2_pending_count], rec,
+                     TRIGGER_SRAM2_PARITY);
     sram2_pending_count++;
 }
 
@@ -550,11 +640,11 @@ static int sram2_flash_prepare(void)
    the loss is observable from the ground instead of silent - and the store
    itself already carries the fault flag, so the safe state on the next boot
    never depends on this Flash write succeeding. */
-static void sram2_persist(const sram2_parity_record_t *rec)
+static void sram2_persist(const sram2_parity_record_t *rec, uint8_t trigger)
 {
     laststates_entry_t entry;
 
-    sram2_fill_entry(&entry, rec);
+    sram2_fill_entry(&entry, rec, trigger);
 
     if (sram2_flash_prepare() != 0) {
         sram2_store_note_dropped();
@@ -572,6 +662,10 @@ void sram2_parity_init(void)
     sram2_parity_record_t rec;
     int erase_rc;
     int erase_stuck = 0;
+    /* Set as soon as anything more severe than "the option byte is off" has
+       been latched into last_event during this boot, so the bookkeeping note
+       at the very end cannot stomp it (Kilo #26, comment id 3741110983). */
+    int event_latched = 0;
 
     /* SYSCFG carries both the parity flag and the SRAM2 erase control. */
     __HAL_RCC_SYSCFG_CLK_ENABLE();
@@ -600,6 +694,9 @@ void sram2_parity_init(void)
        calls once the OBSW has actually reached the safe state. */
     if (sram2_store.boot_fault != 0U) {
         sram2_boot_fault_flag = 1U;
+        /* The previous run latched a finding (typically a real parity NMI).
+           Its last_event is the interesting one; nothing below may stomp it. */
+        event_latched = 1;
     }
 
     /* A flag latched before this point means SRAM2 reported a parity error in
@@ -622,6 +719,7 @@ void sram2_parity_init(void)
         sram2_queue_boot_record(&rec);
         sram2_store_note_event(SRAM2_EVENT_BOOT_LATCH);
         sram2_boot_fault_flag = 1U;
+        event_latched = 1;
         __HAL_SYSCFG_CLEAR_FLAG();
     }
 
@@ -656,17 +754,53 @@ void sram2_parity_init(void)
         sram2_fill_record(&rec, SRAM2_EVENT_ERASE_BUSY);
 
         if (sram2_store.erase_busy_resets < SRAM2_ERASE_BUSY_RESET_LIMIT) {
-            sram2_store_note_erase_busy();   /* latches boot_fault + counts */
+            /* Stashes SYSCFG->SCSR / CFGR2 of the FIRST occurrence, which the
+               reset below would otherwise destroy along with rec and the
+               pending queue (Kilo #26, comment id 3741110980). */
+            sram2_store_note_erase_busy(rec.scsr, rec.cfgr2);
             NVIC_SystemReset();
             for (;;) {
                 /* NVIC_SystemReset() does not return. */
             }
         }
 
-        sram2_store_note_fault(SRAM2_EVENT_ERASE_BUSY);
+        /* Budget spent: continue into STATE_CRIT instead of looping forever.
+           note_boot_fault(), NOT note_fault(): no parity error occurred and no
+           reset is being taken, so bumping parity_resets here would pad the
+           only "one upset vs a dead cell" discriminator ground has - and
+           sram2_parity_events is reseeded from it on every later boot, which
+           compounds the error (Kilo #26, comment id 3741110980). */
+        sram2_store_note_boot_fault(SRAM2_EVENT_ERASE_BUSY);
+        event_latched = 1;
+
+        /* Replay the first occurrence's register context ahead of this one:
+           it is the state before the reset loop started, i.e. the one that
+           says why the engine wedged. Queued first because
+           sram2_queue_boot_record() keeps the oldest when the queue is full. */
+        if ((sram2_store.first_busy_scsr != 0U) ||
+            (sram2_store.first_busy_cfgr2 != 0U)) {
+            sram2_parity_record_t first = rec;
+            first.scsr  = sram2_store.first_busy_scsr;
+            first.cfgr2 = sram2_store.first_busy_cfgr2;
+            sram2_queue_boot_record(&first);
+        }
         sram2_queue_boot_record(&rec);
         sram2_boot_fault_flag = 1U;
         erase_stuck = 1;
+
+        /* Latch the block as UNUSABLE for the rest of this boot. Skipping only
+           sram2_copy_init_image() was not enough: state_machine_init() runs a
+           few functions later and reads obsw_state.magic out of SRAM2 and
+           writes current_state straight back into it. With SRAM2_PE actually
+           programmed that read raises a parity NMI -> reset -> the budget is
+           already spent -> read again -> NMI, forever; and without it the
+           erase completes afterwards and zeroes current_state to STATE_OFF
+           with valid parity and a matching SEU shadow, i.e. the all-zero
+           critical state that looks pristine, arriving one function later
+           (Kilo #26, comment id 3741110981). Every .sram2 consumer must now
+           gate on sram2_parity_region_usable() and run from its SRAM1
+           defaults; the boot-fault latch keeps the OBSW in STATE_CRIT. */
+        sram2_region_usable = 0U;
     } else if (erase_rc == SRAM2_ERASE_NOT_ACKED) {
         /* The hardware never took the request, so the block is idle and
            untouched: defining every byte by hand is safe here (a store writes
@@ -685,6 +819,7 @@ void sram2_parity_init(void)
         sram2_queue_boot_record(&rec);
         sram2_store_note_event(SRAM2_EVENT_ERASE_FAIL);
         sram2_boot_fault_flag = 1U;
+        event_latched = 1;
     }
 
     /* The erase itself must not leave a stale flag behind. */
@@ -711,10 +846,22 @@ void sram2_parity_init(void)
 
     /* The hardware check is a non-volatile option-byte setting, so a build
        that never programs it silently degrades this module to bookkeeping:
-       the NMI it is built around can never fire. Record that in the
-       reset-stable store so the condition is visible from the ground instead
-       of being inferred from the absence of events. */
-    if (sram2_status != SRAM2_PARITY_STATUS_ENABLED) {
+       the NMI it is built around can never fire.
+
+       The primary carrier for that condition is sram2_status, published
+       through sram2_parity_get_status() / sram2_parity_is_enabled() - it is a
+       status, not an event. Writing it into last_event UNCONDITIONALLY made
+       this the last store write of every boot, stomping BOOT_LATCH,
+       ERASE_BUSY, ERASE_FAIL and any PARITY_NMI carried over from the
+       previous run; and because SRAM2_PARITY_PROGRAM_OPTION_BYTE is not in the
+       Makefile C_DEFS, on an unprogrammed part it fired on EVERY boot, so
+       last_event was permanently 5 - a constant, not telemetry - which then
+       poisoned the corroboration check in sram2_store_recover() on the next
+       boot (Kilo #26, comment id 3741110983).
+
+       So it is recorded only when nothing more severe is already latched for
+       this boot. */
+    if ((sram2_status != SRAM2_PARITY_STATUS_ENABLED) && (event_latched == 0)) {
         sram2_store_note_event(SRAM2_EVENT_PARITY_DISABLED);
     }
 }
@@ -793,6 +940,11 @@ uint32_t sram2_parity_error_count(void)
     return sram2_parity_events;
 }
 
+int sram2_parity_region_usable(void)
+{
+    return (sram2_region_usable != 0U) ? 1 : 0;
+}
+
 int sram2_restore_from_image(void *obj, size_t len)
 {
     const uint8_t *ram_start = (const uint8_t *)&_ssram2;
@@ -802,6 +954,14 @@ int sram2_restore_from_image(void *obj, size_t len)
     uintptr_t dst_end;
 
     if ((obj == NULL) || (len == 0U)) {
+        return -1;
+    }
+    /* Refuse while the block is under a wedged erase engine: this function
+       WRITES into .sram2, and every byte it writes is zeroed again - with
+       valid parity - when the erase finally completes, which is precisely the
+       silent-corruption case the caller thinks it is repairing (Kilo #26,
+       comment id 3741110981). Gating here covers every consumer at once. */
+    if (sram2_region_usable == 0U) {
         return -1;
     }
     /* Overflow-safe bounds check: dst+len must not wrap the address space or
@@ -866,17 +1026,61 @@ void sram2_parity_nmi_handler(void)
         __HAL_SYSCFG_CLEAR_FLAG();
     }
     if (__HAL_RCC_GET_IT(RCC_IT_CSS) != RESET) {
-        /* Clock security system: HSE failure also vectors to the NMI. */
+        /* Belt and braces: a CSS event arriving in the same NMI as a parity
+           error. The CSS-only case is routed to
+           sram2_clock_fault_nmi_handler() by NMI_Handler() and never gets
+           here (Kilo #26, comment id 3741110986). */
         __HAL_RCC_CLEAR_IT(RCC_IT_CSS);
     }
 
-    sram2_persist(&rec);
+    sram2_persist(&rec, TRIGGER_SRAM2_PARITY);
 
     NVIC_SystemReset();
 
     for (;;) {
         /* NVIC_SystemReset() does not return; guard against a failed reset. */
     }
+}
+
+void sram2_clock_fault_nmi_handler(void)
+{
+    sram2_parity_record_t rec;   /* on the handler stack, i.e. in SRAM1 */
+    uint32_t seen;
+
+    /* Deliberately does NOT touch sram2_parity_events, parity_resets or the
+       boot-fault latch: a dead HSE crystal says nothing about the integrity
+       of SRAM2. Counting it there filed the record under TRIGGER_SRAM2_PARITY
+       with an inflated RAM-health counter and had ground diagnosing memory
+       degradation for an oscillator failure (Kilo #26, id 3741110986). */
+    sram2_fill_record(&rec, SRAM2_EVENT_CLOCK_NMI);
+
+    sram2_store_validate();
+    seen = sram2_store.clock_faults;
+    if (seen < SRAM2_STORE_COUNT_SANE) {
+        sram2_store.clock_faults = seen + 1U;
+    }
+    sram2_store.last_event = (uint32_t)SRAM2_EVENT_CLOCK_NMI;
+    sram2_store_seal();
+
+    /* Clear CSSF before the record is written: the NMI is driven by the flag,
+       so leaving it set would re-enter this handler on every instruction
+       boundary and never reach the Flash write. */
+    if (__HAL_RCC_GET_IT(RCC_IT_CSS) != RESET) {
+        __HAL_RCC_CLEAR_IT(RCC_IT_CSS);
+    }
+
+    /* Bounded record budget: an HSE failure is permanent, so an unbounded
+       path would program the whole LastStates pool away and destroy the very
+       trail it is meant to preserve. The counter keeps growing in the
+       reset-stable store, so the loss stays observable. */
+    if (seen < SRAM2_CLOCK_FAULT_RECORD_LIMIT) {
+        sram2_persist(&rec, TRIGGER_CLOCK_FAULT);
+    }
+
+    /* RETURNS. The hardware has already switched the system clock to the HSI16
+       fallback (RM0351 rev 9, RCC clock security system), and no reset can
+       resurrect a crystal - NVIC_SystemReset() here would only be an endless
+       reboot loop on a spacecraft that is otherwise perfectly able to run. */
 }
 
 #if defined(SRAM2_PARITY_PROGRAM_OPTION_BYTE) && (SRAM2_PARITY_PROGRAM_OPTION_BYTE == 1)
