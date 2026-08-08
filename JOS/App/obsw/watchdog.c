@@ -3,6 +3,7 @@
 #include "task.h"
 #include "main.h"
 #include "dual_bank.h"
+#include "hw_watchdog.h"
 
 /* ---------- Monitored task entry ---------- */
 typedef struct {
@@ -132,6 +133,20 @@ static void watchdog_monitor_task(void *arg)
 
     for (;;) {
         uint32_t now = xTaskGetTickCount();
+
+        /* Refresh the independent hardware watchdog. This task is the single
+           owner of the refresh once the scheduler is running: it is
+           osPriorityHigh and runs every 500 ms against a ~31 s IWDG timeout,
+           so the backstop only fires when the OBSW has genuinely stopped
+           executing (LOCKUP, a spin in an exception handler, a hang in
+           Error_Handler) rather than when it is merely busy.
+
+           Deliberately unconditional and at the top of the loop: making the
+           kick depend on the task-liveness scan below would couple the
+           hardware backstop to the software monitor's own correctness, and a
+           bug there would turn into a reset storm. Escalating a late task is
+           the scan's job (see the TODO below), not the IWDG's. */
+        hw_watchdog_kick();
 
         watchdog_declare_boot_ok_if_due(now * portTICK_PERIOD_MS);
 

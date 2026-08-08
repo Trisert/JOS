@@ -29,6 +29,17 @@ typedef enum {
     FAULT_ID_BUSFAULT       = 2,
     FAULT_ID_USAGEFAULT     = 3,
     FAULT_ID_STACK_OVERFLOW = 4,
+    /* HardFault that was *derived* from a failure to stack the exception
+       frame (HFSR.FORCED && CFSR.MSTKERR). The canonical producer is a task
+       stack overflow: the offending push faults against the read-only MPU
+       guard band at the bottom of the task stack, and exception entry to
+       MemManage then tries to stack the frame at PSP-32, i.e. back inside the
+       band that just faulted, so the MemManage entry itself faults and
+       escalates. Recorded under its own id because the generic HardFault code
+       would hide the single most likely in-flight failure mode behind the
+       least specific label. Never encoded in an entry stub - fault_capture()
+       derives it from HFSR/CFSR. */
+    FAULT_ID_HARDFAULT_STACKING = 5,
 } fault_id_t;
 
 typedef struct {

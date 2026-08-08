@@ -31,6 +31,7 @@
 #include "comms.h"
 #include "faults.h"
 #include "mpu.h"
+#include "hw_watchdog.h"
 #include "sram2_parity.h"
 #include "seu_mitigation.h"
 /* USER CODE END Includes */
@@ -103,6 +104,14 @@ int main(void)
   /* W2-1: lock down memory before anything else runs — kernel/task
      isolation and no-execute SRAM (NASA-PoT #4, JPL-182). */
   mpu_init();
+  /* Arm the independent hardware watchdog immediately after, and before any
+     code that can fault or spin. Every software containment path in this
+     OBSW ends in NVIC_SystemReset(), which the core can no longer reach once
+     a fault inside a fault handler has driven it into LOCKUP; the IWDG is the
+     only mechanism that recovers from that, and until now the tree had no
+     hardware watchdog at all. Needs no clock setup (it starts the LSI
+     itself), so it can run this early. See Core/Inc/hw_watchdog.h. */
+  hw_watchdog_init();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -146,6 +155,7 @@ int main(void)
      policy is applied below, once the LastStates pool is available.
      See docs/dev/hardening.md 2.4. */
   (void)boot_crc_verify();
+  hw_watchdog_kick();
 
   /* Dual-bank golden-image fallback — NASA-STD-8739.8 (graceful
      degradation), ECSS-Q-ST-80C 6.2.6 (fault tolerance). Reads the option
@@ -154,6 +164,7 @@ int main(void)
      golden image in bank 2. Every unsafe case degrades instead of switching
      (see Core/Inc/dual_bank.h, gates G1..G5). */
   (void)dual_bank_init();
+  hw_watchdog_kick();
 
   bms_init();
   fram_init();
@@ -171,6 +182,7 @@ int main(void)
      bounded — never from the MemManage handler itself. Done before the boot
      CRC policy below, which may reset and never return. */
   (void)mpu_fault_log_flush();
+  hw_watchdog_kick();
 
   /* Act on the integrity result now that the fault can be persisted.
      BOOT_CRC_FATAL (=1 by default, see App/obsw/boot_crc.h): the fault is
@@ -191,6 +203,9 @@ int main(void)
      reference to vote against. Must run after sram2_parity_init(),
      laststates_init(), lora_init() and state_machine_init(). */
   seu_mitigation_init();
+  /* Last kick before the scheduler takes over: from here on
+     watchdog_monitor_task() owns the refresh (App/obsw/watchdog.c). */
+  hw_watchdog_kick();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -723,6 +738,10 @@ void Error_Handler(void)
   __disable_irq();
   while (1)
   {
+    /* Bounded, not a brick: __disable_irq() masks interrupts but has no
+       effect on the IWDG, which is clocked from the LSI and independent of
+       the core. This spin is therefore terminated by a watchdog reset within
+       ~31 s instead of hanging for ever. Deliberately not kicked here. */
   }
   /* USER CODE END Error_Handler_Debug */
 }
