@@ -322,6 +322,55 @@ static seu_region_t *seu_find(seu_region_id_t id)
     return NULL;
 }
 
+/* Bounds check on a region descriptor (review C2).
+   The descriptor table is itself in RAM and therefore itself a target: an
+   upset in `len` would make the scrubber memcpy far past the staging buffers,
+   and a NULL `addr` / `shadow` would fault inside the scrub task. Every path
+   that dereferences a descriptor validates it first and treats a bad one as a
+   recorded fault instead of trusting it. */
+static int seu_region_valid(const seu_region_t *r)
+{
+    if (r == NULL) {
+        return 0;
+    }
+    if ((r->addr == NULL) || (r->len == 0U) || (r->len > SEU_MAX_REGION_BYTES)) {
+        return 0;
+    }
+    if (((seu_policy_t)r->policy == SEU_POLICY_GOLDEN) && (r->shadow == NULL)) {
+        return 0;
+    }
+    if ((seu_policy_t)r->policy != SEU_POLICY_GOLDEN &&
+        (seu_policy_t)r->policy != SEU_POLICY_TOUCH) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Record a descriptor that failed the bounds check. Never dereferences the
+   suspect pointers - only the scalar fields go into the record. */
+static void seu_region_reject(const seu_region_t *r)
+{
+    seu_stats.region_faults++;
+    seu_log(SEU_EVENT_REGION_INVALID, r, 0U, 0U, 0U, 0U, 0xFFFFFFFFU);
+}
+
+/* Containment for an upset no vote can repair (review C1).
+   The Flash load image is NOT written back: it holds the compile-time
+   defaults (state OFF, soc 100 %) and restoring them in place would mask a
+   dead battery as a healthy one. The honest, safe answer is to leave the
+   corrupt object alone, record it, and drive the OBSW into the beacon-only
+   safe state so ground decides what happens next. */
+static void seu_enter_safe_state(const seu_region_t *r)
+{
+    if (state_machine_get_state() == STATE_CRIT) {
+        return;   /* already contained */
+    }
+    if (state_machine_request_transition(STATE_CRIT, TRIGGER_SEU_SCRUB) == 0) {
+        seu_stats.escalations++;
+        seu_log(SEU_EVENT_SAFE_STATE, r, 0U, 0U, 0U, 0U, 0xFFFFFFFFU);
+    }
+}
+
 int seu_mitigation_register_region(seu_region_id_t id, void *addr, size_t len,
                                    seu_policy_t policy)
 {
@@ -379,7 +428,7 @@ int seu_mitigation_commit(seu_region_id_t id)
     }
 
     r = seu_find(id);
-    if ((r == NULL) || (r->shadow == NULL)) {
+    if ((r == NULL) || (seu_region_valid(r) == 0) || (r->shadow == NULL)) {
         return -1;
     }
 
@@ -418,6 +467,14 @@ static seu_scrub_result_t seu_scrub_golden(seu_region_t *r)
     uint32_t first_bad   = 0xFFFFFFFFU;
     seu_scrub_result_t result;
 
+    /* Bounds check before the first dereference (review C2): a corrupt
+       descriptor must not be able to drive a memcpy past seu_work /
+       seu_shadow_work, which are exactly SEU_MAX_REGION_BYTES long. */
+    if (seu_region_valid(r) == 0) {
+        seu_region_reject(r);
+        return SEU_RESULT_UNRECOVERED;
+    }
+
     /* Take all three legs of the vote in one locked instant, then do the
        arithmetic with interrupts enabled - the lock must not be held for a
        CRC, and a commit landing between two of the reads would otherwise look
@@ -447,9 +504,9 @@ static seu_scrub_result_t seu_scrub_golden(seu_region_t *r)
 
         r->mismatches++;
         seu_stats.mismatches++;
-        seu_stats.repairs++;
+        seu_stats.shadow_repairs++;
         seu_stats.bit_errors += bit_errors;
-        seu_log(SEU_EVENT_SCRUB_REPAIR, r, crc_live, crc_shadow,
+        seu_log(SEU_EVENT_SHADOW_REPAIR, r, crc_live, crc_shadow,
                 byte_errors, bit_errors, first_bad);
         return SEU_RESULT_REPAIRED;
     }
@@ -511,33 +568,29 @@ static seu_scrub_result_t seu_scrub_golden(seu_region_t *r)
         return SEU_RESULT_CRC_REFRESH;
     }
 
-    /* No two copies agree. For an object of the initialised .sram2 section the
-       Flash load image is the last trustworthy source: fall back to the
-       compile-time defaults rather than keep flying on unknown data. For any
-       other object the honest answer is to record the loss and leave the live
-       copy alone - reverting the LastStates bookkeeping, for instance, would
-       destroy history instead of saving it. */
+    /* No two copies agree. The Flash load image is NOT a trustworthy source
+       here: it holds the compile-time defaults (state OFF, soc 100 %), so
+       writing it back would replace an unknown value with a *wrong* value and
+       report a dead battery as a full one (review C1). Leave the live object
+       untouched, record the loss, and contain the spacecraft in the
+       beacon-only safe state. */
     seu_mitigation_lock();
     if (memcmp(seu_work, r->addr, r->len) != 0) {
         seu_mitigation_unlock();
         return SEU_RESULT_HEALTHY;       /* commit raced us; re-examine later */
     }
-    if (sram2_restore_from_image(r->addr, r->len) == 0) {
-        memcpy(r->shadow, r->addr, r->len);
-        r->crc = seu_crc32(r->addr, r->len);
-        result = SEU_RESULT_REPAIRED;
-    } else {
-        result = SEU_RESULT_UNRECOVERED;
-    }
     seu_mitigation_unlock();
+
+    result = SEU_RESULT_UNRECOVERED;
 
     r->mismatches++;
     seu_stats.mismatches++;
     seu_stats.unrecoverable++;
     seu_stats.bit_errors += bit_errors;
-    seu_log((result == SEU_RESULT_REPAIRED) ? SEU_EVENT_SCRUB_REPAIR
-                                            : SEU_EVENT_SCRUB_FAILED,
-            r, crc_live, crc_shadow, byte_errors, bit_errors, first_bad);
+    seu_log(SEU_EVENT_SCRUB_FAILED, r, crc_live, crc_shadow,
+            byte_errors, bit_errors, first_bad);
+
+    seu_enter_safe_state(r);
     return result;
 }
 
@@ -558,6 +611,14 @@ int seu_mitigation_scrub_once(void)
 
         seu_stats.regions_checked++;
 
+        /* Bounds check before any dereference (review C2) — applies to the
+           touch policy too: seu_touch() walks r->len bytes from r->addr. */
+        if (seu_region_valid(r) == 0) {
+            seu_region_reject(r);
+            corrupted++;
+            continue;
+        }
+
         if ((seu_policy_t)r->policy == SEU_POLICY_TOUCH) {
             seu_touch(r);
             continue;
@@ -572,6 +633,7 @@ int seu_mitigation_scrub_once(void)
     seu_stats.last_scrub_tick    = HAL_GetTick();
     seu_stats.parity_events_boot = sram2_parity_error_count();
     seu_stats.parity_events_total = seu_bkp_count();
+    seu_stats.parity_status      = (uint32_t)sram2_parity_get_status();
 
     return (int)corrupted;
 }
@@ -594,32 +656,49 @@ void seu_mitigation_init(void)
 
     /* (a) Snapshot the critical structures. The owners are already
            initialised at this point, so the shadows capture the intended
-           post-boot content, not whatever the linker left behind. */
+           post-boot content, not whatever the linker left behind.
+           A failed registration is a real loss of protection, so it is
+           counted and never silently dropped (review M5). */
     addr = state_machine_critical_region(&len);
-    (void)seu_mitigation_register_region(SEU_REGION_OBSW_STATE, addr, len,
-                                         SEU_POLICY_GOLDEN);
+    if (seu_mitigation_register_region(SEU_REGION_OBSW_STATE, addr, len,
+                                       SEU_POLICY_GOLDEN) != 0) {
+        seu_stats.registration_failures++;
+    }
 
     addr = laststates_mirror_region(&len);
-    (void)seu_mitigation_register_region(SEU_REGION_LASTSTATES, addr, len,
-                                         SEU_POLICY_GOLDEN);
+    if (seu_mitigation_register_region(SEU_REGION_LASTSTATES, addr, len,
+                                       SEU_POLICY_GOLDEN) != 0) {
+        seu_stats.registration_failures++;
+    }
 
     /* Comms frames change with every beacon and every uplink, so there is no
        golden content to vote on; reading them is still worth it because that
        is what makes the parity hardware report a dormant upset. */
     addr = comms_beacon_buffer(&len);
-    (void)seu_mitigation_register_region(SEU_REGION_COMMS_BEACON, addr, len,
-                                         SEU_POLICY_TOUCH);
+    if (seu_mitigation_register_region(SEU_REGION_COMMS_BEACON, addr, len,
+                                       SEU_POLICY_TOUCH) != 0) {
+        seu_stats.registration_failures++;
+    }
     addr = comms_rx_buffer(&len);
-    (void)seu_mitigation_register_region(SEU_REGION_COMMS_RX, addr, len,
-                                         SEU_POLICY_TOUCH);
+    if (seu_mitigation_register_region(SEU_REGION_COMMS_RX, addr, len,
+                                       SEU_POLICY_TOUCH) != 0) {
+        seu_stats.registration_failures++;
+    }
     addr = comms_tx_buffer(&len);
-    (void)seu_mitigation_register_region(SEU_REGION_COMMS_TX, addr, len,
-                                         SEU_POLICY_TOUCH);
+    if (seu_mitigation_register_region(SEU_REGION_COMMS_TX, addr, len,
+                                       SEU_POLICY_TOUCH) != 0) {
+        seu_stats.registration_failures++;
+    }
 
     seu_stats.parity_events_boot  = sram2_parity_error_count();
     seu_stats.parity_events_total = seu_bkp_count();
+    seu_stats.parity_status       = (uint32_t)sram2_parity_get_status();
 
     seu_initialised = 1U;
+
+    if (seu_stats.registration_failures != 0U) {
+        seu_log(SEU_EVENT_REGISTER_FAILED, NULL, 0U, 0U, 0U, 0U, 0xFFFFFFFFU);
+    }
 
     /* (c) Parity NMIs reset the OBSW, so their count lives in the backup
            domain. If it moved since the last boot that was acknowledged, this
