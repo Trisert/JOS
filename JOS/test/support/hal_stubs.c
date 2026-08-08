@@ -11,14 +11,20 @@
  *
  * NVIC_SystemReset() must not return on target. Returning here would let the
  * test continue past a point the flight code considers unreachable, so the
- * double records the request and longjmp-free aborts the test run with a
- * readable message unless a test has explicitly armed it (no test currently
- * exercises the reset path; boot_crc_apply_policy() only reaches it after the
- * attempt counter saturates).
+ * double either
+ *
+ *   - aborts the test run with a readable message (default: nothing asked for
+ *     a reboot, so a reboot is a defect), or
+ *   - longjmp()s straight back to the HOST_EXPECT_NVIC_RESET() call site when
+ *     a test has explicitly armed the capture. That reproduces "does not
+ *     return" faithfully: no statement after NVIC_SystemReset() is executed,
+ *     which is exactly what the retry-budget logic in boot_crc_apply_policy()
+ *     relies on.
  *
  * Refs: NASA-STD-8739.8 (test doubles must be explicit, never silent).
  * ------------------------------------------------------------------------- */
 #include "main.h"        /* fakes/main.h */
+#include "host_support.h"
 #include "unity.h"
 
 #include <stdint.h>
@@ -38,8 +44,46 @@ void host_hal_tick_reset(void)
     host_tick = 0u;
 }
 
+/* ---------------------------------------------------------------------------
+ * NVIC_SystemReset() capture
+ * ------------------------------------------------------------------------- */
+jmp_buf host_nvic_reset_jmp;
+
+static int      nvic_reset_armed;
+static uint32_t nvic_reset_requests;
+
+void host_nvic_reset_arm(void)
+{
+    nvic_reset_armed = 1;
+}
+
+void host_nvic_reset_disarm(void)
+{
+    nvic_reset_armed = 0;
+}
+
+uint32_t host_nvic_reset_count(void)
+{
+    return nvic_reset_requests;
+}
+
+void host_nvic_reset_clear(void)
+{
+    nvic_reset_armed    = 0;
+    nvic_reset_requests = 0u;
+}
+
 void NVIC_SystemReset(void)
 {
+    nvic_reset_requests++;
+
+    if (nvic_reset_armed) {
+        /* Armed by HOST_EXPECT_NVIC_RESET(): emulate the reboot by never
+         * returning to the caller. */
+        nvic_reset_armed = 0;
+        longjmp(host_nvic_reset_jmp, 1);
+    }
+
     /* On target this never returns. Failing loudly beats silently continuing
      * into code the flight software believes is unreachable. */
     TEST_FAIL_MESSAGE("NVIC_SystemReset() called: the code under test asked "
