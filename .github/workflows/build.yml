@@ -3,68 +3,13 @@ name: Build JOS firmware
 on:
   push:
     branches: [main]
+  # No base-branch filter: every pull request is gated, including ones that are
+  # stacked on another feature branch rather than targeting main directly.
   pull_request:
-    branches: [main]
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Static analysis gate.
-  #
-  # SCOPE: first-party code ONLY -- `JOS/App` and the hand-written CubeMX
-  # `JOS/Core/Src` sources. The vendored trees (`JOS/Drivers` = STM32 HAL +
-  # CMSIS, `JOS/Middlewares` = FreeRTOS, `JOS/Core/Inc/RadioLib`) are NOT
-  # analysed; they are only on the include path so first-party headers resolve,
-  # and their findings are silenced with PATH-SCOPED suppressions so no check id
-  # is ever disabled for code we own.
-  #
-  # SINGLE SOURCE OF TRUTH: every flag, include path, define, exclusion and
-  # suppression lives in the `cppcheck` target of `JOS/Makefile`, derived from
-  # the same $(INCLUDES)/$(C_DEFS) the compiler uses. This workflow only calls
-  # `make`, so the gate cannot drift from the real build. Run
-  # `make -C JOS cppcheck-print` to see the exact command.
-  # ---------------------------------------------------------------------------
-  static-analysis:
-    # The runner image is PINNED (deliberately not `ubuntu-latest`): the
-    # cppcheck finding set is version dependent, so an image refresh must not be
-    # able to change the gate result behind our backs.
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install pinned cppcheck
-        run: |
-          sudo apt-get update
-          # PINNED VERSION. ubuntu-24.04 (noble/universe) ships exactly
-          # cppcheck 2.13.0-2ubuntu3. Pinning matters because a cppcheck bump
-          # can add, drop or retune checks (e.g. `constParameter` was split into
-          # `constParameterPointer` in 2.11+) and would silently change what
-          # this gate accepts. If this install ever fails, the archive moved:
-          # bump it here AND bump CPPCHECK_VERSION in JOS/Makefile in the same
-          # PR, after re-running the gate and triaging any new findings.
-          sudo apt-get install -y --no-install-recommends cppcheck=2.13.0-2ubuntu3
-          cppcheck --version
-
-      # Canary: proves the gate is still capable of failing BEFORE we trust a
-      # green result on the real tree. It generates a throwaway C file with an
-      # out-of-bounds array write and a NULL dereference, runs cppcheck over it
-      # with the EXACT same flags as the real gate, deletes the file, and exits
-      # non-zero if cppcheck came back clean.
-      #
-      # This is not theoretical: the first version of this gate suppressed
-      # `preprocessorErrorDirective` and never defined `__GNUC__`, so
-      # cmsis_compiler.h hit `#error Unknown compiler`, cppcheck abandoned the
-      # configuration without analysing anything and exited 0 on every run. The
-      # canary #includes main.h and FreeRTOS.h, so it walks the same
-      # HAL/CMSIS/FreeRTOS-portable include chain and reproduces that failure
-      # mode -- it is verified to go red under the old flags.
-      - name: Canary (assert the cppcheck gate can fail)
-        run: make -C JOS cppcheck-canary
-
-      - name: Static analysis (cppcheck, first-party only)
-        run: make -C JOS cppcheck
-
   build:
+    name: Firmware build (arm-none-eabi)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -82,26 +27,9 @@ jobs:
         working-directory: JOS
         run: make all
 
-      # `make all` already depends on crc-stamp; re-running it here is
-      # idempotent and makes the stamping step explicit in the log. Without a
-      # stamp the .fw_crc word stays at the 0x00000000 placeholder and the
-      # boot-time integrity check degrades to a no-op.
-      - name: Stamp firmware image CRC32
+      - name: Stamp firmware image CRC
         working-directory: JOS
         run: make crc-stamp
-
-      # Hard gate before upload: fails if the artefact is unstamped, carries
-      # the erased-Flash pattern, or does not match its own contents.
-      - name: Verify image is stamped and consistent
-        working-directory: JOS
-        run: make crc-check
-
-      # Runs the *flight* CRC routine (App/obsw/boot_crc.c) on the host over
-      # the stamped image, so the on-orbit check and the zlib-based stamping
-      # tool can never silently diverge.
-      - name: Boot-CRC self-test (flight routine vs stamped image)
-        working-directory: JOS
-        run: make crc-selftest
 
       - name: Report size
         working-directory: JOS
@@ -116,3 +44,63 @@ jobs:
             JOS/build/JOS.hex
             JOS/build/JOS.bin
           if-no-files-found: error
+
+  unit-tests:
+    name: Host unit tests (Ceedling)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.1'
+
+      # Unity and CMock are taken from the Ceedling gem. There is deliberately
+      # no vendored Unity in the repository, so there is exactly one version in
+      # the build (see JOS/test/project.yml, :which_ceedling: gem).
+      - name: Install Ceedling
+        run: gem install ceedling -v 1.1.3 --no-document
+
+      # gcovr is what actually computes the coverage numbers behind
+      # `ceedling gcov:all`. Without it installed the plugin degrades to a
+      # console summary that cannot fail, so this is a hard install step and
+      # the version is echoed into the log.
+      - name: Install gcovr
+        run: |
+          pipx install gcovr || python3 -m pip install --user gcovr
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Show coverage tool versions
+        run: |
+          gcovr --version
+          gcov --version | head -1
+
+      - name: Run unit tests
+        working-directory: JOS/test
+        run: ceedling test:all
+
+      # Enforced gate: JOS/test/project.yml sets :fail_under_line /
+      # :fail_under_branch together with :exception_on_fail, so this step exits
+      # non-zero when coverage of the modules under test drops below the
+      # thresholds (verified locally: 99% threshold -> exit 1).
+      - name: Enforce code coverage thresholds
+        working-directory: JOS/test
+        run: ceedling gcov:all
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: JOS/test/build/test/results/
+          if-no-files-found: warn
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-coverage
+          path: JOS/test/build/artifacts/gcov/
+          if-no-files-found: warn

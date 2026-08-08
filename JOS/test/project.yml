@@ -1,0 +1,115 @@
+---
+# =============================================================================
+# Ceedling project configuration - RedPill / JOS host unit tests
+# =============================================================================
+# Host-side (x86_64/aarch64 gcc) unit tests for the flight software modules
+# that are pure logic or can be exercised against a faked HAL. The flight
+# build itself is unchanged and still built with arm-none-eabi-gcc via
+# ../Makefile.
+#
+# Unity/CMock come from the Ceedling *gem* (:which_ceedling: gem below).
+# There is deliberately NO vendored copy of Unity in this repository: two
+# Unity versions in one build produce silent ABI/macro mismatches.
+#
+# Run from JOS/test/:   ceedling test:all
+# Or from JOS/:         make test
+#
+# Refs: ECSS-E-ST-40C 5.5 (software validation), NASA-STD-8739.8 (unit test
+#       evidence), JPL-182 Rule 31 (all code exercised by tests).
+# =============================================================================
+
+:project:
+  :which_ceedling: gem          # use the installed gem's Unity/CMock, never a vendored copy
+  :use_exceptions: FALSE
+  :use_test_preprocessor: :none # no mocks are generated; fakes are hand written
+  :use_backtrace: :simple
+  :build_root: build
+  :test_file_prefix: test_
+  :default_tasks:
+    - test:all
+
+:extension:
+  :executable: .out
+
+:paths:
+  :test:
+    - +:test/**
+  # Only modules that are host-compilable are on the source path. In
+  # particular ../Core/Src is NOT: it is CubeMX-generated (main.c,
+  # stm32l4xx_it.c, stm32l4xx_hal_msp.c, system_stm32l4xx.c, syscalls.c ...),
+  # it pulls the whole HAL/CMSIS/FreeRTOS tree, and Ceedling would happily
+  # feed main.c to the host gcc for any test that includes "main.h" (the test
+  # build uses fakes/main.h instead). If a Core/Src module ever becomes
+  # host-testable, add that one file explicitly under :files: :source: rather
+  # than putting the whole directory back on the path.
+  :source:
+    - ../App/obsw
+    - ../App/memory
+  :include:
+    - ../App
+    - ../App/obsw
+    - ../App/memory
+    - fakes
+    - support
+  :support:
+    - support
+
+:defines:
+  :test:
+    :*:
+      - HOST_UNIT_TEST
+    # test_bad_region.c links the same boot_crc.c but with the fake linker
+    # symbols laid out so that __fw_crc_start <= __fw_image_start, which is
+    # the only way to reach the BOOT_CRC_BAD_REGION branch on the host.
+    :test_bad_region:
+      - HOST_FW_BAD_REGION
+
+:flags:
+  :test:
+    :compile:
+      :*:
+        - -std=gnu11
+        - -Wall
+        - -Wextra
+        - -Wno-unused-parameter
+        - -Werror
+
+:cmock:
+  :mock_prefix: mock_
+  :when_no_prototypes: :warn
+  :enforce_strict_ordering: TRUE
+  :plugins:
+    - :ignore
+    - :callback
+
+:plugins:
+  :load_paths: []
+  :enabled:
+    - gcov
+
+# =============================================================================
+# Coverage
+# =============================================================================
+# `ceedling gcov:all` produces a real, enforced number: gcovr must be
+# installed (CI installs it) and the run fails if line or branch coverage of
+# the modules under test drops below the thresholds below. Reporting coverage
+# without a threshold is a gate that cannot fail, which is worse than no gate
+# because it looks like one.
+:gcov:
+  :summaries: TRUE
+  :report_task: FALSE
+  :utilities:
+    - gcovr
+  :reports:
+    - Text
+  :gcovr:
+    :report_root: ".."
+    :report_exclude: '^(test|build|Drivers|Middlewares|Core)[\\/]'
+    :sort_percentage: TRUE
+    :print_summary: TRUE
+    # Without :exception_on_fail the plugin only prints a warning and still
+    # exits 0, i.e. the threshold below would be decoration. TRUE turns a
+    # coverage regression into a failed build.
+    :exception_on_fail: TRUE
+    :fail_under_line: 90
+    :fail_under_branch: 75
