@@ -8,6 +8,11 @@
  * LASTSTATES_FLASH_BASE below). */
 #include "dual_bank.h"
 #endif
+#ifndef HOST_UNIT_TEST
+/* CMSIS-RTOS2 mutex for the LastStates pool lock (W2-2 review, CRITICAL).
+ * The host build is single-threaded and stubs the lock out entirely. */
+#include "cmsis_os2.h"
+#endif
 /* bookkeeping mirror scrubbing (W2-5). Core/Inc/seu_mitigation.h on the
  * target; test/fakes/seu_mitigation.h (same signatures, no RTOS) on the host,
  * so the lock/commit calls below stay flight code in both builds. */
@@ -394,6 +399,66 @@ static int flash_erase_page_bounded(uintptr_t addr)
 }
 #endif /* HOST_UNIT_TEST */
 
+/* ---------------------------------------------------------------------------
+ * LastStates pool lock (W2-2 review, CRITICAL: Flash write race).
+ *
+ * See memory.h for the full rationale. Short version: laststates_write() and
+ * dual_bank.c:ls_append() both run "pick the first erased slot -> unlock ->
+ * program -> lock" on the SAME pool, from tasks of different priority, with
+ * configUSE_PREEMPTION == 1. One mutex owns that sequence in both writers.
+ *
+ * The mutex is created in laststates_init(), which main() calls before
+ * osKernelInitialize(): osMutexNew() only refuses to run from an ISR, so
+ * creating it there is legal and removes any lazy-creation race between the
+ * two writers.
+ * ------------------------------------------------------------------------- */
+#ifndef HOST_UNIT_TEST
+
+static osMutexId_t ls_pool_mutex = NULL;
+
+static void laststates_pool_lock_create(void)
+{
+    static const osMutexAttr_t attr = {
+        .name      = "lsPool",
+        .attr_bits = osMutexPrioInherit,   /* the writers span 3 priorities */
+        .cb_mem    = NULL,
+        .cb_size   = 0U,
+    };
+
+    if (ls_pool_mutex == NULL) {
+        ls_pool_mutex = osMutexNew(&attr);
+    }
+}
+
+int laststates_pool_lock(void)
+{
+    if (__get_IPSR() != 0U) {
+        return 0;   /* fault / parity NMI path: log and reset, never block */
+    }
+    if (ls_pool_mutex == NULL) {
+        return 0;   /* boot, before laststates_init(): single-threaded */
+    }
+    if (osKernelGetState() != osKernelRunning) {
+        return 0;   /* scheduler not started yet: still single-threaded */
+    }
+    return (osMutexAcquire(ls_pool_mutex, osWaitForever) == osOK) ? 1 : 0;
+}
+
+void laststates_pool_unlock(int held)
+{
+    if (held != 0) {
+        (void)osMutexRelease(ls_pool_mutex);
+    }
+}
+
+#else  /* host unit-test build: single-threaded, no RTOS */
+
+static void laststates_pool_lock_create(void) { }
+int  laststates_pool_lock(void)          { return 0; }
+void laststates_pool_unlock(int held)    { (void)held; }
+
+#endif /* HOST_UNIT_TEST */
+
 static int flash_write_row(uintptr_t addr, const uint8_t *data, size_t len)
 {
     if (len == 0U || (len % 8U) != 0U) return -1;
@@ -447,6 +512,12 @@ void laststates_init(void)
 {
     dwt_cyccnt_enable();
 
+    /* Create the pool mutex before anything can write: main() calls us before
+     * osKernelInitialize(), and dual_bank.c's writer only starts once the
+     * watchdog task runs, so the mutex always exists by the time two writers
+     * can actually race (W2-2 review, CRITICAL). */
+    laststates_pool_lock_create();
+
     /* Scan the pool for the first free (erased) slot. That slot is where the
      * next record must be appended so post-mortem readback can recover the
      * existing trail after the reboot (review C1). If the pool is completely
@@ -482,6 +553,12 @@ int laststates_write(const laststates_entry_t *entry)
 {
     if (entry == NULL) return -1;
 
+    /* Take the pool lock for the WHOLE select-slot / erase / program sequence:
+       dual_bank.c:ls_append() runs the same sequence from a higher-priority
+       task, and interleaving the two corrupts the pool (W2-2 review,
+       CRITICAL). Every exit path below must release it. */
+    const int lock_held = laststates_pool_lock();
+
     /* Bounds guard: the cursor is always in range after init, but never trust
        a cached index against corruption. */
     if (ls_mirror.idx >= LASTSTATES_MAX_ENTRIES) {
@@ -514,11 +591,13 @@ int laststates_write(const laststates_entry_t *entry)
     if (!slot_is_erased(ls_idx)) {
         uintptr_t page_addr = addr & ~(((uintptr_t)1U << LS_PAGE_SHIFT) - 1U);
         if (flash_erase_page_bounded(page_addr) != 0) {
+            laststates_pool_unlock(lock_held);
             return -1;
         }
     }
 
     if (flash_write_row(addr, (const uint8_t *)entry, LASTSTATES_ENTRY_SIZE) != 0) {
+        laststates_pool_unlock(lock_held);
         return -1;
     }
 
@@ -531,6 +610,7 @@ int laststates_write(const laststates_entry_t *entry)
     if (ls_mirror.count < LASTSTATES_MAX_ENTRIES) { ls_mirror.count++; }
     (void)seu_mitigation_commit(SEU_REGION_LASTSTATES);
     seu_mitigation_unlock();
+    laststates_pool_unlock(lock_held);
     return 0;
 }
 
