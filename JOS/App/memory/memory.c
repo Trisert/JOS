@@ -448,8 +448,20 @@ static int dwt_cyccnt_running(void)
  * is not implemented/enabled: a plain iteration budget. One iteration is at
  * least a few CPU cycles, so using the same number as the cycle budget only
  * ever makes the fallback timeout LONGER in wall-clock terms, never shorter -
- * it is a liveness guarantee, not a precise timeout. Returns 0 when BSY
- * cleared in time, -1 on timeout (the caller owns the register clean-up). */
+ * it is a liveness guarantee, not a precise timeout.
+ *
+ * The iteration budget is counted and checked UNCONDITIONALLY, not only on the
+ * fallback branch: dwt_cyccnt_running() is a photograph taken before the loop,
+ * and CYCCNTENA can be cleared *while* we spin (a debug probe attaching, any
+ * other agent writing DWT->CTRL). CYCCNT would then freeze at `start`,
+ * (DWT->CYCCNT - start) would stay 0 and this loop - which exists precisely to
+ * stop a fault handler spinning forever - would never exit (Kilo #26). With
+ * both checks in place the cycle bound still decides the normal timeout (one
+ * iteration costs several cycles, so it always trips first) and the spin count
+ * is a strictly later backstop that no register write can disable.
+ *
+ * Returns 0 when BSY cleared in time, -1 on timeout (the caller owns the
+ * register clean-up). */
 static int flash_wait_bsy_bounded(uint32_t budget)
 {
     const int      have_cyccnt = dwt_cyccnt_running();
@@ -457,15 +469,12 @@ static int flash_wait_bsy_bounded(uint32_t budget)
     uint32_t       spins       = 0U;
 
     while (__HAL_FLASH_GET_FLAG(FLASH_FLAG_BSY)) {
-        if (have_cyccnt != 0) {
-            if ((DWT->CYCCNT - start) >= budget) {
-                return -1;
-            }
-        } else {
-            spins++;
-            if (spins >= budget) {
-                return -1;
-            }
+        if ((have_cyccnt != 0) && ((DWT->CYCCNT - start) >= budget)) {
+            return -1;
+        }
+        spins++;
+        if (spins >= budget) {
+            return -1;   /* cycle counter absent, or silenced mid-loop */
         }
     }
     return 0;
@@ -568,19 +577,48 @@ static int flash_erase_page_bounded(uintptr_t addr)
 /* ---------------------------------------------------------------------------
  * LastStates pool lock (W2-2 review, CRITICAL: Flash write race).
  *
- * See memory.h for the full rationale. Short version: laststates_write() and
- * dual_bank.c:ls_append() both run "pick the first erased slot -> unlock ->
- * program -> lock" on the SAME pool, from tasks of different priority, with
- * configUSE_PREEMPTION == 1. One mutex owns that sequence in both writers.
+ * See memory.h for the full rationale and the meaning of the three return
+ * values. Short version: laststates_write() and dual_bank.c:ls_append() both
+ * run "pick the first erased slot -> unlock -> program -> lock" on the SAME
+ * pool, from tasks of different priority, with configUSE_PREEMPTION == 1. One
+ * mutex owns that sequence in both writers.
  *
  * The mutex is created in laststates_init(), which main() calls before
  * osKernelInitialize(): osMutexNew() only refuses to run from an ISR, so
  * creating it there is legal and removes any lazy-creation race between the
  * two writers.
  * ------------------------------------------------------------------------- */
+
+/* Degraded-path telemetry. Compiled in BOTH builds so the host tests can see
+ * the refusal happen (Kilo #21: "at minimum, bump a counter that reaches the
+ * LastStates/telemetry stream so ground can see the pool went unsynchronised").
+ */
+static volatile uint32_t ls_lock_failures   = 0U;
+static volatile uint32_t ls_dropped_records = 0U;
+
+uint32_t laststates_lock_failures(void)   { return ls_lock_failures; }
+uint32_t laststates_dropped_records(void) { return ls_dropped_records; }
+
+/* Every writer of this pool - laststates_write() here and
+ * Core/Src/dual_bank.c:ls_append(), which drives HAL_FLASH_Program() itself
+ * and never routes through laststates_write() - must call this when it
+ * refuses a record because serialisation was unavailable. Without it the
+ * dual-bank boot-fault / boot-OK markers were dropped silently and the
+ * tri-state lock was invisible from the ground (Kilo #26). */
+void laststates_note_dropped_record(void)
+{
+    ls_dropped_records++;
+}
+
 #ifndef HOST_UNIT_TEST
 
 static osMutexId_t ls_pool_mutex = NULL;
+
+/* Set when laststates_init() ran but osMutexNew() handed back NULL (FreeRTOS
+ * heap exhausted). Distinguishes "the mutex does not exist yet, boot is still
+ * single-threaded" (safe: no lock needed) from "the mutex will never exist"
+ * (unsafe: two tasks can now race, so every write must be refused). */
+static volatile uint8_t ls_pool_lock_degraded = 0U;
 
 static void laststates_pool_lock_create(void)
 {
@@ -594,33 +632,108 @@ static void laststates_pool_lock_create(void)
     if (ls_pool_mutex == NULL) {
         ls_pool_mutex = osMutexNew(&attr);
     }
+    if (ls_pool_mutex == NULL) {
+        /* Nobody checked this return before; a NULL mutex silently degraded
+         * every later lock into a no-op, i.e. exactly the unsynchronised pool
+         * this module exists to prevent (Kilo #21). Latch it and fail loud. */
+        ls_pool_lock_degraded = 1U;
+        ls_lock_failures++;
+    }
+}
+
+/* Exception-context preparation for a Flash write.
+ *
+ * The fault / MPU / parity handlers log through laststates_write() and then
+ * reset, so they can neither block on the mutex nor let the preempted task
+ * resume. Returning "no lock needed" and programming anyway is not safe on its
+ * own: the preempted task may be sitting between the two 32-bit stores of a
+ * double-word program (PG set, BSY not yet asserted) or between PER+PNB and
+ * STRT. Programming on top of either is a programming-sequence error, and the
+ * record we most wanted to read is then filed under dropped_records.
+ *
+ * So: wait for BSY with the same cycle-counted bound the writers use (never
+ * HAL_GetTick(): SysTick cannot preempt an NMI), then sanitise FLASH->CR
+ * before handing the controller over. If the controller is still busy when the
+ * bound expires it is wedged - refuse the write rather than queue behind an
+ * operation that may never end. */
+static int laststates_flash_isr_prepare(void)
+{
+    dwt_cyccnt_enable();
+
+    if (flash_wait_bsy_bounded(FLASH_PAGE_TIMEOUT_CYCLES) != 0) {
+        ls_lock_failures++;
+        return LASTSTATES_LOCK_FAILED;
+    }
+
+    /* BSY low proves the controller is idle *now*, not that FLASH->CR is
+     * clean. Clear every operation-select bit plus the page number, then the
+     * error latches, so the write below starts from a known state. */
+    CLEAR_BIT(FLASH->CR, (FLASH_CR_PG | FLASH_CR_FSTPG | FLASH_CR_PER |
+                          FLASH_CR_MER1 | FLASH_CR_MER2 | FLASH_CR_PNB));
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+    __DSB();
+
+    return LASTSTATES_LOCK_NOT_NEEDED;
 }
 
 int laststates_pool_lock(void)
 {
     if (__get_IPSR() != 0U) {
-        return 0;   /* fault / parity NMI path: log and reset, never block */
+        /* fault / parity NMI path: log and reset, never block */
+        return laststates_flash_isr_prepare();
+    }
+    /* "Is serialisation even possible?" comes BEFORE "can I serialise?".
+     * main() calls laststates_init() at main.c:172 and osKernelInitialize()
+     * only at main.c:212, so the whole window in between is provably
+     * single-threaded - and it carries exactly the boot forensics
+     * (sram2_parity_persist_boot_records(), mpu_fault_log_flush(),
+     * boot_crc_apply_policy()). Testing the degraded latch first refused those
+     * writes wholesale even though no mutex was needed, contradicting the
+     * contract in memory.h (Kilo #26). Concurrency starts with the scheduler,
+     * so the latch is only meaningful once it is running. */
+    if (osKernelGetState() != osKernelRunning) {
+        return LASTSTATES_LOCK_NOT_NEEDED;   /* boot is single-threaded */
+    }
+    if (ls_pool_lock_degraded != 0U) {
+        /* The mutex could not be created: serialisation is required (two
+         * tasks write this pool) and permanently unavailable. Fail safe. */
+        ls_lock_failures++;
+        return LASTSTATES_LOCK_FAILED;
     }
     if (ls_pool_mutex == NULL) {
-        return 0;   /* boot, before laststates_init(): single-threaded */
+        /* Scheduler running with no mutex and no degraded latch means
+         * laststates_init() never ran: both writers can be scheduled, so this
+         * is "required and unavailable" too - never a silent fail-open. */
+        ls_lock_failures++;
+        return LASTSTATES_LOCK_FAILED;
     }
-    if (osKernelGetState() != osKernelRunning) {
-        return 0;   /* scheduler not started yet: still single-threaded */
+    if (osMutexAcquire(ls_pool_mutex, osWaitForever) != osOK) {
+        ls_lock_failures++;
+        return LASTSTATES_LOCK_FAILED;
     }
-    return (osMutexAcquire(ls_pool_mutex, osWaitForever) == osOK) ? 1 : 0;
+    return LASTSTATES_LOCK_HELD;
 }
 
 void laststates_pool_unlock(int held)
 {
-    if (held != 0) {
+    if (held == LASTSTATES_LOCK_HELD) {
         (void)osMutexRelease(ls_pool_mutex);
     }
 }
 
 #else  /* host unit-test build: single-threaded, no RTOS */
 
+/* Forced result, so the LASTSTATES_LOCK_FAILED refusal path is reachable from
+ * a test (there is no CMSIS-RTOS2 and no __get_IPSR() on the host). */
+static int ls_host_lock_result = LASTSTATES_LOCK_NOT_NEEDED;
+
+void laststates_pool_lock_set_result_for_test(int result)
+{
+    ls_host_lock_result = result;
+}
+
 static void laststates_pool_lock_create(void) { }
-int  laststates_pool_lock(void)          { return 0; }
+int  laststates_pool_lock(void)          { return ls_host_lock_result; }
 void laststates_pool_unlock(int held)    { (void)held; }
 
 #endif /* HOST_UNIT_TEST */
@@ -725,6 +838,17 @@ int laststates_write(const laststates_entry_t *entry)
        CRITICAL). Every exit path below must release it. */
     const int lock_held = laststates_pool_lock();
 
+    /* Serialisation required but unavailable (mutex creation or acquire
+       failed, or the exception path found the Flash controller wedged): refuse
+       WITHOUT touching Flash. Programming an unsynchronised pool risks a torn
+       128-byte entry, which destroys forensic history that is already there -
+       strictly worse than losing this one record. Count the loss so ground can
+       see it instead of inferring it from a gap (Kilo #21). */
+    if (lock_held == LASTSTATES_LOCK_FAILED) {
+        ls_dropped_records++;
+        return -1;
+    }
+
     /* Bounds guard: the cursor is always in range after init, but never trust
        a cached index against corruption. */
     if (ls_mirror.idx >= LASTSTATES_MAX_ENTRIES) {
@@ -780,6 +904,24 @@ int laststates_write(const laststates_entry_t *entry)
     return 0;
 }
 
+/* Pool lock for a READER.
+ *
+ * Same mutual exclusion as laststates_pool_lock(), minus the exception-path
+ * Flash-controller take-over: a reader programs nothing, so sanitising
+ * FLASH->CR on its behalf would corrupt an in-flight write instead of
+ * protecting one. From an exception there is also nothing to exclude - the
+ * handler resets - so the read simply runs unlocked and relies on the hard
+ * copy bound below. */
+static int laststates_reader_lock(void)
+{
+#ifndef HOST_UNIT_TEST
+    if (__get_IPSR() != 0U) {
+        return LASTSTATES_LOCK_NOT_NEEDED;
+    }
+#endif
+    return laststates_pool_lock();
+}
+
 int laststates_dump_all(uint8_t *out, size_t *len)
 {
     if (out == NULL || len == NULL) return -1;
@@ -791,6 +933,17 @@ int laststates_dump_all(uint8_t *out, size_t *len)
      * NASA-STD-8739.8 buffer-overrun class). */
     size_t   capacity = *len;
     uint32_t needed   = 0U;
+    uint32_t valid    = 0U;
+
+    /* Hold the pool lock across BOTH passes. laststates_write() and
+     * dual_bank.c:ls_append() seal a record with a single double-word program
+     * (see slot_is_complete()), so without the lock a record can become
+     * complete between the counting pass and the copying pass and the memcpy
+     * would run one entry past the capacity that was just checked (Kilo #26).
+     * A failed lock is NOT fatal for a reader - it cannot corrupt Flash - so
+     * the dump proceeds, and the `valid < needed` bound below keeps it inside
+     * the caller's buffer in every case. */
+    const int lock_held = laststates_reader_lock();
 
     for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
         if (slot_is_complete(i)) {
@@ -799,14 +952,17 @@ int laststates_dump_all(uint8_t *out, size_t *len)
     }
     if ((size_t)needed * LASTSTATES_ENTRY_SIZE > capacity) {
         *len = (size_t)needed * LASTSTATES_ENTRY_SIZE;   /* required, nothing copied */
+        laststates_pool_unlock(lock_held);
         return -1;
     }
 
     /* Scan the whole pool: because page recycling can leave gaps, valid
      * records are not necessarily a contiguous prefix. Copy every valid slot
      * in index order so ground can reconstruct the trail by timestamp. */
-    uint32_t valid = 0U;
     for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
+        if (valid >= needed) {
+            break;      /* hard bound: never copy past the checked capacity */
+        }
         if (slot_is_complete(i)) {
             memcpy(out + valid * LASTSTATES_ENTRY_SIZE,
                    (const uint8_t *)(LASTSTATES_FLASH_BASE + (uintptr_t)i * LASTSTATES_ENTRY_SIZE),
@@ -815,6 +971,7 @@ int laststates_dump_all(uint8_t *out, size_t *len)
         }
     }
     *len = valid * LASTSTATES_ENTRY_SIZE;
+    laststates_pool_unlock(lock_held);
     return 0;
 }
 

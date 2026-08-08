@@ -46,6 +46,7 @@
 
 #include "memory.h"      /* laststates_write()   */
 #include "obsw_types.h"  /* laststates_entry_t   */
+#include "faults.h"      /* fault_dwt_enable()   */
 
 /* Private define ------------------------------------------------------------*/
 
@@ -262,6 +263,14 @@ void mpu_init(void)
 
   s_mpu_ready = 0U;
   s_kernel_guard_installed = 0U;
+
+  /* Start the DWT cycle counter here, at the very first call in main(), so a
+     fault taken before HAL_Init() has a timestamp source that is already
+     running. Enabling it inside the fault handler and reading it six cycles
+     later returned 0 (Kilo #26, comment id 3741110984); starting it here is
+     also what makes the record's DWT epoch mean "ms since the start of
+     main()". Idempotent and register-only - safe before any clock setup. */
+  fault_dwt_enable();
 
   /* Make sure every outstanding memory access completes under the old
      configuration before the MPU is touched. */
