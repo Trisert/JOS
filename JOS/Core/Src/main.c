@@ -29,6 +29,7 @@
 #include "memory.h"
 #include "comms.h"
 #include "faults.h"
+#include "mpu.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -96,7 +97,9 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  /* W2-1: lock down memory before anything else runs — kernel/task
+     isolation and no-execute SRAM (NASA-PoT #4, JPL-182). */
+  mpu_init();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -141,6 +144,12 @@ int main(void)
   fram_init();
   cyclic_buffer_init();
   laststates_init();
+
+  /* W2-1: if the previous run died on an MPU violation, the staged fault
+     record is persisted here, at task level, where flash programming is
+     bounded — never from the MemManage handler itself. Done before the boot
+     CRC policy below, which may reset and never return. */
+  (void)mpu_fault_log_flush();
 
   /* Act on the integrity result now that the fault can be persisted.
      BOOT_CRC_FATAL (=1 by default, see App/obsw/boot_crc.h): the fault is

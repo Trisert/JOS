@@ -45,6 +45,12 @@
 
 /* USER CODE BEGIN Includes */
 /* Section where include file can be added */
+/* W2-1 (MPU task isolation): the context-switch hook below calls into
+   Core/Src/mpu.c. The prototype is declared here rather than including
+   "mpu.h" so this config header keeps working from every build unit. */
+#if defined(__ICCARM__) || defined(__CC_ARM) || defined(__GNUC__)
+  void mpu_task_stack_guard_set(const void *stack_base);
+#endif
 /* USER CODE END Includes */
 
 /* Ensure definitions are only used by the compiler, and not by the assembler. */
@@ -171,6 +177,15 @@ standard names. */
 
 /* USER CODE BEGIN Defines */
 /* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */
+
+/* W2-1 — per-task MPU stack isolation.
+   On every context switch, move the MPU guard band onto the low end of
+   the incoming task's stack. A task that overruns its stack then faults
+   on its own write instead of corrupting a neighbouring task stack, a
+   TCB or the kernel heap. The band is read-only, so the
+   configCHECK_FOR_STACK_OVERFLOW==2 pattern *reads* still work.
+   Expanded inside tasks.c only, where pxCurrentTCB is in scope. */
+#define traceTASK_SWITCHED_IN()   mpu_task_stack_guard_set( pxCurrentTCB->pxStack )
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */
