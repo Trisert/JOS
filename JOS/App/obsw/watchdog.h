@@ -17,6 +17,6 @@ int watchdog_register_task(osThreadId_t handle, uint32_t expected_period_ms);
 osThreadId_t watchdog_task_create(void);
 
 /* Called by monitored tasks to signal liveness */
-void watchdog_alive(osThreadId_t handle);
+void watchdog_alive(const osThreadId_t handle);
 
 #endif /* WATCHDOG_H */

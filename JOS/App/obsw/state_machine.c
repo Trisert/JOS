@@ -1,4 +1,5 @@
 #include "state_machine.h"
+#include "memory.h"        /* laststates_write(): LastStates pool API */
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"

@@ -46,7 +46,11 @@ int watchdog_register_task(osThreadId_t handle, uint32_t expected_period_ms)
     return -1;  /* no slots */
 }
 
-void watchdog_alive(osThreadId_t handle)
+/* `handle` is only compared against the registered handles, never dereferenced
+ * or reassigned, so it is declared const (cppcheck constParameter). The
+ * top-level const does not change the function type, so the prototype in
+ * watchdog.h stays ABI-compatible. */
+void watchdog_alive(const osThreadId_t handle)
 {
     osMutexAcquire(wdg_mutex, osWaitForever);
     for (int i = 0; i < WDG_MAX_TASKS; i++) {
