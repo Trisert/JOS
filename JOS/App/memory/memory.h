@@ -19,7 +19,28 @@ uint32_t cyclic_buffer_head(void);
 /* ---------- LastStates pool (internal Flash) ---------- */
 void     laststates_init(void);
 int      laststates_write(const laststates_entry_t *entry);
+
+/* Dump every COMPLETE record in the pool into `out`.
+ *
+ * `len` is an in/out parameter and carries the buffer SIZE - the function has
+ * no other way to know how much of `out` it may touch:
+ *   in : capacity of `out` in bytes (0 is legal and means "tell me the size").
+ *   out: on success, the number of bytes written (0 .. 8192);
+ *        on failure with -1 and a non-NULL `len`, the number of bytes the
+ *        caller must provide, so a retry can size the buffer exactly.
+ *
+ * A buffer smaller than the required size is REFUSED (-1) and nothing is
+ * copied - a full pool is 64 x 128 B = 8 KB, which silently overrunning a
+ * caller stack frame would be the classic buffer-overflow defect
+ * (NASA-STD-8739.8). Records torn by a reset mid-write are skipped, not
+ * reported.
+ *
+ * Returns 0 on success, -1 on a NULL argument or an undersized buffer. */
 int      laststates_dump_all(uint8_t *out, size_t *len);
+
+/* Number of complete records currently held in the pool (0 .. 64). Rescans
+   Flash, so it is also the required capacity of laststates_dump_all() divided
+   by LASTSTATES_ENTRY_SIZE. */
 uint32_t laststates_count(void);
 
 /* ---------- LastStates pool lock (W2-2 review, CRITICAL) ----------
@@ -71,5 +92,13 @@ typedef struct {
 
 /* Address and size of that structure, for seu_mitigation_register_region(). */
 void *laststates_mirror_region(size_t *len);
+
+#ifdef HOST_UNIT_TEST
+/* Host-test-only: does the Flash page-erase bounds guard accept this address?
+   Exposed so the guard that keeps a stray erase away from the vector table and
+   the dual-bank golden image can be unit-tested directly. Not compiled into
+   the flight image. */
+int laststates_erase_addr_allowed(uintptr_t addr);
+#endif
 
 #endif /* MEMORY_H */

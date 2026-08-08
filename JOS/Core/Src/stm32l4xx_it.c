@@ -170,8 +170,34 @@ void DebugMon_Handler(void)
 void SysTick_Handler(void)
 {
   /* USER CODE BEGIN SysTick_IRQn 0 */
+  /* The generated body of this handler was EMPTY, which broke two things at
+     once (Kilo review of PR #9, finding C5):
 
+       1. HAL_IncTick() was never called, so uwTick stayed 0 forever.
+          HAL_GetTick() therefore returned 0 to every caller, which means
+          every LastStates / fault / boot-CRC / SEU record was stamped with
+          timestamp 0 and ground could not order the post-mortem trail at
+          all. Any HAL_Delay() or HAL *_Timeout path would also have hung.
+       2. xPortSysTickHandler() was never called either. FreeRTOSConfig.h
+          sets USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION 1, which switches
+          OFF the SysTick_Handler that cmsis_os2.c would otherwise provide,
+          so this function is the ONLY tick source of the RTOS: without it
+          vTaskDelay()/osDelay() never return and time slicing never runs.
+
+     The scheduler-state guard is required because SysTick is already running
+     between HAL_Init() and osKernelStart(): calling the FreeRTOS tick hook
+     before the scheduler exists corrupts the (not yet initialised) task
+     lists. */
   /* USER CODE END SysTick_IRQn 0 */
+  HAL_IncTick();
+#if (INCLUDE_xTaskGetSchedulerState == 1)
+  if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
+  {
+#endif /* INCLUDE_xTaskGetSchedulerState */
+    xPortSysTickHandler();
+#if (INCLUDE_xTaskGetSchedulerState == 1)
+  }
+#endif /* INCLUDE_xTaskGetSchedulerState */
   /* USER CODE BEGIN SysTick_IRQn 1 */
 
   /* USER CODE END SysTick_IRQn 1 */
