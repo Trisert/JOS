@@ -225,15 +225,33 @@ static int try_transition(obw_state_t target, uint8_t trigger)
    established, accompanied by a very well documented flag saying we intended
    otherwise. The LastStates record is best effort; the containment is not, so
    force the state through the SEU pair when the recorded transition does not
-   take. */
-static void enter_safe_state(uint8_t trigger)
+   take.
+
+   The RESULT is reported to the caller (Kilo #26, roast 8). While this
+   returned void, "CRIT entered and the transition is in the LastStates trail"
+   and "CRIT forced by hand because laststates_log() failed" were the same
+   answer, and the only consumer - the acknowledgement of the reset-stable
+   SRAM2 boot-fault flag - therefore cleared the finding in both cases. That
+   is the fail-OPEN direction on the one flag whose whole job is to survive a
+   reset: the record never landed, the flag was gone, so the next boot came up
+   nominal with no trace on the ground of either the finding or the safe state
+   it was supposed to force. */
+#define SAFE_STATE_RECORDED   (0)   /* in CRIT, and the record landed        */
+#define SAFE_STATE_FORCED    (-1)   /* in CRIT, but nothing was persisted    */
+
+static int enter_safe_state(uint8_t trigger)
 {
-    if (try_transition(STATE_CRIT, trigger) != 0) {
-        seu_mitigation_lock();
-        obsw_state.current_state = STATE_CRIT;
-        (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
-        seu_mitigation_unlock();
+    if (try_transition(STATE_CRIT, trigger) == 0) {
+        return SAFE_STATE_RECORDED;
     }
+
+    seu_mitigation_lock();
+    obsw_state.current_state = STATE_CRIT;
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+    seu_mitigation_unlock();
+
+    /* Containment is in force either way - only the evidence is missing. */
+    return SAFE_STATE_FORCED;
 }
 
 /* ---------- Autonomous battery check ---------- */
@@ -255,6 +273,13 @@ static void check_battery_autonomous(void)
 /* ---------- Main task loop ---------- */
 static void state_machine_task(void *arg)
 {
+    /* Outcome of the parity safe-state entry, consumed by the acknowledgement
+       below (Kilo #26, roast 8). "_entered" records that the parity branch is
+       the one that ran at all - the boot-CRC branch takes priority and enters
+       CRIT under a different trigger. */
+    int parity_safe_entered = 0;
+    int parity_safe_rc = SAFE_STATE_FORCED;
+
     (void)arg;
 
     /* Boot sequence: s0 → s1 → s3 */
@@ -281,26 +306,47 @@ static void state_machine_task(void *arg)
     if (boot_crc_image_trusted() == 0) {
         /* Image integrity fault survived the reset budget: enter the safe
            state instead of nominal ops (beacon-only, payloads inhibited). */
-        enter_safe_state(TRIGGER_IMAGE_CRC_FAIL);
+        (void)enter_safe_state(TRIGGER_IMAGE_CRC_FAIL);
     } else if (parity_safe_latched != 0U) {
         /* SRAM2 reported a parity finding, or the boot erase never completed:
            come up in the safe state, not in READY on data whose integrity is
            not established. */
-        enter_safe_state(TRIGGER_SRAM2_PARITY);
+        parity_safe_rc = enter_safe_state(TRIGGER_SRAM2_PARITY);
+        parity_safe_entered = 1;
     } else {
         try_transition(STATE_READY, TRIGGER_ANTENNA_DONE);
     }
 
     if (parity_safe_latched != 0U) {
-        /* The OBSW is now in STATE_CRIT (enter_safe_state() forces it if the
-           recorded transition failed), so the reset-stable half of the flag
-           has done its job and can be released. Releasing it only HERE - and
+        /* Release the reset-stable half of the finding ONLY when the safe
+           state was entered *under the parity trigger* and the transition
+           actually reached the LastStates pool. Releasing it only HERE - and
            not in sram2_parity_init() - is what makes the evidence survive
            dual_bank_init()'s OB_Launch, boot_crc_apply_policy()'s reset
            budget and any fault handler in between (Kilo #23, id 3740885202).
-           parity_safe_latched stays set for this run, so the confinement in
-           try_transition() outlives the acknowledgement. */
-        sram2_parity_boot_fault_ack();
+           parity_safe_latched stays set for this run either way, so the
+           confinement in try_transition() outlives the acknowledgement.
+
+           The two conditions below are the roast-8 fix (Kilo #26). The old
+           code acked unconditionally, on the strength of a void-returning
+           enter_safe_state():
+
+           - SAFE_STATE_FORCED means laststates_log() failed, so CRIT was
+             forced by hand and NOTHING was persisted. Clearing the only
+             reset-surviving copy of the finding at that point erases the last
+             trace of it: the next boot comes up nominal, on memory whose
+             integrity was never re-established, with an empty trail. Keeping
+             the flag makes the next boot re-derive the confinement and leaves
+             the finding on the telemetry stream - fail-closed, which is the
+             only acceptable direction for a safety latch.
+           - parity_safe_entered == 0 means the boot-CRC branch above won the
+             race and CRIT was recorded under TRIGGER_IMAGE_CRC_FAIL. The
+             parity finding then has no record of its own anywhere, so it has
+             not been "handled" and must not be retired either. That boot is
+             heading for boot_crc_apply_policy()'s reset budget anyway. */
+        if ((parity_safe_entered != 0) && (parity_safe_rc == SAFE_STATE_RECORDED)) {
+            sram2_parity_boot_fault_ack();
+        }
     }
 
     osMutexRelease(state_mutex);

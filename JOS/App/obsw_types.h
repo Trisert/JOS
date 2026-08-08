@@ -59,6 +59,12 @@ enum {
        telemetry contract, so existing codes are never renumbered. */
     TRIGGER_BOOT_FAULT      = 14,  /* HardFault/NMI during early boot */
     TRIGGER_BOOT_OK         = 15,  /* boot reached the scheduler      */
+    /* RCC clock security system: the HSE oscillator failed and the hardware
+       fell back to HSI16. Its own code because routing it through
+       TRIGGER_SRAM2_PARITY made a dead crystal look like a memory fault to
+       ground (Kilo #26, comment id 3741110986). Next free value; the wire
+       values above are never renumbered. */
+    TRIGGER_CLOCK_FAULT     = 16,  /* RCC CSS: HSE/oscillator failure  */
 };
 
 /* ---------- BMS interface (stub for now) ---------- */

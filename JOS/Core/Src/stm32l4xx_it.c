@@ -120,10 +120,22 @@ void NMI_Handler(void)
        DUAL_BANK_BOOT_FAULT_THRESHOLD of them and then swap to the golden
        image on self-manufactured evidence, i.e. the very loop this
        discrimination exists to kill (Kilo #21, comment id 3740842361).
-       sram2_parity_nmi_handler() already knows this case: it records
-       SRAM2_EVENT_OTHER_NMI (explicitly NOT a parity fault, so the safe
-       state is not forced), clears CSSF and resets. */
-    sram2_parity_nmi_handler();
+       Handing it to sram2_parity_nmi_handler() was still wrong, though: that
+       module hard-codes TRIGGER_SRAM2_PARITY on the entry and bumps
+       sram2_parity_events, which seu_mitigation.c publishes as
+       parity_events_boot - so the record landed filed under "SRAM2 parity"
+       with an inflated RAM-health counter and ground diagnosed memory
+       degradation for an HSE failure. It also reset on every pass, and a
+       PERMANENT crystal failure has no reset budget, so it would reboot
+       forever and program the LastStates trail away (Kilo #26, comment
+       id 3741110986).
+
+       sram2_clock_fault_nmi_handler() records under TRIGGER_CLOCK_FAULT with
+       its own bounded budget, touches none of the parity counters and RETURNS:
+       the hardware has already switched the system clock to HSI16, so the
+       OBSW keeps running on the fallback instead of looping through reset. */
+    sram2_clock_fault_nmi_handler();
+    return;
   }
   else
   {
