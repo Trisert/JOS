@@ -155,8 +155,33 @@ static void sim_process_task(void *arg)
             case SIM_CMD_LORA_RX_COMMAND: {
                 sim_lora_cmd_t *cmd = (sim_lora_cmd_t *)(buf + sizeof(sim_header_t));
                 if (hdr->len >= 1) {
-                    comms_dispatch_command(cmd->cmd_id, cmd->payload, cmd->payload_len);
-                    ESP_LOGI(TAG, "LoRa cmd received: 0x%02x len=%u", cmd->cmd_id, cmd->payload_len);
+                    /* The dispatcher is private to comms.c — the simulated uplink
+                     * goes through the same validation gate as the flight RX path:
+                     * build the wire frame (opcode | len | payload | CRC-16) and
+                     * hand it to comms_rx_handle_frame(). Invalid frames are
+                     * counted and never dispatched. */
+                    if (cmd->payload_len > COMMS_TC_MAX_PAYLOAD) {
+                        ESP_LOGW(TAG, "LoRa cmd 0x%02x payload %u B > %u B — dropped",
+                                 cmd->cmd_id, cmd->payload_len,
+                                 (unsigned)COMMS_TC_MAX_PAYLOAD);
+                    } else {
+                        uint8_t frame[COMMS_TC_MAX_FRAME];
+                        size_t  n = (size_t)cmd->payload_len;
+
+                        frame[0] = cmd->cmd_id;
+                        frame[1] = cmd->payload_len;
+                        memcpy(&frame[COMMS_TC_HDR_LEN], cmd->payload, n);
+
+                        uint16_t crc = comms_crc16_ccitt(frame, n + COMMS_TC_HDR_LEN);
+                        frame[COMMS_TC_HDR_LEN + n]      = (uint8_t)(crc >> 8);
+                        frame[COMMS_TC_HDR_LEN + n + 1U] = (uint8_t)(crc & 0xFFU);
+
+                        comms_tc_result_t vr =
+                            comms_rx_handle_frame(frame, n + COMMS_TC_OVERHEAD);
+                        ESP_LOGI(TAG, "LoRa cmd received: 0x%02x len=%u -> %s",
+                                 cmd->cmd_id, cmd->payload_len,
+                                 comms_tc_result_str(vr));
+                    }
                 }
                 break;
             }
