@@ -174,6 +174,31 @@ _Static_assert(sizeof(sram2_parity_record_t) <=
    when that layout carried one) instead of calling it garbage. Bump
    SRAM2_STORE_VERSION on any future field change and teach the migration
    path about the layout it replaces. */
+
+/* The version word is itself one unprotected cell, so the LAYOUT DECISION may
+   never rest on it alone (Kilo #26, comment id 3741302888). Reading
+   "version != 2" as "older firmware" turned a single 2 -> 0 bit flip into a
+   view switch: the v1 struct has no version word, so every field slid by one
+   (v1.boot_fault read v2.version, v1.chk read v2.erase_busy_resets), a latched
+   boot fault was retired to 0 and the wedged-erase budget was re-armed - the
+   fail-OPEN direction, reached by exactly one upset, in the function that only
+   runs because the store is already damaged. Three things now stand in the way:
+
+     1. the word stores a COMPLEMENTARY PATTERN (SRAM2_STORE_VERSION_TAG), not
+        the small integer 2, so it sits 16 bits away from the 0/1 a v1
+        boot_fault holds in that cell, and it is read with a Hamming-distance
+        tolerance rather than ==;
+     2. a shredded version word is still read as THIS layout whenever the rest
+        of the payload checksums as this layout - the whole-store checksum
+        outvotes the single word;
+     3. the migration path additionally demands POSITIVE evidence of the old
+        layout (its checksum authenticates, or the v1 view is self-consistent).
+        Anything else is corruption of the current layout and belongs in the
+        salvage branch, where saturate-never-zero already lives.
+
+   And inside the migration the latch is resolved UPWARDS across both views, so
+   no reading of those bytes can retire a finding the other reading still
+   sees. */
 #define SRAM2_STORE_MAGIC       0x53324653U   /* "S2FS" */
 
 /* Layout id of sram2_fault_store_t. Version 1 is every pre-version layout
@@ -183,6 +208,20 @@ _Static_assert(sizeof(sram2_parity_record_t) <=
    below. */
 #define SRAM2_STORE_VERSION     2U
 
+/* What the version WORD actually holds: the layout id in the low half and its
+   one's complement in the high half. The point is Hamming distance - the cell
+   a v1 store keeps at this offset is its boot_fault (0 or 1), 16+ bits away
+   from this pattern, so no credible number of upsets can make a current store
+   look like an old one or the reverse. */
+#define SRAM2_STORE_VERSION_TAG \
+    ((uint32_t)(((uint32_t)SRAM2_STORE_VERSION << 16) | \
+                (uint32_t)((uint16_t)~(uint16_t)SRAM2_STORE_VERSION)))
+
+/* Flipped bits the version word may carry and still be read as this image's
+   layout. Four leaves ~12 bits of margin against the v1 pattern while
+   surviving a multi-bit upset in that single cell. */
+#define SRAM2_STORE_VERSION_SLACK  4
+
 /* Counter values above this are not credible for a single mission run, so a
    salvaged word beyond it is corruption rather than history. A uniformly
    random 32-bit word lands above it with probability ~0.99998. */
@@ -191,7 +230,7 @@ _Static_assert(sizeof(sram2_parity_record_t) <=
 typedef struct {
     uint32_t magic;             /* SRAM2_STORE_MAGIC                        */
     uint32_t magic_inv;         /* ~SRAM2_STORE_MAGIC                       */
-    uint32_t version;           /* SRAM2_STORE_VERSION: layout marker       */
+    uint32_t version;           /* SRAM2_STORE_VERSION_TAG: layout marker   */
     uint32_t boot_fault;        /* 1: last run ended on a parity finding    */
     uint32_t last_event;        /* SRAM2_EVENT_* of that finding            */
     uint32_t parity_resets;     /* parity-triggered resets since power-on   */
@@ -256,14 +295,48 @@ static uint8_t  sram2_region_usable = 1U;
 
 /* ---------- Helpers ---------- */
 
-static uint32_t sram2_store_checksum(void)
+/* The checksum of the current layout, computed against a CALLER-SUPPLIED
+   version word. Passing the canonical tag asks "would this payload check out
+   if the version cell were intact?", which is how a corrupted version word is
+   told apart from an older layout without trusting the cell itself. */
+static uint32_t sram2_store_checksum_of(uint32_t version_word)
 {
-    return sram2_store.version         ^ sram2_store.boot_fault ^
+    return version_word                ^ sram2_store.boot_fault ^
            sram2_store.last_event      ^ sram2_store.parity_resets ^
            sram2_store.dropped_records ^ sram2_store.erase_busy_resets ^
            sram2_store.clock_faults    ^ sram2_store.first_busy_scsr ^
            sram2_store.first_busy_cfgr2 ^
            SRAM2_STORE_MAGIC;
+}
+
+static uint32_t sram2_store_checksum(void)
+{
+    return sram2_store_checksum_of(sram2_store.version);
+}
+
+/* Does the version cell say "this image's layout"? Never a bare ==: the cell
+   is unprotected and the answer selects which struct the payload is read
+   through (Kilo #26, comment id 3741302888). Two independent ways to say yes,
+   either of which survives the loss of the other. */
+static int sram2_store_version_is_current(void)
+{
+    const uint32_t word = sram2_store.version;
+
+    /* 1. The tag itself, allowing for upsets in it. */
+    if (__builtin_popcount(word ^ SRAM2_STORE_VERSION_TAG) <=
+        SRAM2_STORE_VERSION_SLACK) {
+        return 1;
+    }
+
+    /* 2. The word can be shredded beyond recognition and the store still be
+       ours: if the payload checksums as the current layout once the canonical
+       tag is substituted, the ONLY damaged word is the version cell. Nine
+       words of corroboration outvote one. */
+    if (sram2_store.chk == sram2_store_checksum_of(SRAM2_STORE_VERSION_TAG)) {
+        return 1;
+    }
+
+    return 0;
 }
 
 /* The checksum formula of the version-1 layout (payload words only, no
@@ -293,7 +366,7 @@ static int sram2_store_is_valid(void)
 {
     return ((sram2_store.magic == SRAM2_STORE_MAGIC) &&
             (sram2_store.magic_inv == (uint32_t)~SRAM2_STORE_MAGIC) &&
-            (sram2_store.version == SRAM2_STORE_VERSION) &&
+            (sram2_store.version == SRAM2_STORE_VERSION_TAG) &&
             (sram2_store.chk == sram2_store_checksum())) ? 1 : 0;
 }
 
@@ -315,30 +388,58 @@ static void sram2_store_recover(void)
     if (sram2_store.magic_inv == (uint32_t)~SRAM2_STORE_MAGIC)   { magic_words++; }
 
     if (magic_words != 0) {
-        if (sram2_store.version != SRAM2_STORE_VERSION) {
+        /* POSITIVE evidence of the old layout, hoisted above the branch so it
+           can gate the view switch instead of merely decorating it (Kilo #26,
+           comment id 3741302888).
+
+           erase_busy_resets only exists in the 8-word shape of version 1; in
+           the original 6-word shape that word aliases unrelated .noinit
+           content, so it is carried over ONLY when the old checksum
+           authenticates it. Zeroing it there is not the evidence-deleting move
+           roast 3741110977 is about: the counter genuinely did not exist in
+           that layout, so there is no history to preserve and no budget being
+           re-armed by a corruption. */
+        const int v1_authentic =
+            (magic_words == 2) &&
+            (sram2_store_image.v1.chk == sram2_store_v1_checksum());
+
+        /* The checksum-less 6-word shape cannot authenticate itself, so it has
+           to look like itself instead: an old boot_fault is 0 or 1 (this is
+           the very cell the current layout keeps its version tag in, and that
+           tag is nowhere near 0/1), an old event id is one of the ids that
+           existed back then, and the counters are within the plausibility
+           bound. A current store whose version word was upset fails this on
+           the first term and stays where it belongs - the salvage branch. */
+        const int v1_self_consistent =
+            (sram2_store_image.v1.boot_fault <= 1U) &&
+            (sram2_store_image.v1.last_event <= (uint32_t)SRAM2_EVENT_STORE_LOST) &&
+            (sram2_store_image.v1.parity_resets   <= SRAM2_STORE_COUNT_SANE) &&
+            (sram2_store_image.v1.dropped_records <= SRAM2_STORE_COUNT_SANE);
+
+        /* Switch views only when the version cell does NOT claim this layout
+           AND the old layout proves itself. Two independent readings must
+           agree before the payload is reinterpreted one word out of phase. */
+        const int layout_is_v1 =
+            (sram2_store_version_is_current() == 0) &&
+            ((v1_authentic != 0) || (v1_self_consistent != 0));
+
+        if (layout_is_v1) {
             /* ---- Pre-version layout: a firmware update, not corruption ----
                The words are ours (magic) but they were written by an image
                whose struct was three fields shorter, so the current checksum
                could never match. Treating that as garbage silently dropped
                every counter on the first boot after every OTA - the "survives
                a reset" store not surviving a firmware update (Kilo #26,
-               comment id 3741226504). Migrate instead.
-
-               erase_busy_resets only exists in the 8-word shape of version 1;
-               in the original 6-word shape that word aliases unrelated
-               .noinit content, so it is carried over ONLY when the old
-               checksum authenticates it. Zeroing it there is not the
-               evidence-deleting move roast 3741110977 is about: the counter
-               genuinely did not exist in that layout, so there is no history
-               to preserve and no budget being re-armed by a corruption. */
-            const int v1_authentic =
-                (magic_words == 2) &&
-                (sram2_store_image.v1.chk == sram2_store_v1_checksum());
-
+               comment id 3741226504). Migrate instead. */
             resets  = sram2_store_image.v1.parity_resets;
             dropped = sram2_store_image.v1.dropped_records;
             event   = sram2_store_image.v1.last_event;
-            fault   = (sram2_store_image.v1.boot_fault != 0U) ? 1U : 0U;
+            /* Resolve the latch UPWARDS across BOTH readings of these bytes:
+               whichever view is the wrong one, a finding seen through either
+               of them is still a finding, and losing it is the fail-open
+               direction (Kilo #26, comment id 3741302888). */
+            fault   = ((sram2_store_image.v1.boot_fault != 0U) ||
+                       (sram2_store.boot_fault != 0U)) ? 1U : 0U;
             busy    = (v1_authentic != 0)
                           ? sram2_store_image.v1.erase_busy_resets : 0U;
             /* clock_faults / first_busy_* had no equivalent in version 1. */
@@ -434,7 +535,7 @@ static void sram2_store_recover(void)
     /* Field-wise, not memset(): the object is volatile. */
     sram2_store.magic             = SRAM2_STORE_MAGIC;
     sram2_store.magic_inv         = (uint32_t)~SRAM2_STORE_MAGIC;
-    sram2_store.version           = SRAM2_STORE_VERSION;
+    sram2_store.version           = SRAM2_STORE_VERSION_TAG;
     sram2_store.boot_fault        = fault;
     sram2_store.last_event        = event;
     sram2_store.parity_resets     = resets;
