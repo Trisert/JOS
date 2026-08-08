@@ -93,6 +93,47 @@ static void fault_reset_now(void)
     }
 }
 
+/* ---------- Timestamp source for a fault record (finding C5) ----------
+ *
+ * The records used to be stamped with a bare HAL_GetTick() while nothing in
+ * the image ever incremented uwTick: SysTick_Handler() in stm32l4xx_it.c was
+ * empty and HAL_IncTick() had no callers, so EVERY record - fault, boot CRC,
+ * SEU, dual bank - carried timestamp 0 and the post-mortem trail could not be
+ * ordered at all. SysTick_Handler() now calls HAL_IncTick() (and the FreeRTOS
+ * tick hook), so HAL_GetTick() is a real millisecond counter.
+ *
+ * A fault handler still cannot rely on it alone: a fault taken before
+ * HAL_Init() (MPU setup, clock configuration, boot-CRC verification) sees
+ * uwTick == 0. In that window the DWT cycle counter is used instead - it is
+ * CPU-clock based, keeps running with interrupts masked, and converted to
+ * milliseconds it is the same physical quantity ("ms since reset"), so ground
+ * needs no special case to order the records. */
+static uint32_t fault_timestamp_ms(void)
+{
+    uint32_t tick = HAL_GetTick();
+    uint32_t cycles_per_ms;
+
+    if (tick != 0U) {
+        return tick;
+    }
+
+    /* Pre-tick: derive the timestamp from the cycle counter, enabling it if
+       the debug unit left it off. */
+    if ((CoreDebug->DEMCR & CoreDebug_DEMCR_TRCENA_Msk) == 0U) {
+        CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    }
+    if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0U) {
+        DWT->CYCCNT = 0U;
+        DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+    }
+
+    cycles_per_ms = SystemCoreClock / 1000U;
+    if (cycles_per_ms == 0U) {          /* never on this part; no div-by-zero */
+        return 0U;
+    }
+    return DWT->CYCCNT / cycles_per_ms;
+}
+
 static int fault_frame_is_readable(const uint32_t *frame)
 {
     uint32_t addr = (uint32_t)frame;
@@ -135,7 +176,7 @@ static void fault_persist(const fault_record_t *rec, uint8_t trigger)
     laststates_entry_t entry;
 
     memset(&entry, 0, sizeof(entry));
-    entry.timestamp  = HAL_GetTick();
+    entry.timestamp  = fault_timestamp_ms();
     entry.state_from = FAULT_STATE_UNKNOWN;
     entry.state_to   = FAULT_STATE_UNKNOWN;
     entry.trigger    = trigger;

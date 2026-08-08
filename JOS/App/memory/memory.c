@@ -22,32 +22,48 @@
 
 /* ========== FRAM driver (I2C) ==========
  * Per RED_DES_ElectronicArchitecture_V1:
- *   4x FM24VN10-G (1 Mbit each, I2C interface) = 4 Mbit total.
- *   All four FM24VN10-G devices are on the OBC PCB.
+ *   4x FM24VN10-G on the OBC PCB, on I2C2.
  *
- * I2C addresses: 0x50, 0x51, 0x52, 0x53 (A0/A1 pins select chip).
- * Each chip: 128 Kbit = 16 KB address space.
- * Total: 4 x 16 KB = 64 KB.
+ * Device-select (7-bit) addresses: 0x50, 0x51, 0x52, 0x53 (A0/A1 pins).
+ * The driver addresses ONE 16 KB window per device select, using the 16-bit
+ * memory-address transfer of HAL_I2C_Mem_Read/Write:
  *
- * FM24VN_CHIP_SIZE (16 * 1024 B) is a power of two, so the address decode uses
- * shift/mask instead of division/modulo. This removes the only runtime
- * divisions in the memory module and therefore the divide-by-zero class
- * entirely (review M1).
+ *   FM24VN_CHIP_SIZE = 16 * 1024 B  = 16 KB  per device select
+ *   FRAM_SIZE        = 4 * 16 KB    = 64 KB  usable, and 64 KB is the number
+ *                                            the ICD, the cyclic buffer and
+ *                                            the unit tests all agree on.
+ *
+ * DO NOT write `#define FM24VN_CHIP_SIZE 16`: that is a byte count, not a
+ * kilobyte count, and it collapses FRAM_SIZE from 65536 to 64 bytes. Every
+ * fram_read()/fram_write()/cyclic_buffer_*() bound check below is expressed
+ * against FRAM_SIZE, so the whole FRAM would silently shrink to 64 usable
+ * bytes and every telemetry record past the first would be rejected with -1
+ * (Kilo review of PR #9, finding C1). The _Static_assert on FRAM_SIZE below
+ * turns that typo into a compile error instead of a silent loss of storage.
+ *
+ * FM24VN_CHIP_SIZE is a power of two, so the address decode uses shift/mask
+ * instead of division/modulo. This removes the only runtime divisions in the
+ * memory module and therefore the divide-by-zero class entirely (review M1).
  */
 
 #define FM24VN_I2C_ADDR_BASE  0x50
 #define FM24VN_PAGE_SIZE      16
-#define FM24VN_CHIP_SIZE      (16U * 1024U)
+#define FM24VN_CHIP_SIZE      (16UL * 1024UL)
 #define FM24VN_CHIP_SIZE_LOG2 14U    /* 16 KB = 2^14 */
 #define FM24VN_NUM_CHIPS      4
 #define FRAM_SIZE             (FM24VN_NUM_CHIPS * FM24VN_CHIP_SIZE)
 
-/* Compile-time guard: a zero (or non-power-of-two) chip size would make the
+/* Compile-time guards: a zero (or non-power-of-two) chip size would make the
  * shift/mask decode below wrong and is the divide-by-zero class M1 guards
- * against. */
+ * against; the size/geometry asserts pin the 64 KB total from the ICD so a
+ * mistyped literal cannot silently shrink the store (finding C1). */
 _Static_assert(FM24VN_CHIP_SIZE > 0U, "FM24VN_CHIP_SIZE must be > 0");
 _Static_assert((FM24VN_CHIP_SIZE & (FM24VN_CHIP_SIZE - 1U)) == 0U,
                "FM24VN_CHIP_SIZE must be a power of two");
+_Static_assert(FM24VN_CHIP_SIZE == (1UL << FM24VN_CHIP_SIZE_LOG2),
+               "FM24VN_CHIP_SIZE_LOG2 must match FM24VN_CHIP_SIZE");
+_Static_assert(FRAM_SIZE == (64UL * 1024UL),
+               "FRAM_SIZE must be 64 KB (4 x 16 KB) per RED_DES_ElectronicArchitecture_V1");
 
 extern I2C_HandleTypeDef hi2c2;
 
@@ -151,6 +167,13 @@ uint32_t cyclic_buffer_head(void)
  * erased, the pool is not always a contiguous run of valid records. Post-mortem
  * readback (laststates_dump_all / laststates_count) therefore scans the WHOLE
  * pool for valid slots rather than trusting a cached count.
+ *
+ * "Valid" means WRITTEN TO COMPLETION, not merely "not erased": a reset in the
+ * middle of the 16 double-word programming sequence leaves a torn record whose
+ * timestamp/trigger bytes are present but whose payload is still 0xFF. Such a
+ * slot is neither free (it cannot be re-programmed) nor reportable, so
+ * slot_is_erased()/slot_is_complete() below distinguish the three states and
+ * the readback path only ever returns complete records (finding C4).
  */
 
 #ifdef HOST_UNIT_TEST
@@ -175,10 +198,16 @@ extern uintptr_t flash_base;
                                 (uintptr_t)LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE)
 #define LS_PAGE_SHIFT          11U   /* STM32L4 Flash page = 2 KB = 2^11 (HAL FLASH_PAGE_SIZE) */
 
-/* A freshly-erased Flash double-word reads as all ones; a programmed slot is
- * never all-ones (the trigger byte is always a small enum value), so testing
- * the first double-word reliably distinguishes a free slot from a valid one. */
+/* A freshly-erased Flash double-word reads as all ones. */
 #define SLOT_ERASED_DWORD      0xFFFFFFFFFFFFFFFFULL
+
+/* Number of 64-bit programming units in one record. The STM32L4 Flash word is
+ * a double word, so this is also the number of individually-committed writes
+ * laststates_write() performs, i.e. the granularity at which a reset can tear
+ * a record in half. */
+#define LASTSTATES_ENTRY_DWORDS  ((uint32_t)(LASTSTATES_ENTRY_SIZE / 8U))
+_Static_assert((LASTSTATES_ENTRY_SIZE % 8U) == 0U,
+               "LastStates entry must be a whole number of Flash double words");
 
 /* Compile-time guards tying the ring to the dual-bank pool description, so the
    two writers of this pool (here and Core/Src/dual_bank.c) can never drift
@@ -240,12 +269,101 @@ _Static_assert((FLASH_PAGE_SIZE & (FLASH_PAGE_SIZE - 1U)) == 0U,
 #define FLASH_DWORD_TIMEOUT_CYCLES   0x20000U   /* ~1.6 ms @ 80 MHz, >> 100 us nominal */
 #define FLASH_PAGE_TIMEOUT_CYCLES    0x400000U  /* ~52 ms @ 80 MHz, >> 22 ms nominal   */
 
+static const volatile uint64_t *slot_dwords(uint32_t idx)
+{
+    return (const volatile uint64_t *)(LASTSTATES_FLASH_BASE +
+                                       (uintptr_t)idx * LASTSTATES_ENTRY_SIZE);
+}
+
+/* TRUE only when the WHOLE slot is still erased, i.e. it can be programmed.
+ *
+ * The previous implementation tested the first double word only. That is not
+ * enough in either direction: a record torn by a reset mid-write (dword 0
+ * programmed, tail still 0xFF) was reported as a complete, valid record, and
+ * the ring bookkeeping could hand a partially-programmed slot back to
+ * flash_write_row(), where re-programming a non-erased double word fails with
+ * PROGERR and kills every later write (Kilo review of PR #9, finding C4).
+ * Scanning all 16 double words costs 16 Flash reads on a free slot and exits
+ * on the first word for an occupied one, which is the common case. */
 static int slot_is_erased(uint32_t idx)
 {
-    const uint64_t *d = (const uint64_t *)(LASTSTATES_FLASH_BASE +
-                                           (uintptr_t)idx * LASTSTATES_ENTRY_SIZE);
-    return (*d == SLOT_ERASED_DWORD) ? 1 : 0;
+    const volatile uint64_t *d = slot_dwords(idx);
+
+    for (uint32_t i = 0U; i < LASTSTATES_ENTRY_DWORDS; i++) {
+        if (d[i] != SLOT_ERASED_DWORD) {
+            return 0;
+        }
+    }
+    return 1;
 }
+
+/* TRUE when the slot holds a record that was written to completion.
+ *
+ * flash_write_row() programs strictly in ascending address order and each
+ * double word is committed by the Flash controller before the next one is
+ * started, so the LAST double word can only be programmed after every earlier
+ * one. Seeing it programmed therefore proves the full 128 B landed; seeing it
+ * erased while dword 0 is programmed is exactly the torn-write signature of a
+ * reset (or a bounded-wait timeout) in the middle of laststates_write().
+ * Torn records are skipped by laststates_count()/laststates_dump_all(), so
+ * ground never reconstructs a timeline from a half-record whose timestamp and
+ * trigger bytes are meaningless.
+ *
+ * The last double word covers context[110..115] plus the two structure
+ * padding bytes, and every writer of this pool (laststates_write() callers,
+ * Core/Src/dual_bank.c, Core/Src/sram2_parity.c, App/obsw/boot_crc.c)
+ * memset()s the entry to zero first, so a complete record can never read back
+ * as all-ones there.
+ *
+ * KNOWN LIMITATION (documented deliberately, not an oversight): this is a
+ * write-COMPLETION check, not an integrity check. The 128 B entry layout is a
+ * frozen ground ICD with no CRC field, so a single-event upset that flips a
+ * bit inside an otherwise complete record is still reported as valid. Adding a
+ * per-record CRC requires an ICD change (a CRC over bytes 0..123 stored in the
+ * currently-unused tail) and is tracked as a separate work package; the SEU
+ * scrubber (W2-5) covers the RAM bookkeeping mirror only, never the Flash
+ * records. */
+static int slot_is_complete(uint32_t idx)
+{
+    const volatile uint64_t *d = slot_dwords(idx);
+
+    return ((d[0] != SLOT_ERASED_DWORD) &&
+            (d[LASTSTATES_ENTRY_DWORDS - 1U] != SLOT_ERASED_DWORD)) ? 1 : 0;
+}
+
+/* Erase bounds guard (finding C2), shared by the host and the target erase
+ * paths so the two can never diverge.
+ *
+ * A page erase is the single most destructive operation this module can
+ * perform: the target path drives FLASH->CR directly, so a corrupted cursor
+ * or a bogus caller address would happily erase the vector table, the active
+ * application image or the dual-bank golden image. Accept an address only if
+ * it is page-aligned AND the whole 2 KB page it starts is inside the
+ * LastStates pool [LASTSTATES_FLASH_BASE, LASTSTATES_FLASH_END). */
+static int flash_page_in_pool(uintptr_t addr)
+{
+    const uintptr_t page_mask = ((uintptr_t)1U << LS_PAGE_SHIFT) - 1U;
+
+    if (addr < LASTSTATES_FLASH_BASE)  { return 0; }
+    if (addr >= LASTSTATES_FLASH_END)  { return 0; }
+    /* Alignment is checked RELATIVE to the pool base (which is itself page
+     * aligned: _Static_assert above on the target, mmap granularity on the
+     * host). Together with the pool being a whole number of pages - also
+     * static-asserted - an aligned address below the end always has its whole
+     * page inside the pool, so no separate end-overlap test is needed. */
+    if (((addr - LASTSTATES_FLASH_BASE) & page_mask) != 0U) { return 0; }
+    return 1;
+}
+
+#ifdef HOST_UNIT_TEST
+/* Test-only window onto the guard above. The guard is what stands between a
+ * corrupted ring cursor and an erased vector table, so it is pinned down by a
+ * direct unit test instead of only being reached through laststates_write(). */
+int laststates_erase_addr_allowed(uintptr_t addr)
+{
+    return flash_page_in_pool(addr);
+}
+#endif
 
 #ifdef HOST_UNIT_TEST
 /* ---------------------------------------------------------------------------
@@ -276,8 +394,8 @@ static int flash_erase_page_bounded(uintptr_t addr)
     uint32_t               page_error = 0U;
     HAL_StatusTypeDef      st;
 
-    /* Same bounds guard (B3) as the target path. */
-    if (addr < LASTSTATES_FLASH_BASE || addr >= LASTSTATES_FLASH_END) {
+    /* Exactly the same bounds guard as the target path (B3 / finding C2). */
+    if (!flash_page_in_pool(addr)) {
         return -1;
     }
 
@@ -304,12 +422,63 @@ static void dwt_cyccnt_enable(void)
     }
 }
 
+/* Is the cycle counter actually counting?
+ *
+ * DWT_CYCCNT is an OPTIONAL Cortex-M4 feature and can additionally be held
+ * disabled by a debug probe or by DWT->CTRL being write-ignored. If it never
+ * advances, a `(DWT->CYCCNT - start) >= budget` loop can never terminate -
+ * exactly the infinite spin in a fault handler that the bounded waits exist to
+ * prevent. Reading it twice around a data-synchronisation barrier costs a
+ * handful of cycles and tells the wait loop below to fall back to an iteration
+ * budget instead. */
+static int dwt_cyccnt_running(void)
+{
+    uint32_t t0 = DWT->CYCCNT;
+
+    __DSB();
+    __ISB();
+
+    return (DWT->CYCCNT != t0) ? 1 : 0;
+}
+
+/* Poll FLASH_SR.BSY with a bound that ALWAYS terminates.
+ *
+ * Primary bound: the DWT cycle counter (CPU-clock based, runs with interrupts
+ * masked, unlike HAL_GetTick()). Fallback bound, used when the cycle counter
+ * is not implemented/enabled: a plain iteration budget. One iteration is at
+ * least a few CPU cycles, so using the same number as the cycle budget only
+ * ever makes the fallback timeout LONGER in wall-clock terms, never shorter -
+ * it is a liveness guarantee, not a precise timeout. Returns 0 when BSY
+ * cleared in time, -1 on timeout (the caller owns the register clean-up). */
+static int flash_wait_bsy_bounded(uint32_t budget)
+{
+    const int      have_cyccnt = dwt_cyccnt_running();
+    const uint32_t start       = DWT->CYCCNT;
+    uint32_t       spins       = 0U;
+
+    while (__HAL_FLASH_GET_FLAG(FLASH_FLAG_BSY)) {
+        if (have_cyccnt != 0) {
+            if ((DWT->CYCCNT - start) >= budget) {
+                return -1;
+            }
+        } else {
+            spins++;
+            if (spins >= budget) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 /* Program one 64-bit double word with a hard, cycle-counted bound. Never relies
  * on HAL_GetTick(); returns 0 on success, -1 on timeout/error. Mirrors the HAL
  * double-word program sequence (set PG, write the two words, poll BSY). */
 static int flash_write_dword_bounded(uintptr_t addr, uint64_t data)
 {
-    uint32_t start = DWT->CYCCNT;
+    /* Enable the counter here as well as in the callers: the bound must be a
+     * property of THIS function, not of the call path that reached it. */
+    dwt_cyccnt_enable();
 
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
 
@@ -318,11 +487,9 @@ static int flash_write_dword_bounded(uintptr_t addr, uint64_t data)
     __ISB();
     *(__IO uint32_t *)(uintptr_t)(addr + 4U) = (uint32_t)(data >> 32U);
 
-    while (__HAL_FLASH_GET_FLAG(FLASH_FLAG_BSY)) {
-        if ((DWT->CYCCNT - start) >= FLASH_DWORD_TIMEOUT_CYCLES) {
-            CLEAR_BIT(FLASH->CR, FLASH_CR_PG);
-            return -1;
-        }
+    if (flash_wait_bsy_bounded(FLASH_DWORD_TIMEOUT_CYCLES) != 0) {
+        CLEAR_BIT(FLASH->CR, FLASH_CR_PG);
+        return -1;
     }
     CLEAR_BIT(FLASH->CR, FLASH_CR_PG);
 
@@ -343,12 +510,13 @@ static int flash_write_dword_bounded(uintptr_t addr, uint64_t data)
 static int flash_erase_page_bounded(uintptr_t addr)
 {
     dwt_cyccnt_enable();
-    uint32_t start = DWT->CYCCNT;
 
     /* Bounds guard (B3): only ever erase a page inside the LastStates pool.
      * Refusing anything else prevents an errant call from wiping the vector
-     * table or any other Flash region. */
-    if (addr < LASTSTATES_FLASH_BASE || addr >= LASTSTATES_FLASH_END) {
+     * table, the golden image or any other Flash region. The guard is checked
+     * BEFORE the Flash controller is unlocked, so a rejected address never
+     * even leaves the controller unlocked. */
+    if (!flash_page_in_pool(addr)) {
         return -1;
     }
 
@@ -376,12 +544,10 @@ static int flash_erase_page_bounded(uintptr_t addr)
     SET_BIT(FLASH->CR, FLASH_CR_PER);
     SET_BIT(FLASH->CR, FLASH_CR_STRT);
 
-    while (__HAL_FLASH_GET_FLAG(FLASH_FLAG_BSY)) {
-        if ((DWT->CYCCNT - start) >= FLASH_PAGE_TIMEOUT_CYCLES) {
-            CLEAR_BIT(FLASH->CR, (FLASH_CR_PER | FLASH_CR_PNB));
-            HAL_FLASH_Lock();
-            return -1;
-        }
+    if (flash_wait_bsy_bounded(FLASH_PAGE_TIMEOUT_CYCLES) != 0) {
+        CLEAR_BIT(FLASH->CR, (FLASH_CR_PER | FLASH_CR_PNB));
+        HAL_FLASH_Lock();
+        return -1;
     }
     CLEAR_BIT(FLASH->CR, (FLASH_CR_PER | FLASH_CR_PNB));
 
@@ -532,7 +698,7 @@ void laststates_init(void)
         idx++;
     }
     for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
-        if (!slot_is_erased(i)) {
+        if (slot_is_complete(i)) {
             valid++;
         }
     }
@@ -627,7 +793,7 @@ int laststates_dump_all(uint8_t *out, size_t *len)
     uint32_t needed   = 0U;
 
     for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
-        if (!slot_is_erased(i)) {
+        if (slot_is_complete(i)) {
             needed++;
         }
     }
@@ -641,7 +807,7 @@ int laststates_dump_all(uint8_t *out, size_t *len)
      * in index order so ground can reconstruct the trail by timestamp. */
     uint32_t valid = 0U;
     for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
-        if (!slot_is_erased(i)) {
+        if (slot_is_complete(i)) {
             memcpy(out + valid * LASTSTATES_ENTRY_SIZE,
                    (const uint8_t *)(LASTSTATES_FLASH_BASE + (uintptr_t)i * LASTSTATES_ENTRY_SIZE),
                    LASTSTATES_ENTRY_SIZE);
@@ -658,7 +824,7 @@ uint32_t laststates_count(void)
        recycling leaves gaps and a cached counter can itself be upset. */
     uint32_t valid = 0U;
     for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
-        if (!slot_is_erased(i)) {
+        if (slot_is_complete(i)) {
             valid++;
         }
     }

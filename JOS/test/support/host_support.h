@@ -111,6 +111,14 @@ uint32_t host_flash_lock_count(void);
 /* TRUE while HAL_FLASH_Unlock() has not been balanced by HAL_FLASH_Lock(). */
 int host_flash_is_unlocked(void);
 
+/* Inject a controller failure into the next HAL_FLASH_Program() calls: the
+ * real STM32L4 raises PROGERR on a worn/stuck cell or a supply glitch
+ * mid-program. After `successes` successful programs, the next one returns
+ * HAL_ERROR, giving tests a way to reach laststates_write()'s failure path
+ * (the module otherwise refuses to write into anything that is not fully
+ * erased). Reset by host_flash_reset(). */
+void host_flash_fail_program_after(uint32_t successes);
+
 /* Last I2C device address the code under test handed to HAL_I2C_Mem_Read/Write
  * (0xFFFF after host_flash_reset()). The HAL takes the 8-bit, already shifted
  * address, so a correct FM24VN10-G access is 0xA0/0xA2/0xA4/0xA6. */
