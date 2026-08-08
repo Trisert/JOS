@@ -268,7 +268,14 @@ uint32_t dual_bank_boot_fault_count(void);   /* faults since last good boot   */
 bool     dual_bank_golden_valid(void);       /* result of the last G3/G4 run  */
 uint32_t dual_bank_get_optr_snapshot(void);  /* user option bytes as read     */
 bool     dual_bank_bfb2_armed(void);         /* BFB2 set in the option bytes  */
-bool     dual_bank_boot_ok_pending(void);    /* boot-OK marker still unwritten */
+bool     dual_bank_boot_ok_pending(void);    /* boot-OK marker still unwritten
+                                              * within THIS boot: the flag is a
+                                              * one-shot token that
+                                              * dual_bank_init() snapshots and
+                                              * clears, so it can never
+                                              * fossilise across boots and
+                                              * disarm the fallback later
+                                              * (Kilo #21). */
 
 /* Re-run the golden-image validation (G3/G4). Read-only; exposed for ground
  * commanded self-tests and for unit testing. */

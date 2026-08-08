@@ -112,14 +112,41 @@ void NMI_Handler(void)
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ECCD);
     sram2_parity_nmi_handler();
   }
+  else if (__HAL_RCC_GET_IT(RCC_IT_CSS) != RESET)
+  {
+    /* RCC clock security system: the HSE crystal/oscillator died. That is a
+       CLOCK fault, not a boot fault, and no bank switch can repair an
+       oscillator - routing it into dual_bank_handle_boot_fault() would count
+       DUAL_BANK_BOOT_FAULT_THRESHOLD of them and then swap to the golden
+       image on self-manufactured evidence, i.e. the very loop this
+       discrimination exists to kill (Kilo #21, comment id 3740842361).
+       Handing it to sram2_parity_nmi_handler() was still wrong, though: that
+       module hard-codes TRIGGER_SRAM2_PARITY on the entry and bumps
+       sram2_parity_events, which seu_mitigation.c publishes as
+       parity_events_boot - so the record landed filed under "SRAM2 parity"
+       with an inflated RAM-health counter and ground diagnosed memory
+       degradation for an HSE failure. It also reset on every pass, and a
+       PERMANENT crystal failure has no reset budget, so it would reboot
+       forever and program the LastStates trail away (Kilo #26, comment
+       id 3741110986).
+
+       sram2_clock_fault_nmi_handler() records under TRIGGER_CLOCK_FAULT with
+       its own bounded budget, touches none of the parity counters and RETURNS:
+       the hardware has already switched the system clock to HSI16, so the
+       OBSW keeps running on the fallback instead of looping through reset. */
+    sram2_clock_fault_nmi_handler();
+    return;
+  }
   else
   {
-    /* RCC CSS or an early-boot software fault: this is the dual-bank
-       boot-fault path. Recording is RAM-only and ISR-safe (no Flash, no HAL,
-       no blocking); the reset is issued there because this build has no IWDG
-       to do it for us, so the loop below would otherwise be a permanent
-       silent hang and the fallback threshold could never be reached.
-       See Core/Inc/dual_bank.h. */
+    /* Early-boot software fault: nothing else claimed this NMI, so the only
+       remaining source is software that failed before the OBSW was up - the
+       one case a golden-image switch can plausibly repair. Recording is
+       RAM-only and ISR-safe (no Flash, no HAL, no blocking); the reset is
+       issued there rather than leaving it to the IWDG backstop
+       (Core/Src/hw_watchdog.c, ~31 s, added in W2 #24), so the fallback
+       threshold is reached promptly instead of after half a minute of
+       silence per boot. See Core/Inc/dual_bank.h. */
     dual_bank_handle_boot_fault();
   }
   /* USER CODE END NonMaskableInt_IRQn 0 */
@@ -170,8 +197,34 @@ void DebugMon_Handler(void)
 void SysTick_Handler(void)
 {
   /* USER CODE BEGIN SysTick_IRQn 0 */
+  /* The generated body of this handler was EMPTY, which broke two things at
+     once (Kilo review of PR #9, finding C5):
 
+       1. HAL_IncTick() was never called, so uwTick stayed 0 forever.
+          HAL_GetTick() therefore returned 0 to every caller, which means
+          every LastStates / fault / boot-CRC / SEU record was stamped with
+          timestamp 0 and ground could not order the post-mortem trail at
+          all. Any HAL_Delay() or HAL *_Timeout path would also have hung.
+       2. xPortSysTickHandler() was never called either. FreeRTOSConfig.h
+          sets USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION 1, which switches
+          OFF the SysTick_Handler that cmsis_os2.c would otherwise provide,
+          so this function is the ONLY tick source of the RTOS: without it
+          vTaskDelay()/osDelay() never return and time slicing never runs.
+
+     The scheduler-state guard is required because SysTick is already running
+     between HAL_Init() and osKernelStart(): calling the FreeRTOS tick hook
+     before the scheduler exists corrupts the (not yet initialised) task
+     lists. */
   /* USER CODE END SysTick_IRQn 0 */
+  HAL_IncTick();
+#if (INCLUDE_xTaskGetSchedulerState == 1)
+  if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
+  {
+#endif /* INCLUDE_xTaskGetSchedulerState */
+    xPortSysTickHandler();
+#if (INCLUDE_xTaskGetSchedulerState == 1)
+  }
+#endif /* INCLUDE_xTaskGetSchedulerState */
   /* USER CODE BEGIN SysTick_IRQn 1 */
 
   /* USER CODE END SysTick_IRQn 1 */

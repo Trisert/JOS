@@ -68,6 +68,10 @@ static uint32_t unlock_count;
 static uint32_t lock_count;
 static uint16_t last_i2c_dev_addr;
 
+/* Injected program failure (see host_flash_fail_program_after). */
+static int      fail_program_armed;
+static uint32_t fail_program_countdown;
+
 /* ---------- fixture control ---------- */
 
 static void host_flash_map_once(void)
@@ -141,6 +145,9 @@ void host_flash_reset(void)
     unlock_count   = 0u;
     lock_count     = 0u;
 
+    fail_program_armed     = 0;
+    fail_program_countdown = 0u;
+
     last_i2c_dev_addr = 0xFFFFu;
 }
 
@@ -152,6 +159,12 @@ uint32_t host_flash_unlock_count(void)    { return unlock_count; }
 uint32_t host_flash_lock_count(void)      { return lock_count; }
 int      host_flash_is_unlocked(void)     { return flash_unlocked; }
 uint16_t host_flash_last_i2c_addr(void)   { return last_i2c_dev_addr; }
+
+void host_flash_fail_program_after(uint32_t successes)
+{
+    fail_program_armed     = 1;
+    fail_program_countdown = successes;
+}
 
 /* ---------- HAL Flash ---------- */
 
@@ -192,6 +205,26 @@ HAL_StatusTypeDef HAL_FLASH_Program(uint32_t TypeProgram, uint32_t Address, uint
     memcpy(&current, pool + offset, sizeof(current));
     if (current != ERASED_DWORD) {
         return HAL_ERROR;                     /* PROGERR: row not erased */
+    }
+
+    /* Injected controller failure (host_flash_fail_program_after): the real
+     * part can raise PROGERR on a perfectly erased row - a worn or damaged
+     * cell, or a supply glitch mid-program. There is no other way to reach
+     * that path from a test once the module refuses to write into slots that
+     * are not fully erased.
+     *
+     * This block sits BELOW the TypeProgram / alignment / bounds / erased
+     * checks on purpose: host_support.h promises "after <successes> successful
+     * programs the next one returns HAL_ERROR", so only a program the model
+     * would genuinely have carried out may consume the countdown. Decrementing
+     * above the checks counted rejected attempts as successes and fired the
+     * injection early, blaming the wrong write (Kilo #26). */
+    if (fail_program_armed) {
+        if (fail_program_countdown == 0U) {
+            fail_program_armed = 0;
+            return HAL_ERROR;
+        }
+        fail_program_countdown--;
     }
 
     memcpy(pool + offset, &Data, sizeof(Data));

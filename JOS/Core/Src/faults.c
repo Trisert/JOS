@@ -93,6 +93,72 @@ static void fault_reset_now(void)
     }
 }
 
+/* Idempotent, and deliberately does NOT write DWT->CYCCNT: the counter reads
+ * 0 out of reset and only advances once CYCCNTENA is set, so there is nothing
+ * stale to clear - while a reset here would restart the epoch under whichever
+ * caller runs second and silently re-order the forensic trail. See
+ * fault_timestamp_ms() below. */
+void fault_dwt_enable(void)
+{
+    if ((CoreDebug->DEMCR & CoreDebug_DEMCR_TRCENA_Msk) == 0U) {
+        CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    }
+    if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0U) {
+        DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    }
+}
+
+/* ---------- Timestamp source for a fault record (finding C5) ----------
+ *
+ * The records used to be stamped with a bare HAL_GetTick() while nothing in
+ * the image ever incremented uwTick: SysTick_Handler() in stm32l4xx_it.c was
+ * empty and HAL_IncTick() had no callers, so EVERY record - fault, boot CRC,
+ * SEU, dual bank - carried timestamp 0 and the post-mortem trail could not be
+ * ordered at all. SysTick_Handler() now calls HAL_IncTick() (and the FreeRTOS
+ * tick hook), so HAL_GetTick() is a real millisecond counter.
+ *
+ * A fault handler still cannot rely on it alone: a fault taken before
+ * HAL_Init() (MPU setup, clock configuration, boot-CRC verification) sees
+ * uwTick == 0. In that window the DWT cycle counter is used instead.
+ *
+ * Two things make that fallback actually work (Kilo #26, comment id
+ * 3741110984). First, the counter is started by fault_dwt_enable() from
+ * mpu_init(), the very first call in main() - the previous version enabled it
+ * HERE and divided it by SystemCoreClock/1000 about six cycles later, so it
+ * returned 0, the exact value the fallback exists to eliminate, and only
+ * produced anything useful when some other module happened to start DWT
+ * first. Second, CYCCNT is never reset here: doing so would restart the epoch
+ * on every fault and make the stamps unorderable again.
+ *
+ * The epoch is therefore "ms since mpu_init()" and it wraps every ~54 s at
+ * 80 MHz, which is NOT the same clock as HAL_GetTick(). The record says which
+ * one it is in fault_record_t.ts_source so ground never has to guess. */
+static uint32_t fault_timestamp_ms(uint32_t *source)
+{
+    uint32_t tick = HAL_GetTick();
+    uint32_t cycles_per_ms;
+
+    if (tick != 0U) {
+        *source = (uint32_t)FAULT_TS_SOURCE_TICK;
+        return tick;
+    }
+
+    /* Pre-tick: derive the timestamp from the cycle counter. Enabling it here
+       is a last-resort backstop for a fault that somehow precedes mpu_init();
+       it does NOT reset CYCCNT, so an already-running counter keeps its
+       epoch. */
+    fault_dwt_enable();
+
+    cycles_per_ms = SystemCoreClock / 1000U;
+    if (cycles_per_ms == 0U) {          /* never on this part; no div-by-zero */
+        *source = (uint32_t)FAULT_TS_SOURCE_NONE;
+        return 0U;
+    }
+
+    *source = (uint32_t)FAULT_TS_SOURCE_DWT;
+    return DWT->CYCCNT / cycles_per_ms;
+}
+
 static int fault_frame_is_readable(const uint32_t *frame)
 {
     uint32_t addr = (uint32_t)frame;
@@ -130,12 +196,12 @@ static void fault_fill_scb(fault_record_t *rec)
    timeout would never fire and would block forever if the controller stuck.
    The cycle-counter bound always advances, so a stuck controller is reported as
    a write failure and the reset (the real containment) still happens. */
-static void fault_persist(const fault_record_t *rec, uint8_t trigger)
+static void fault_persist(fault_record_t *rec, uint8_t trigger)
 {
     laststates_entry_t entry;
 
     memset(&entry, 0, sizeof(entry));
-    entry.timestamp  = HAL_GetTick();
+    entry.timestamp  = fault_timestamp_ms(&rec->ts_source);
     entry.state_from = FAULT_STATE_UNKNOWN;
     entry.state_to   = FAULT_STATE_UNKNOWN;
     entry.trigger    = trigger;

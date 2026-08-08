@@ -64,9 +64,35 @@ typedef struct {
     uint32_t shcsr;       /* System Handler Control and State Register       */
     uint32_t icsr;        /* Interrupt Control and State Register            */
     char     task[FAULT_TASK_NAME_LEN]; /* offending task, "" when unknown   */
+    /* Which clock the entry timestamp came from. Appended at the END so every
+       existing field keeps its offset in the ground decoder. Without it a
+       cycle-counter timestamp and a SysTick timestamp are indistinguishable
+       32-bit millisecond values from two different epochs, and ground can
+       silently mis-order the post-mortem trail - the very bug the DWT
+       fallback was added to fix (Kilo #26, comment id 3741110984). */
+    uint32_t ts_source;   /* fault_ts_source_t                               */
 } fault_record_t;
 
+/* Epoch/source of fault_record_t.ts_source. */
+typedef enum {
+    FAULT_TS_SOURCE_NONE  = 0U, /* no usable clock: the stamp is meaningless */
+    FAULT_TS_SOURCE_TICK  = 1U, /* HAL_GetTick(): ms since HAL_Init()        */
+    FAULT_TS_SOURCE_DWT   = 2U, /* DWT CYCCNT: ms since fault_dwt_enable(),
+                                   i.e. since mpu_init() at the top of main().
+                                   Wraps every ~54 s at 80 MHz.             */
+} fault_ts_source_t;
+
 /* ---------- Public API ---------- */
+
+/* Start the DWT cycle counter (idempotent, never resets CYCCNT).
+
+   Must be called as early as possible - mpu_init() does it, first thing in
+   main() - so the counter is already running when a pre-HAL_Init() fault
+   needs a timestamp. Enabling it inside the fault handler and dividing six
+   cycles later returned 0, i.e. exactly the value the fallback exists to
+   eliminate (Kilo #26, comment id 3741110984). Calling it early is also what
+   makes "ms since reset" an honest description of the DWT epoch. */
+void fault_dwt_enable(void);
 
 /* Enable the MemManage, BusFault and UsageFault handlers (they are disabled
    out of reset, which escalates every such fault to HardFault).

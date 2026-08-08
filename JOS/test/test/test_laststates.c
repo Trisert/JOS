@@ -39,6 +39,7 @@ void setUp(void)
 {
     host_flash_reset();
     seu_stub_reset();
+    laststates_pool_lock_set_result_for_test(LASTSTATES_LOCK_NOT_NEEDED);
     laststates_init();
 }
 
@@ -182,38 +183,113 @@ void test_laststates_dump_all_accepts_exactly_sized_buffer(void)
 }
 
 /* Boundary of the capacity check: one byte short of the required size must
- * still be refused with nothing copied. An off-by-one here (>= instead of >)
- * is exactly the overrun the size parameter was introduced to prevent, and a
- * test that only ever passes an oversized buffer cannot see it. */
+ * still be refused with nothing copied. A capacity check that is one byte too
+ * LAX (accepting capacity == needed - 1, e.g. comparing against `capacity + 1`
+ * or against `needed - 1` entries) is exactly the overrun the size parameter
+ * was introduced to prevent, and a test that only ever passes an oversized
+ * buffer cannot see it.
+ *
+ * The opposite mutation - a check one byte too STRICT, refusing the exactly
+ * sized buffer - cannot overrun anything and is already covered by
+ * test_laststates_dump_all_accepts_exactly_sized_buffer above. This test is
+ * single-purpose: refusal only, no accept half.
+ *
+ * Guard bands frame the buffer, as in
+ * test_laststates_dump_all_refuses_undersized_buffer: with a bare array the
+ * declared capacity is one byte below the array size, so a copy that runs one
+ * byte past the capacity lands harmlessly inside the array, and a copy that
+ * runs past `needed` bytes redecorates the stack without failing a single
+ * assertion. The canaries turn "we infer nothing was written" into "nothing
+ * was written". */
 void test_laststates_dump_all_refuses_a_buffer_one_byte_short(void)
 {
-    uint8_t out[3 * LASTSTATES_ENTRY_SIZE];
-    size_t  len;
+    struct {
+        uint8_t guard_lo[16];
+        uint8_t out[3 * LASTSTATES_ENTRY_SIZE];
+        uint8_t guard_hi[16];
+    } framed;
+
+    size_t   len;
     uint32_t i;
 
-    laststates_entry_t a = make_entry(1u, STATE_OFF,   STATE_INIT,  TRIGGER_BOOT, 0xA1u);
-    laststates_entry_t b = make_entry(2u, STATE_INIT,  STATE_READY, TRIGGER_BOOT, 0xB2u);
+    laststates_entry_t a = make_entry(1u, STATE_OFF,   STATE_INIT,   TRIGGER_BOOT, 0xA1u);
+    laststates_entry_t b = make_entry(2u, STATE_INIT,  STATE_READY,  TRIGGER_BOOT, 0xB2u);
     laststates_entry_t c = make_entry(3u, STATE_READY, STATE_ACTIVE, TRIGGER_BOOT, 0xC3u);
 
-    memset(out, 0x00, sizeof(out));
+    memset(&framed, 0x00, sizeof(framed));
 
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&a));
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&b));
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&c));
 
-    len = sizeof(out) - 1u;                       /* one byte short */
-    TEST_ASSERT_EQUAL_INT(-1, laststates_dump_all(out, &len));
-    TEST_ASSERT_EQUAL_size_t((size_t)(3 * LASTSTATES_ENTRY_SIZE), len);
-    for (i = 0u; i < (uint32_t)sizeof(out); i++) {
-        TEST_ASSERT_EQUAL_HEX8(0x00u, out[i]);    /* nothing copied */
-    }
+    len = sizeof(framed.out) - 1u;                /* one byte short */
+    TEST_ASSERT_EQUAL_INT(-1, laststates_dump_all(framed.out, &len));
 
-    len = sizeof(out);                            /* exactly enough */
-    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    /* Required size reported back for the caller's retry ... */
     TEST_ASSERT_EQUAL_size_t((size_t)(3 * LASTSTATES_ENTRY_SIZE), len);
-    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&c,
-                                  out + (2 * LASTSTATES_ENTRY_SIZE),
+
+    /* ... and nothing was copied: not into the buffer, and - the point of the
+     * canaries - not one byte past either end of it. */
+    for (i = 0u; i < (uint32_t)sizeof(framed.out); i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.out[i]);
+    }
+    for (i = 0u; i < (uint32_t)sizeof(framed.guard_lo); i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.guard_lo[i]);
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.guard_hi[i]);
+    }
+}
+
+/* The accept side of the same boundary, one byte up: a buffer of exactly the
+ * required size copies every entry and touches nothing beyond it.
+ *
+ * Distinct from test_laststates_dump_all_accepts_exactly_sized_buffer, which
+ * checks the return value and *len on a two-entry pool: this one pins the
+ * CONTENT of all three entries at their exact offsets (a dump that returned
+ * the right byte count with the entries transposed, or that only got the last
+ * one right, would pass there and fail here) and adds the upper guard band to
+ * prove the copy stopped at `needed` bytes rather than merely at the array
+ * boundary. */
+void test_laststates_dump_all_capacity_boundary_accepts_exact_fit(void)
+{
+    struct {
+        uint8_t guard_lo[16];
+        uint8_t out[3 * LASTSTATES_ENTRY_SIZE];
+        uint8_t guard_hi[16];
+    } framed;
+
+    size_t   len;
+    uint32_t i;
+
+    laststates_entry_t a = make_entry(1u, STATE_OFF,   STATE_INIT,   TRIGGER_BOOT, 0xA1u);
+    laststates_entry_t b = make_entry(2u, STATE_INIT,  STATE_READY,  TRIGGER_BOOT, 0xB2u);
+    laststates_entry_t c = make_entry(3u, STATE_READY, STATE_ACTIVE, TRIGGER_BOOT, 0xC3u);
+
+    memset(&framed, 0x00, sizeof(framed));
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&a));
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&b));
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&c));
+
+    len = sizeof(framed.out);                     /* exactly enough */
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(framed.out, &len));
+    TEST_ASSERT_EQUAL_size_t((size_t)(3 * LASTSTATES_ENTRY_SIZE), len);
+
+    /* Every entry, at its own offset, in write order. */
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&a,
+                                  framed.out + (0 * LASTSTATES_ENTRY_SIZE),
                                   LASTSTATES_ENTRY_SIZE);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&b,
+                                  framed.out + (1 * LASTSTATES_ENTRY_SIZE),
+                                  LASTSTATES_ENTRY_SIZE);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&c,
+                                  framed.out + (2 * LASTSTATES_ENTRY_SIZE),
+                                  LASTSTATES_ENTRY_SIZE);
+
+    /* The copy stopped exactly at the capacity it was given. */
+    for (i = 0u; i < (uint32_t)sizeof(framed.guard_lo); i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.guard_lo[i]);
+        TEST_ASSERT_EQUAL_HEX8(0x00u, framed.guard_hi[i]);
+    }
 }
 
 /* An empty pool needs no space at all, so even a zero-capacity buffer is a
@@ -228,6 +304,50 @@ void test_laststates_dump_all_on_empty_pool_writes_nothing(void)
     TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
     TEST_ASSERT_EQUAL_size_t(0u, len);
     TEST_ASSERT_EQUAL_HEX8(0xC3u, out[0]);
+}
+
+/* A reader takes the pool lock so its two passes (count, then copy) cannot
+ * disagree, but it must NOT inherit the writer's refusal contract: a dump
+ * programs nothing, so it cannot corrupt the pool, and refusing it would deny
+ * ground the forensic trail exactly when the spacecraft is degraded. The
+ * refusal must also not be filed as a dropped record - nothing was lost
+ * (Kilo #26). */
+void test_laststates_dump_all_still_reads_with_a_degraded_lock(void)
+{
+    laststates_entry_t e = make_entry(0x1234u, STATE_READY, STATE_CRIT,
+                                      TRIGGER_BOOT, 0x3Cu);
+    uint8_t  out[LASTSTATES_ENTRY_SIZE];
+    size_t   len     = sizeof(out);
+    uint32_t dropped;
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+    dropped = laststates_dropped_records();
+
+    laststates_pool_lock_set_result_for_test(LASTSTATES_LOCK_FAILED);
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    laststates_pool_lock_set_result_for_test(LASTSTATES_LOCK_NOT_NEEDED);
+
+    TEST_ASSERT_EQUAL_size_t((size_t)LASTSTATES_ENTRY_SIZE, len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&e, out, LASTSTATES_ENTRY_SIZE);
+    TEST_ASSERT_EQUAL_UINT32(dropped, laststates_dropped_records());
+}
+
+/* Cross-module drop accounting (Kilo #26). Core/Src/dual_bank.c:ls_append()
+ * drives HAL_FLASH_Program() itself and never calls laststates_write(), so it
+ * reports a lock-refused boot-fault / boot-OK marker through this entry point;
+ * without it the tri-state lock is invisible from the ground. dual_bank.c
+ * needs the real HAL and is not host-compiled, so the contract is pinned here:
+ * one call == exactly one more dropped record, and the lock-failure counter
+ * (already bumped by laststates_pool_lock() on the target) is left alone. */
+void test_laststates_note_dropped_record_is_visible_to_ground(void)
+{
+    const uint32_t dropped  = laststates_dropped_records();
+    const uint32_t failures = laststates_lock_failures();
+
+    laststates_note_dropped_record();
+
+    TEST_ASSERT_EQUAL_UINT32(dropped + 1u, laststates_dropped_records());
+    TEST_ASSERT_EQUAL_UINT32(failures, laststates_lock_failures());
 }
 
 /* Flash must be unlocked to program and re-locked afterwards; leaving the
@@ -484,4 +604,168 @@ void test_laststates_mirror_region_tracks_the_ring_bookkeeping(void)
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&entry));
     TEST_ASSERT_EQUAL_UINT32(1u, m->idx);      /* cursor advanced by one slot */
     TEST_ASSERT_EQUAL_UINT32(laststates_count(), m->count);
+}
+
+/* =====================================================================
+ * Torn (partially programmed) records - Kilo review of PR #9, finding C4
+ *
+ * A 128 B record is programmed as 16 separate double words. A reset (or a
+ * bounded-wait timeout) between them leaves a slot whose first double word is
+ * programmed and whose tail is still erased. Testing only double word 0 - the
+ * previous implementation - reported such a half-record as a perfectly valid
+ * entry, so ground would reconstruct the anomaly timeline from a record whose
+ * payload is 0xFF filler.
+ * ===================================================================== */
+
+/* Program one double word straight through the HAL doubles, bypassing
+ * laststates_write(), to build the torn-slot fixture. */
+static void program_raw_dword(uint32_t byte_offset, uint64_t value)
+{
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Unlock());
+    TEST_ASSERT_EQUAL_INT(HAL_OK,
+                          HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                            (uint32_t)flash_base + byte_offset,
+                                            value));
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Lock());
+}
+
+void test_laststates_torn_record_is_not_reported_as_valid(void)
+{
+    uint8_t out[LASTSTATES_ENTRY_SIZE];
+    size_t  len = sizeof(out);
+
+    program_raw_dword(0u, 0x0000000102030405ULL);   /* only dword 0 of slot 0 */
+    laststates_init();                              /* rescan after the reset */
+
+    TEST_ASSERT_EQUAL_UINT32(0u, laststates_count());
+
+    memset(out, 0xC3, sizeof(out));
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    TEST_ASSERT_EQUAL_size_t(0u, len);
+    TEST_ASSERT_EQUAL_HEX8(0xC3u, out[0]);          /* nothing copied out */
+}
+
+/* Only the LAST double word missing is still a torn record: the completeness
+ * rule is "the tail is programmed", not "something is programmed". */
+void test_laststates_record_missing_only_its_tail_is_skipped(void)
+{
+    uint32_t d;
+
+    for (d = 0u; d < (LASTSTATES_ENTRY_SIZE / 8u) - 1u; d++) {
+        program_raw_dword(d * 8u, 0x1122334455667788ULL);
+    }
+    laststates_init();
+
+    TEST_ASSERT_EQUAL_UINT32(0u, laststates_count());
+}
+
+/* The torn slot must not be handed back to the programmer either: re-writing
+ * a non-erased double word fails with PROGERR on the real part and would kill
+ * every later write. The cursor skips it and the next record lands in slot 1,
+ * with no page erase (the newer records must survive).
+ *
+ * The torn slot is built by programming a LATER double word (offset 64) and
+ * leaving double word 0 erased: that is the case the pre-C4 predicate got
+ * wrong. It looked at double word 0 only, so it would have called this slot
+ * "erased", targeted the write at slot 0 and hit PROGERR on offset 64 -
+ * laststates_write() would return -1 and this test would fail. Programming
+ * double word 0 instead (the previous fixture) marks the slot non-erased under
+ * BOTH predicates, so it could not discriminate the fix (Kilo #26). */
+void test_laststates_write_skips_a_torn_slot(void)
+{
+    laststates_entry_t e = make_entry(0x55u, STATE_READY, STATE_ACTIVE,
+                                      TRIGGER_BOOT, 0x5Au);
+
+    program_raw_dword(64u, 0x0000000102030405ULL);   /* header still erased */
+    laststates_init();
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+
+    TEST_ASSERT_EQUAL_UINT32(0u, host_flash_erase_count());
+    TEST_ASSERT_EQUAL_UINT32(1u, laststates_count());
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&e,
+                                  host_flash_pool() + LASTSTATES_ENTRY_SIZE,
+                                  LASTSTATES_ENTRY_SIZE);
+}
+
+/* A complete record is still reported next to a torn one. */
+void test_laststates_dump_returns_only_the_complete_record(void)
+{
+    laststates_entry_t e = make_entry(0x99u, STATE_INIT, STATE_READY,
+                                      TRIGGER_BOOT, 0x42u);
+    uint8_t out[2 * LASTSTATES_ENTRY_SIZE];
+    size_t  len = sizeof(out);
+
+    program_raw_dword(0u, 0x0000000102030405ULL);
+    laststates_init();
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    TEST_ASSERT_EQUAL_size_t((size_t)LASTSTATES_ENTRY_SIZE, len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&e, out, LASTSTATES_ENTRY_SIZE);
+}
+
+/* The host double's failure injector is part of the test contract, so it gets
+ * its own test: host_support.h promises "after <successes> SUCCESSFUL programs
+ * the next one returns HAL_ERROR". A program the model rejects on its own
+ * (misaligned address, wrong TypeProgram, out of bounds, row not erased) is
+ * not a success and must not consume the countdown - otherwise a test arming
+ * N > 0 over a sequence containing one legitimately rejected program fires the
+ * injection early and blames the wrong write (Kilo #26). */
+void test_host_flash_injector_only_counts_successful_programs(void)
+{
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Unlock());
+
+    host_flash_fail_program_after(1u);       /* one success, then HAL_ERROR */
+
+    /* Rejected by the model (misaligned): must not consume the countdown. */
+    TEST_ASSERT_EQUAL_INT(HAL_ERROR,
+                          HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                            (uint32_t)flash_base + 4u,
+                                            0xA5A5A5A5A5A5A5A5ULL));
+
+    /* The one allowed success. */
+    TEST_ASSERT_EQUAL_INT(HAL_OK,
+                          HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                            (uint32_t)flash_base + 0u,
+                                            0x1111111111111111ULL));
+
+    /* ...and only now does the injection fire. */
+    TEST_ASSERT_EQUAL_INT(HAL_ERROR,
+                          HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                            (uint32_t)flash_base + 8u,
+                                            0x2222222222222222ULL));
+
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Lock());
+
+    /* Exactly one double word reached the pool. */
+    TEST_ASSERT_EQUAL_UINT32(1u, host_flash_program_count());
+}
+
+/* =====================================================================
+ * Flash page-erase bounds guard - Kilo review of PR #9, finding C2
+ *
+ * The target path drives FLASH->CR directly, so an out-of-pool address would
+ * erase 2 KB of whatever it points at: the vector table, the running image or
+ * the dual-bank golden image. Only page-aligned addresses inside
+ * [pool_base, pool_end) may be erased.
+ * ===================================================================== */
+void test_laststates_erase_guard_only_accepts_pool_pages(void)
+{
+    const uintptr_t base = flash_base;
+    const uintptr_t end  = base + (uintptr_t)LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE;
+
+    /* first and last page of the pool */
+    TEST_ASSERT_TRUE(laststates_erase_addr_allowed(base));
+    TEST_ASSERT_TRUE(laststates_erase_addr_allowed(end - HOST_FLASH_PAGE_SIZE));
+
+    /* one page below the pool, and the first page past it */
+    TEST_ASSERT_FALSE(laststates_erase_addr_allowed(base - HOST_FLASH_PAGE_SIZE));
+    TEST_ASSERT_FALSE(laststates_erase_addr_allowed(end));
+
+    /* inside the pool but not on a page boundary */
+    TEST_ASSERT_FALSE(laststates_erase_addr_allowed(base + LASTSTATES_ENTRY_SIZE));
+
+    /* the vector table, i.e. the worst case this guard exists for */
+    TEST_ASSERT_FALSE(laststates_erase_addr_allowed((uintptr_t)0x08000000UL));
 }
