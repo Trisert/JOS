@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "state_machine.h"
 #include "watchdog.h"
+#include "boot_crc.h"
 #include "bms.h"
 #include "memory.h"
 #include "comms.h"
@@ -126,10 +127,32 @@ int main(void)
   /* Enable fault containment first: a fault taken during the remaining
      init sequence must reset the OBSW instead of hanging in a stub. */
   fault_handlers_init();
+
+  /* Firmware image integrity check — ECSS-E-ST-40C 5.4 (software integrity),
+     NASA-STD-8739.8 (fault detection). Pure-software CRC32 over
+     [__fw_image_start, __fw_crc_start); no HAL/peripheral dependency and no
+     task exists yet, so a corrupted image is caught before osKernelStart().
+     The result is latched in boot_crc.c for beacon telemetry; the fault
+     policy is applied below, once the LastStates pool is available.
+     See docs/dev/hardening.md 2.4. */
+  (void)boot_crc_verify();
+
   bms_init();
   fram_init();
   cyclic_buffer_init();
   laststates_init();
+
+  /* Act on the integrity result now that the fault can be persisted.
+     BOOT_CRC_FATAL (=1 by default, see App/obsw/boot_crc.h): the fault is
+     written to LastStates and the OBC resets up to
+     BOOT_CRC_MAX_RESET_ATTEMPTS times to clear a transient corruption — this
+     call does not return in that case. When the budget is exhausted we keep
+     booting with the image marked untrusted, which confines the state machine
+     to STATE_CRIT (beacon-only, payloads inhibited) so ground can re-upload.
+     Deliberately never Error_Handler(): with no IWDG configured its
+     __disable_irq(); while(1) would be an unrecoverable brick. */
+  boot_crc_apply_policy();
+
   lora_init();
   state_machine_init();
   watchdog_monitor_init();
@@ -159,6 +182,12 @@ int main(void)
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
+  /* defaultTask is created by CubeIDE above; register it here so every
+     running task is watchdog-monitored (docs/dev/hardening.md 3.1). */
+  if (defaultTaskHandle != NULL)
+  {
+    (void)watchdog_register_task(defaultTaskHandle, WDG_PERIOD_DEFAULT_TASK_MS);
+  }
   state_machine_task_create();
   watchdog_task_create();
   lora_beacon_task_create();
@@ -633,6 +662,7 @@ void StartDefaultTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
+    watchdog_alive_self();
     osDelay(1);
   }
   /* USER CODE END 5 */

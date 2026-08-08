@@ -8,6 +8,7 @@ Welcome to the JOS (RedPill) On-Board Software documentation.
 |--------|-------|
 | Building the code | [docs/dev/building.md](dev/building.md) |
 | Verification simulation | [docs/dev/simulation.md](dev/simulation.md) |
+| Fault tolerance (boot CRC, watchdog) | [docs/dev/hardening.md](dev/hardening.md) |
 | Understanding modules | [docs/api/](api/) |
 | System design | [docs/arch/README.md](arch/README.md) |
 | Operating the satellite | [docs/user/README.md](user/README.md) |
@@ -29,6 +30,7 @@ docs/
 ├── dev/                # Developer guides
 │   ├── building.md     # Build (NixOS container / local / CI / CubeIDE)
 │   ├── simulation.md   # ESP32 dual-board HIL verification
+│   ├── hardening.md    # Boot CRC32 integrity + task watchdog monitoring
 │   ├── coding_standards.md
 │   └── debugging.md
 └── user/               # User manual (ground operators)
@@ -66,3 +68,4 @@ docs/
 - Review API docs in `docs/api/`
 - See debugging guide in `docs/dev/debugging.md`
 - See simulation guide in `docs/dev/simulation.md`
+- See hardening / fault-tolerance notes in `docs/dev/hardening.md`
