@@ -74,19 +74,27 @@ uint32_t laststates_count(void);
 
      LASTSTATES_LOCK_NOT_NEEDED (0)
        No serialisation is required and none was taken: before
-       laststates_init() has created the mutex, or before the scheduler runs
-       (boot is single-threaded), or on the exception path once the Flash
-       controller has been proven idle and sanitised (see below).
+       the scheduler runs (boot is single-threaded: main() calls
+       laststates_init() long before osKernelInitialize(), and the boot
+       forensics written in that window need no mutex - the kernel state is
+       therefore checked BEFORE the degraded latch), or on the exception path
+       once the Flash controller has been proven idle and sanitised (see
+       below).
 
      LASTSTATES_LOCK_FAILED (-1)
        Serialisation is REQUIRED but unavailable: osMutexNew() returned NULL
-       at init (FreeRTOS heap exhausted) or osMutexAcquire() failed, or the
+       at init (FreeRTOS heap exhausted), osMutexAcquire() failed, the
+       scheduler is running and no mutex exists at all (laststates_init()
+       never ran, so both writers can be scheduled against each other), or the
        exception path found the Flash controller mid-sequence and could not
        bring it to a safe state inside its bounded wait. Every writer must
        REFUSE the write and touch no Flash at all — a torn 128-byte entry
        destroys existing forensic history, which is strictly worse than one
        lost record. The refusal is counted (laststates_dropped_records()) so
-       the loss is visible from the ground instead of silent.
+       the loss is visible from the ground instead of silent. READERS
+       (laststates_dump_all()) are exempt: they program nothing, so they take
+       the lock for a consistent two-pass scan but continue without it rather
+       than deny ground the trail, and they count no dropped record.
 
    Exception context (the fault, MPU and parity handlers log through
    laststates_write() and then reset) can never block on the mutex. It gets a
@@ -113,6 +121,13 @@ void     laststates_pool_unlock(int held);
    inferred from missing records. */
 uint32_t laststates_lock_failures(void);
 uint32_t laststates_dropped_records(void);
+
+/* Bump laststates_dropped_records() from a writer that does NOT go through
+   laststates_write(). Core/Src/dual_bank.c:ls_append() programs the pool
+   itself, so its boot-fault / boot-OK refusals have to be counted here or the
+   tri-state lock stays invisible from the ground. Call it exactly once, on the
+   LASTSTATES_LOCK_FAILED path, before returning without touching Flash. */
+void     laststates_note_dropped_record(void);
 
 /* ---------- LastStates bookkeeping mirror (SEU scrubbing, W2-5) ----------
    The write index and the entry count decide where the next post-mortem

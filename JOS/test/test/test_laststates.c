@@ -39,6 +39,7 @@ void setUp(void)
 {
     host_flash_reset();
     seu_stub_reset();
+    laststates_pool_lock_set_result_for_test(LASTSTATES_LOCK_NOT_NEEDED);
     laststates_init();
 }
 
@@ -303,6 +304,50 @@ void test_laststates_dump_all_on_empty_pool_writes_nothing(void)
     TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
     TEST_ASSERT_EQUAL_size_t(0u, len);
     TEST_ASSERT_EQUAL_HEX8(0xC3u, out[0]);
+}
+
+/* A reader takes the pool lock so its two passes (count, then copy) cannot
+ * disagree, but it must NOT inherit the writer's refusal contract: a dump
+ * programs nothing, so it cannot corrupt the pool, and refusing it would deny
+ * ground the forensic trail exactly when the spacecraft is degraded. The
+ * refusal must also not be filed as a dropped record - nothing was lost
+ * (Kilo #26). */
+void test_laststates_dump_all_still_reads_with_a_degraded_lock(void)
+{
+    laststates_entry_t e = make_entry(0x1234u, STATE_READY, STATE_CRIT,
+                                      TRIGGER_BOOT, 0x3Cu);
+    uint8_t  out[LASTSTATES_ENTRY_SIZE];
+    size_t   len     = sizeof(out);
+    uint32_t dropped;
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+    dropped = laststates_dropped_records();
+
+    laststates_pool_lock_set_result_for_test(LASTSTATES_LOCK_FAILED);
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    laststates_pool_lock_set_result_for_test(LASTSTATES_LOCK_NOT_NEEDED);
+
+    TEST_ASSERT_EQUAL_size_t((size_t)LASTSTATES_ENTRY_SIZE, len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&e, out, LASTSTATES_ENTRY_SIZE);
+    TEST_ASSERT_EQUAL_UINT32(dropped, laststates_dropped_records());
+}
+
+/* Cross-module drop accounting (Kilo #26). Core/Src/dual_bank.c:ls_append()
+ * drives HAL_FLASH_Program() itself and never calls laststates_write(), so it
+ * reports a lock-refused boot-fault / boot-OK marker through this entry point;
+ * without it the tri-state lock is invisible from the ground. dual_bank.c
+ * needs the real HAL and is not host-compiled, so the contract is pinned here:
+ * one call == exactly one more dropped record, and the lock-failure counter
+ * (already bumped by laststates_pool_lock() on the target) is left alone. */
+void test_laststates_note_dropped_record_is_visible_to_ground(void)
+{
+    const uint32_t dropped  = laststates_dropped_records();
+    const uint32_t failures = laststates_lock_failures();
+
+    laststates_note_dropped_record();
+
+    TEST_ASSERT_EQUAL_UINT32(dropped + 1u, laststates_dropped_records());
+    TEST_ASSERT_EQUAL_UINT32(failures, laststates_lock_failures());
 }
 
 /* Flash must be unlocked to program and re-locked afterwards; leaving the
@@ -617,13 +662,21 @@ void test_laststates_record_missing_only_its_tail_is_skipped(void)
 /* The torn slot must not be handed back to the programmer either: re-writing
  * a non-erased double word fails with PROGERR on the real part and would kill
  * every later write. The cursor skips it and the next record lands in slot 1,
- * with no page erase (the newer records must survive). */
+ * with no page erase (the newer records must survive).
+ *
+ * The torn slot is built by programming a LATER double word (offset 64) and
+ * leaving double word 0 erased: that is the case the pre-C4 predicate got
+ * wrong. It looked at double word 0 only, so it would have called this slot
+ * "erased", targeted the write at slot 0 and hit PROGERR on offset 64 -
+ * laststates_write() would return -1 and this test would fail. Programming
+ * double word 0 instead (the previous fixture) marks the slot non-erased under
+ * BOTH predicates, so it could not discriminate the fix (Kilo #26). */
 void test_laststates_write_skips_a_torn_slot(void)
 {
     laststates_entry_t e = make_entry(0x55u, STATE_READY, STATE_ACTIVE,
                                       TRIGGER_BOOT, 0x5Au);
 
-    program_raw_dword(0u, 0x0000000102030405ULL);
+    program_raw_dword(64u, 0x0000000102030405ULL);   /* header still erased */
     laststates_init();
 
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
@@ -650,6 +703,43 @@ void test_laststates_dump_returns_only_the_complete_record(void)
     TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
     TEST_ASSERT_EQUAL_size_t((size_t)LASTSTATES_ENTRY_SIZE, len);
     TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&e, out, LASTSTATES_ENTRY_SIZE);
+}
+
+/* The host double's failure injector is part of the test contract, so it gets
+ * its own test: host_support.h promises "after <successes> SUCCESSFUL programs
+ * the next one returns HAL_ERROR". A program the model rejects on its own
+ * (misaligned address, wrong TypeProgram, out of bounds, row not erased) is
+ * not a success and must not consume the countdown - otherwise a test arming
+ * N > 0 over a sequence containing one legitimately rejected program fires the
+ * injection early and blames the wrong write (Kilo #26). */
+void test_host_flash_injector_only_counts_successful_programs(void)
+{
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Unlock());
+
+    host_flash_fail_program_after(1u);       /* one success, then HAL_ERROR */
+
+    /* Rejected by the model (misaligned): must not consume the countdown. */
+    TEST_ASSERT_EQUAL_INT(HAL_ERROR,
+                          HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                            (uint32_t)flash_base + 4u,
+                                            0xA5A5A5A5A5A5A5A5ULL));
+
+    /* The one allowed success. */
+    TEST_ASSERT_EQUAL_INT(HAL_OK,
+                          HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                            (uint32_t)flash_base + 0u,
+                                            0x1111111111111111ULL));
+
+    /* ...and only now does the injection fire. */
+    TEST_ASSERT_EQUAL_INT(HAL_ERROR,
+                          HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                            (uint32_t)flash_base + 8u,
+                                            0x2222222222222222ULL));
+
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Lock());
+
+    /* Exactly one double word reached the pool. */
+    TEST_ASSERT_EQUAL_UINT32(1u, host_flash_program_count());
 }
 
 /* =====================================================================

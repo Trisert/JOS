@@ -318,8 +318,14 @@ static int ls_append(uint8_t trigger, uint32_t value)
 
     /* Serialisation required but unavailable: refuse rather than program an
      * unsynchronised pool (Kilo #21). The caller treats this exactly like a
-     * Flash failure; App/memory/memory.c counts the dropped record. */
+     * Flash failure. Count the loss here: this writer drives
+     * HAL_FLASH_Program() itself and never calls laststates_write(), so
+     * without this call a refused boot-fault / boot-OK marker would be
+     * invisible in laststates_dropped_records() and ground would have to infer
+     * it from a gap - the exact hole the tri-state lock exists to close
+     * (Kilo #26). */
     if (lock_held == LASTSTATES_LOCK_FAILED) {
+        laststates_note_dropped_record();
         return -1;
     }
 
