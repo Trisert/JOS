@@ -63,6 +63,12 @@
     # the only way to reach the BOOT_CRC_BAD_REGION branch on the host.
     :test_bad_region:
       - HOST_FW_BAD_REGION
+    # test_boot_unstamped_bench.c links the same boot_crc.c with the bench
+    # opt-out of the unstamped-image policy, which is the only way to reach
+    # the #if BOOT_CRC_TRUST_UNSTAMPED branch of boot_crc_image_trusted().
+    # The flight default (0) is exercised by every other test executable.
+    :test_boot_unstamped_bench:
+      - BOOT_CRC_TRUST_UNSTAMPED=1
 
 :flags:
   :test:

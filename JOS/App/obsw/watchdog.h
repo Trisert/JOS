@@ -30,6 +30,26 @@
 #define WDG_PERIOD_CLOUD_MS         (90UL * 60UL * 1000UL) /* once per orbit */
 #define WDG_PERIOD_AOCS_MS             20u
 
+/* Monitor scan period (ms). */
+#define WDG_MONITOR_PERIOD_MS         500u
+
+/* Start-up grace window (ms).
+ *
+ * Tasks are registered from main() *before* osKernelStart(), where
+ * xTaskGetTickCount() still reads 0, and several of them do bring-up work
+ * (peripheral settling, init delays) before their first watchdog_alive()
+ * call. Seeding last_tick at registration therefore made the very first
+ * monitor scan report every task as hung (elapsed 500 ms > 3 x 100 ms for the
+ * state machine) on every single boot.
+ *
+ * Instead an entry stays *unarmed* until the task reports liveness for the
+ * first time; while unarmed it is judged against max(3 x period, this grace
+ * window), measured from the first real post-kernel-start tick. Long enough
+ * for the slowest bring-up path in the tree (state_machine_task: 100 ms +
+ * 500 ms of init work), short enough that a task which never starts is still
+ * caught within a few seconds. */
+#define WDG_STARTUP_GRACE_MS         5000u
+
 /* Initialise the watchdog monitor */
 void watchdog_monitor_init(void);
 

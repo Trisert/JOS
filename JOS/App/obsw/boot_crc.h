@@ -50,8 +50,12 @@
  * Fault policy
  *
  * BOOT_CRC_FATAL selects what happens when the image cannot be trusted. It is
- * defined to 1 by the build system (Makefile C_DEFS) and defaults to 1 here so
- * that no build can accidentally end up with the fault path compiled out.
+ * defined to 1 by the build system (Makefile C_DEFS, `:=` so an exported
+ * environment variable cannot override it) and defaults to 1 here so that no
+ * build can accidentally end up with the fault path compiled out. The value
+ * is validated in both places: the Makefile rejects anything but 0/1 and the
+ * #error below catches a -D that slipped past it (App/ is also compiled with
+ * -Wundef, so a misspelled switch is a warning, not a silent 0).
  *
  *   BOOT_CRC_FATAL = 1 (flight default)
  *     1. The fault is recorded in the LastStates pool (internal Flash).
@@ -73,6 +77,40 @@
  * ------------------------------------------------------------------------- */
 #ifndef BOOT_CRC_FATAL
 #define BOOT_CRC_FATAL 1
+#endif
+
+#if (BOOT_CRC_FATAL != 0) && (BOOT_CRC_FATAL != 1)
+#error "BOOT_CRC_FATAL must be defined to 0 or 1 (see Makefile / docs/dev/hardening.md)"
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Unstamped-image policy
+ *
+ * A freshly linked image still carries the BOOT_CRC_UNSTAMPED_VALUE
+ * (0x00000000) placeholder in .fw_crc until `make crc-stamp` patches the real
+ * value into the .bin/.hex. Such an image carries NO integrity evidence.
+ *
+ *   BOOT_CRC_TRUST_UNSTAMPED = 0 (flight/CI default)
+ *     UNSTAMPED is a fault verdict exactly like MISMATCH/ERASED: the image is
+ *     untrusted, the fault is recorded, and the state machine confines the
+ *     OBC to STATE_CRIT. This is what stops the whole boot-integrity check
+ *     from being a no-op when the ELF is flashed straight from CubeIDE or
+ *     OpenOCD (which never run the stamping step).
+ *
+ *   BOOT_CRC_TRUST_UNSTAMPED = 1 (bench builds only, explicit opt-in)
+ *     UNSTAMPED means "nothing to compare against": the image is trusted and
+ *     boot_crc_apply_policy() is a no-op, so an unstamped debug session on the
+ *     bench behaves like it did before this policy existed.
+ *
+ * `make flash` depends on `crc-stamp`, and CI stamps + verifies before the
+ * artefact upload, so the flight path never produces an unstamped image.
+ * ------------------------------------------------------------------------- */
+#ifndef BOOT_CRC_TRUST_UNSTAMPED
+#define BOOT_CRC_TRUST_UNSTAMPED 0
+#endif
+
+#if (BOOT_CRC_TRUST_UNSTAMPED != 0) && (BOOT_CRC_TRUST_UNSTAMPED != 1)
+#error "BOOT_CRC_TRUST_UNSTAMPED must be defined to 0 or 1 (see Makefile / docs/dev/hardening.md)"
 #endif
 
 #ifndef BOOT_CRC_MAX_RESET_ATTEMPTS
@@ -106,8 +144,9 @@ boot_crc_status_t boot_crc_verify(void);
 void boot_crc_apply_policy(void);
 
 /* 1 when the running image may be trusted for nominal operations
- * (BOOT_CRC_OK or an unstamped bench build), 0 when the OBC must stay in the
- * safe state. Consulted by the state machine on every transition. */
+ * (BOOT_CRC_OK, plus BOOT_CRC_UNSTAMPED only when the build explicitly opted
+ * in with BOOT_CRC_TRUST_UNSTAMPED=1), 0 when the OBC must stay in the safe
+ * state. Consulted by the state machine on every transition. */
 int boot_crc_image_trusted(void);
 
 /* Accessors for the latched result (valid after boot_crc_verify()). */

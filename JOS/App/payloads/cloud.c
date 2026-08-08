@@ -2,6 +2,7 @@
 #include "memory.h"
 #include "state_machine.h"
 #include "watchdog.h"
+#include "obsw_delay.h"
 #include "MAX11128.h"
 #include "main.h"
 #include "FreeRTOS.h"
@@ -122,8 +123,16 @@ static void cloud_task(void *arg)
             cloud_acquire(&sample);
         }
 
-        /* Check once per orbit (~90 min) — placeholder interval */
-        osDelay(pdMS_TO_TICKS(90UL * 60 * 1000));
+        /* Check once per orbit (~90 min) — placeholder interval.
+         *
+         * NOT osDelay(pdMS_TO_TICKS(WDG_PERIOD_CLOUD_MS)): pdMS_TO_TICKS()
+         * multiplies by configTICK_RATE_HZ (1000) in a 32-bit TickType_t, so
+         * 5 400 000 ms overflows and the task would actually wake every
+         * ~18.3 min. obsw_delay_ms() sleeps in overflow-free chunks and the
+         * period is taken from the same constant the task registers with, so
+         * the declared watchdog period and the real cadence cannot drift
+         * apart. */
+        obsw_delay_ms(WDG_PERIOD_CLOUD_MS);
     }
 }
 

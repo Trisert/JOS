@@ -11,10 +11,33 @@ typedef struct {
     uint32_t     expected_period_ms;
     uint32_t     last_tick;
     uint8_t      registered;
+    /* 0 until the task has reported liveness at least once. An unarmed entry
+       is judged against the start-up grace window instead of 3x its period,
+       because its last_tick is only a seed (see watchdog.h). */
+    uint8_t      armed;
+    /* 0 until last_tick holds a tick sampled *after* osKernelStart(). Tasks
+       registered from main() are seeded by the monitor on its first scan. */
+    uint8_t      seeded;
 } wdg_entry_t;
 
 static wdg_entry_t wdg_tasks[WDG_MAX_TASKS];
 static osMutexId_t wdg_mutex;
+
+/* Deadline helper: 3x the declared period, saturating instead of wrapping.
+   WDG_PERIOD_CLOUD_MS is already 5 400 000 ms, so the multiplication is worth
+   guarding before someone declares a bigger one. */
+static uint32_t wdg_silence_limit_ms(uint32_t period_ms)
+{
+    return (period_ms > (UINT32_MAX / 3u)) ? UINT32_MAX : (period_ms * 3u);
+}
+
+/* A tick sampled before the scheduler runs is meaningless (xTaskGetTickCount()
+   reads 0 and stays there), so registrations from main() are marked unseeded
+   and the monitor stamps them with the first real tick it sees. */
+static uint8_t wdg_kernel_is_running(void)
+{
+    return (osKernelGetState() == osKernelRunning) ? 1u : 0u;
+}
 
 /* ---------- Public functions ---------- */
 
@@ -28,6 +51,8 @@ void watchdog_monitor_init(void)
 
     for (int i = 0; i < WDG_MAX_TASKS; i++) {
         wdg_tasks[i].registered = 0;
+        wdg_tasks[i].armed      = 0;
+        wdg_tasks[i].seeded     = 0;
     }
 }
 
@@ -40,11 +65,17 @@ int watchdog_register_task(osThreadId_t handle, uint32_t expected_period_ms)
     }
 
     osMutexAcquire(wdg_mutex, osWaitForever);
+    const uint8_t running = wdg_kernel_is_running();
     for (int i = 0; i < WDG_MAX_TASKS; i++) {
         if (wdg_tasks[i].registered && wdg_tasks[i].handle == handle) {
             /* Already registered (e.g. task re-created): refresh in place. */
             wdg_tasks[i].expected_period_ms = expected_period_ms;
-            wdg_tasks[i].last_tick          = xTaskGetTickCount();
+            wdg_tasks[i].last_tick          = running ? xTaskGetTickCount() : 0u;
+            wdg_tasks[i].seeded             = running;
+            /* Re-registration is not a liveness report: a task that
+               re-declares its period gets a fresh grace window rather than
+               inheriting the previous armed state. */
+            wdg_tasks[i].armed              = 0u;
             osMutexRelease(wdg_mutex);
             return 0;
         }
@@ -53,7 +84,9 @@ int watchdog_register_task(osThreadId_t handle, uint32_t expected_period_ms)
         if (!wdg_tasks[i].registered) {
             wdg_tasks[i].handle            = handle;
             wdg_tasks[i].expected_period_ms = expected_period_ms;
-            wdg_tasks[i].last_tick          = xTaskGetTickCount();
+            wdg_tasks[i].last_tick          = running ? xTaskGetTickCount() : 0u;
+            wdg_tasks[i].seeded             = running;
+            wdg_tasks[i].armed              = 0u;
             wdg_tasks[i].registered         = 1;
             osMutexRelease(wdg_mutex);
             return 0;
@@ -77,6 +110,10 @@ void watchdog_alive(const osThreadId_t handle)
     for (int i = 0; i < WDG_MAX_TASKS; i++) {
         if (wdg_tasks[i].registered && wdg_tasks[i].handle == handle) {
             wdg_tasks[i].last_tick = xTaskGetTickCount();
+            /* First real report from the task: leave the grace window and
+               start judging it against its declared period. */
+            wdg_tasks[i].seeded    = 1u;
+            wdg_tasks[i].armed     = 1u;
             break;
         }
     }
@@ -154,17 +191,36 @@ static void watchdog_monitor_task(void *arg)
         for (int i = 0; i < WDG_MAX_TASKS; i++) {
             if (!wdg_tasks[i].registered) continue;
 
+            /* Registered before osKernelStart(): last_tick is not a real
+               tick. Stamp it with the first tick the monitor actually
+               observes and give the task its grace window from here, instead
+               of reporting a hang that only measures the boot sequence. */
+            if (!wdg_tasks[i].seeded) {
+                wdg_tasks[i].last_tick = now;
+                wdg_tasks[i].seeded    = 1u;
+                continue;
+            }
+
             uint32_t elapsed = (now - wdg_tasks[i].last_tick)
                                * portTICK_PERIOD_MS;
-            /* Allow 3x the expected period before flagging */
-            if (elapsed > wdg_tasks[i].expected_period_ms * 3) {
+
+            /* Armed tasks (they have reported at least once) are held to 3x
+               their declared period. A task that has not reported yet is
+               still in bring-up, so it gets the longer of that limit and the
+               start-up grace window. */
+            uint32_t limit = wdg_silence_limit_ms(wdg_tasks[i].expected_period_ms);
+            if ((!wdg_tasks[i].armed) && (limit < WDG_STARTUP_GRACE_MS)) {
+                limit = WDG_STARTUP_GRACE_MS;
+            }
+
+            if (elapsed > limit) {
                 /* TODO: log anomaly, optionally suspend/delete task */
             }
         }
         osMutexRelease(wdg_mutex);
 
-        /* Check every 500 ms */
-        osDelay(pdMS_TO_TICKS(500));
+        /* Check every WDG_MONITOR_PERIOD_MS */
+        osDelay(pdMS_TO_TICKS(WDG_MONITOR_PERIOD_MS));
     }
 }
 

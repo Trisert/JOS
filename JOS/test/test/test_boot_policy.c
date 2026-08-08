@@ -99,16 +99,20 @@ static void assert_fault_record(uint32_t slot, uint32_t timestamp,
  * boot_crc_image_trusted()
  * ===================================================================== */
 
-/* Only a verified image and an unstamped bench build may be trusted. ERASED
- * and MISMATCH must confine the satellite to the safe state; treating either
- * as trustworthy would let a corrupted image run payload operations. */
-void test_boot_crc_image_trusted_only_for_ok_and_unstamped(void)
+/* With the flight policy (BOOT_CRC_TRUST_UNSTAMPED = 0, the default) only a
+ * verified image may be trusted. MISMATCH and ERASED are obvious faults;
+ * UNSTAMPED is one too, because an image flashed straight from the .elf
+ * (CubeIDE / OpenOCD, or `make crc-stamp` skipped) carries no integrity
+ * evidence at all - trusting it turns the whole boot check into a no-op on
+ * exactly the path most likely to be used by hand.
+ * test_boot_unstamped_bench.c pins the opposite, opt-in bench behaviour. */
+void test_boot_crc_image_trusted_only_for_a_verified_image(void)
 {
     stamp_and_verify(HOST_FW_IMAGE_CRC, BOOT_CRC_OK);
     TEST_ASSERT_EQUAL_INT(1, boot_crc_image_trusted());
 
     stamp_and_verify(BOOT_CRC_UNSTAMPED_VALUE, BOOT_CRC_UNSTAMPED);
-    TEST_ASSERT_EQUAL_INT(1, boot_crc_image_trusted());
+    TEST_ASSERT_EQUAL_INT(0, boot_crc_image_trusted());
 
     stamp_and_verify(POLICY_BAD_STAMP, BOOT_CRC_MISMATCH);
     TEST_ASSERT_EQUAL_INT(0, boot_crc_image_trusted());
@@ -180,15 +184,29 @@ void test_boot_crc_apply_policy_on_trusted_image_rearms_the_budget(void)
     TEST_ASSERT_EQUAL_UINT32(0u, host_nvic_reset_count());
 }
 
-/* An unstamped bench build is trusted, so it takes the same no-op path. */
-void test_boot_crc_apply_policy_on_unstamped_image_records_nothing(void)
+/* An unstamped image is a fault verdict under the flight policy: it is
+ * recorded with its own status (not collapsed into MISMATCH) and it spends
+ * the recovery budget like any other untrusted image. This is the test that
+ * would have failed while boot_crc_image_trusted() returned 1 for UNSTAMPED,
+ * i.e. while the CubeIDE/OpenOCD flashing path silently bypassed the check. */
+void test_boot_crc_apply_policy_on_unstamped_image_is_a_fault(void)
 {
     stamp_and_verify(BOOT_CRC_UNSTAMPED_VALUE, BOOT_CRC_UNSTAMPED);
-    boot_crc_apply_policy();
+    TEST_ASSERT_EQUAL_INT(0, boot_crc_image_trusted());
 
+    HOST_EXPECT_NVIC_RESET(boot_crc_apply_policy());
+
+    TEST_ASSERT_EQUAL_UINT32(1u, boot_crc_get_reset_attempts());
+    TEST_ASSERT_EQUAL_UINT32(1u, host_nvic_reset_count());
+    TEST_ASSERT_EQUAL_UINT32(1u, laststates_count());
+    assert_fault_record(0u, 0u, BOOT_CRC_UNSTAMPED, BOOT_CRC_UNSTAMPED_VALUE, 0u);
+
+    /* This executable shares one .noinit across its tests, the way successive
+     * warm resets share it on the spacecraft. Hand the next test the clean
+     * cold-start budget it documents as its precondition. */
+    stamp_and_verify(HOST_FW_IMAGE_CRC, BOOT_CRC_OK);
+    boot_crc_apply_policy();
     TEST_ASSERT_EQUAL_UINT32(0u, boot_crc_get_reset_attempts());
-    TEST_ASSERT_EQUAL_UINT32(0u, laststates_count());
-    TEST_ASSERT_EQUAL_UINT32(0u, host_nvic_reset_count());
 }
 
 /* Proof that the re-arm above is real and not just a cleared accessor: after
