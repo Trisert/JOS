@@ -160,6 +160,12 @@ int main(void)
   cyclic_buffer_init();
   laststates_init();
 
+  /* Flush the SRAM2 boot-time findings captured by sram2_parity_init() into
+     the now-initialised LastStates pool. Must run after laststates_init()
+     (which resets the pool write index) and before any transition is logged,
+     so the fault record is not overwritten by the first post-boot event. */
+  (void)sram2_parity_persist_boot_records();
+
   /* W2-1: if the previous run died on an MPU violation, the staged fault
      record is persisted here, at task level, where flash programming is
      bounded — never from the MemManage handler itself. Done before the boot

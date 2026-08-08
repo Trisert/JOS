@@ -50,6 +50,7 @@ enum {
     SRAM2_EVENT_PARITY_NMI = 0U,  /* NMI with SYSCFG_CFGR2.SPF set           */
     SRAM2_EVENT_OTHER_NMI  = 1U,  /* NMI from another source (e.g. RCC CSS)  */
     SRAM2_EVENT_BOOT_LATCH = 2U,  /* SPF already latched when init() ran     */
+    SRAM2_EVENT_ERASE_FAIL = 3U,  /* SRAM2 hardware erase never completed    */
 };
 
 /* Marker so ground can find these records inside a LastStates context blob. */
@@ -84,8 +85,54 @@ typedef struct {
   *
   * @note MUST be called before any SRAM2_CRITICAL / SRAM2_CRITICAL_NOINIT
   *       object is read or written - the hardware erase wipes the whole block.
+  * @note Boot-time findings (latched parity flag, failed erase) are NOT
+  *       written to Flash here: the LastStates write index is only valid once
+  *       laststates_init() has run. Call sram2_parity_persist_boot_records()
+  *       right after laststates_init() to flush them.
   */
 void sram2_parity_init(void);
+
+/**
+  * @brief  Flush the boot-time parity records captured by sram2_parity_init().
+  *
+  * Must be called after laststates_init(), which (re)sets the LastStates pool
+  * write index: a record persisted before that call is overwritten by the
+  * first transition logged after boot. The records were fully built at
+  * detection time - every status register was sampled before it was cleared -
+  * so deferring the Flash write does not change their contents.
+  *
+  * @retval >=0 number of records written, 0 when nothing was pending.
+  * @retval -1  at least one Flash write failed (records are dropped, one shot:
+  *             the boot-fault flag stays set so the safe state is still taken).
+  */
+int sram2_parity_persist_boot_records(void);
+
+/**
+  * @brief  Non-zero when boot found SRAM2 in a non-nominal condition.
+  * @note   Set when a parity NMI ended the previous run (latched in a
+  *         reset-stable .noinit store in SRAM1, because .bss and SYSCFG_CFGR2
+  *         .SPF are both cleared by a system reset), when the parity flag was
+  *         already latched at boot, or when the SRAM2 hardware erase did not
+  *         complete. The state machine uses it to start in the safe state
+  *         (STATE_CRIT) instead of continuing to READY on data whose
+  *         integrity is not established.
+  */
+int sram2_parity_boot_fault(void);
+
+/**
+  * @brief  Parity-triggered system resets seen since the last power-on.
+  * @note   Kept in the same reset-stable store, so ground can tell a single
+  *         upset from a hard-failed cell looping through reset after reset.
+  *         Only a power-on / brown-out reset clears it.
+  */
+uint32_t sram2_parity_reset_count(void);
+
+/**
+  * @brief  LastStates records the fault path could not write (Flash busy or
+  *         write error), counted in the reset-stable store so the loss is
+  *         observable instead of silent.
+  */
+uint32_t sram2_parity_dropped_records(void);
 
 /** @brief Parity check status as read back from the FLASH option bytes. */
 sram2_parity_status_t sram2_parity_get_status(void);
