@@ -169,9 +169,10 @@ _Static_assert(sizeof(sram2_parity_record_t) <=
    boot after a firmware update and the recovery below threw away every
    salvaged counter: a reset-stable store that does not survive an OTA is not
    reset-stable, it is just slow to lose data. The version word makes the
-   layout explicit, and sram2_store_recover() recognises the pre-version
-   layout and MIGRATES it (authenticating it with the old checksum formula
-   when that layout carried one) instead of calling it garbage. Bump
+   layout explicit, and sram2_store_recover() recognises EVERY pre-version
+   layout - all three of them - and MIGRATES it (authenticating it with that
+   layout's own checksum formula when it carried one) instead of calling it
+   garbage. Bump
    SRAM2_STORE_VERSION on any future field change and teach the migration
    path about the layout it replaces. */
 
@@ -203,9 +204,21 @@ _Static_assert(sizeof(sram2_parity_record_t) <=
 
 /* Layout id of sram2_fault_store_t. Version 1 is every pre-version layout
    (no version word): the 6-word shape that flew first (magic pair, boot_fault,
-   last_event, parity_resets, dropped_records - no checksum at all) and the
-   8-word shape that added erase_busy_resets + chk. Version 2 is the struct
-   below. */
+   last_event, parity_resets, dropped_records - no checksum at all), the
+   8-word shape that added erase_busy_resets + chk, and the 11-word shape of
+   a975896 that appended clock_faults / first_busy_scsr / first_busy_cfgr2
+   ahead of its chk. Version 2 is the struct below.
+
+   The 11-word shape is the one every unit flashed with a975896 is carrying
+   right now, and omitting it from this catalogue was not a documentation gap.
+   Its chk lives at word 10; read through the 8-word view, word 7 is
+   clock_faults, so sram2_store_v1_checksum() could never match, v1_authentic
+   stayed 0 and erase_busy_resets was migrated as 0 - the wedged-erase reboot
+   budget re-armed by the very migration that exists to preserve it, on the
+   first boot after the update this PR ships (Kilo #26, sram2_parity.c:184).
+   Every pre-version shape that ever carried a checksum now has a view and a
+   checksum function of its own, and the migration believes the richest one
+   that authenticates. */
 #define SRAM2_STORE_VERSION     2U
 
 /* What the version WORD actually holds: the layout id in the low half and its
@@ -258,12 +271,33 @@ typedef struct {
     uint32_t chk;
 } sram2_fault_store_v1_t;
 
-/* One object, two views. A union (rather than a cast of &sram2_store) keeps
-   both layouts at the same .noinit address without type-punning through an
-   incompatible pointer. */
+/* The LAST pre-version layout (a975896): the 8-word shape plus clock_faults /
+   first_busy_scsr / first_busy_cfgr2, with the checksum pushed out to word 10
+   and still computed over payload words only. This is the shape sitting in
+   .noinit on every unit that runs the currently deployed image, so it is the
+   migration path that actually gets exercised by this PR - which is exactly
+   why its absence from the catalogue silently zeroed erase_busy_resets. */
+typedef struct {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t boot_fault;
+    uint32_t last_event;
+    uint32_t parity_resets;
+    uint32_t dropped_records;
+    uint32_t erase_busy_resets;
+    uint32_t clock_faults;
+    uint32_t first_busy_scsr;
+    uint32_t first_busy_cfgr2;
+    uint32_t chk;
+} sram2_fault_store_v1_11w_t;
+
+/* One object, several views. A union (rather than a cast of &sram2_store)
+   keeps every layout at the same .noinit address without type-punning through
+   an incompatible pointer. */
 typedef union {
     sram2_fault_store_t    v2;
     sram2_fault_store_v1_t v1;
+    sram2_fault_store_v1_11w_t v1_11w;
 } sram2_store_image_t;
 
 static volatile sram2_store_image_t sram2_store_image
@@ -339,9 +373,9 @@ static int sram2_store_version_is_current(void)
     return 0;
 }
 
-/* The checksum formula of the version-1 layout (payload words only, no
-   version word, three fields short). Used exclusively to authenticate a store
-   left behind by the previous firmware image before migrating it: a match
+/* The checksum formula of the 8-word version-1 shape (payload words only, no
+   version word, four fields short). Used exclusively to authenticate a store
+   left behind by a previous firmware image before migrating it: a match
    means those words really are the old store and not .noinit debris that
    happens to carry our magic. */
 static uint32_t sram2_store_v1_checksum(void)
@@ -351,6 +385,24 @@ static uint32_t sram2_store_v1_checksum(void)
            sram2_store_image.v1.parity_resets     ^
            sram2_store_image.v1.dropped_records   ^
            sram2_store_image.v1.erase_busy_resets ^
+           SRAM2_STORE_MAGIC;
+}
+
+/* Same idea for the 11-word version-1 shape of a975896: still payload-only
+   and still no version word, but three fields longer, so the checksum covers
+   clock_faults / first_busy_scsr / first_busy_cfgr2 too and lands at word 10
+   instead of word 7. Authenticating through THIS formula is what lets the
+   deployed store keep its erase_busy_resets across the update. */
+static uint32_t sram2_store_v1_11w_checksum(void)
+{
+    return sram2_store_image.v1_11w.boot_fault        ^
+           sram2_store_image.v1_11w.last_event        ^
+           sram2_store_image.v1_11w.parity_resets     ^
+           sram2_store_image.v1_11w.dropped_records   ^
+           sram2_store_image.v1_11w.erase_busy_resets ^
+           sram2_store_image.v1_11w.clock_faults      ^
+           sram2_store_image.v1_11w.first_busy_scsr   ^
+           sram2_store_image.v1_11w.first_busy_cfgr2  ^
            SRAM2_STORE_MAGIC;
 }
 
@@ -392,16 +444,38 @@ static void sram2_store_recover(void)
            can gate the view switch instead of merely decorating it (Kilo #26,
            comment id 3741302888).
 
-           erase_busy_resets only exists in the 8-word shape of version 1; in
-           the original 6-word shape that word aliases unrelated .noinit
-           content, so it is carried over ONLY when the old checksum
-           authenticates it. Zeroing it there is not the evidence-deleting move
-           roast 3741110977 is about: the counter genuinely did not exist in
-           that layout, so there is no history to preserve and no budget being
-           re-armed by a corruption. */
+           Two of the three version-1 shapes carry a checksum, at DIFFERENT
+           offsets, so each is tried through its own view. The 11-word shape of
+           a975896 is tried first because it is the richest - and because it is
+           the one actually flashed on hardware, which is why leaving it out
+           re-armed the erase budget on the first boot after this very update
+           (Kilo #26, sram2_parity.c:184).
+
+           erase_busy_resets exists in both checksummed shapes; in the original
+           6-word shape that word aliases unrelated .noinit content, so it is
+           carried over ONLY when one of the old checksums authenticates it.
+           Zeroing it there is not the evidence-deleting move roast 3741110977
+           is about: the counter genuinely did not exist in that layout, so
+           there is no history to preserve and no budget being re-armed by a
+           corruption. */
         const int v1_authentic =
             (magic_words == 2) &&
             (sram2_store_image.v1.chk == sram2_store_v1_checksum());
+
+        /* The two formulas are NOT independent: the 11-word checksum XORs in
+           exactly the words the 8-word one covers PLUS the word the 8-word
+           shape keeps its chk in, so for an 8-word store whose three trailing
+           .noinit words are zero the 11-word formula collapses to 0 - and
+           word 10 is one of those zeros, so it "authenticates". Reading that
+           store through the 11-word view would import the old chk word as
+           clock_faults, saturate it at SRAM2_STORE_COUNT_SANE and retire the
+           CSS record budget for the rest of the mission. Whenever the SHORTER
+           shape authenticates it wins; a genuine a975896 store cannot satisfy
+           the 8-word formula, which needs clock_faults to equal a value with
+           SRAM2_STORE_MAGIC XORed into it. */
+        const int v1_11w_authentic =
+            (magic_words == 2) && (v1_authentic == 0) &&
+            (sram2_store_image.v1_11w.chk == sram2_store_v1_11w_checksum());
 
         /* The checksum-less 6-word shape cannot authenticate itself, so it has
            to look like itself instead: an old boot_fault is 0 or 1 (this is
@@ -421,7 +495,8 @@ static void sram2_store_recover(void)
            agree before the payload is reinterpreted one word out of phase. */
         const int layout_is_v1 =
             (sram2_store_version_is_current() == 0) &&
-            ((v1_authentic != 0) || (v1_self_consistent != 0));
+            ((v1_11w_authentic != 0) || (v1_authentic != 0) ||
+             (v1_self_consistent != 0));
 
         if (layout_is_v1) {
             /* ---- Pre-version layout: a firmware update, not corruption ----
@@ -440,16 +515,24 @@ static void sram2_store_recover(void)
                direction (Kilo #26, comment id 3741302888). */
             fault   = ((sram2_store_image.v1.boot_fault != 0U) ||
                        (sram2_store.boot_fault != 0U)) ? 1U : 0U;
-            busy    = (v1_authentic != 0)
+            busy    = ((v1_11w_authentic != 0) || (v1_authentic != 0))
                           ? sram2_store_image.v1.erase_busy_resets : 0U;
-            /* clock_faults / first_busy_* had no equivalent in version 1. */
-            clocks  = 0U;
-            bscsr   = 0U;
-            bcfgr2  = 0U;
+            /* clock_faults / first_busy_* exist only in the 11-word shape, and
+               only that shape's checksum can vouch for the words: through any
+               other view they are .noinit debris. Migrating them matters -
+               clock_faults is the CSS record budget, and re-arming it lets a
+               dead crystal program the whole LastStates pool away. */
+            clocks  = (v1_11w_authentic != 0)
+                          ? sram2_store_image.v1_11w.clock_faults : 0U;
+            bscsr   = (v1_11w_authentic != 0)
+                          ? sram2_store_image.v1_11w.first_busy_scsr : 0U;
+            bcfgr2  = (v1_11w_authentic != 0)
+                          ? sram2_store_image.v1_11w.first_busy_cfgr2 : 0U;
 
             if (resets  > SRAM2_STORE_COUNT_SANE) { resets  = SRAM2_STORE_COUNT_SANE; }
             if (dropped > SRAM2_STORE_COUNT_SANE) { dropped = SRAM2_STORE_COUNT_SANE; }
             if (busy    > SRAM2_STORE_COUNT_SANE) { busy    = SRAM2_STORE_COUNT_SANE; }
+            if (clocks  > SRAM2_STORE_COUNT_SANE) { clocks  = SRAM2_STORE_COUNT_SANE; }
 
             if (event > (uint32_t)SRAM2_EVENT_LAST) {
                 event = (uint32_t)SRAM2_EVENT_STORE_LOST;
