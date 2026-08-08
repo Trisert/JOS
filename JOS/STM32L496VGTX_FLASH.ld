@@ -164,7 +164,11 @@ SECTIONS
      .sram2        : initialised data, load image kept in Flash and copied by
                      sram2_parity_init() (startup.s only copies .data).
      .sram2_noinit : NOLOAD buffers, zeroed by the SRAM2 hardware erase that
-                     sram2_parity_init() performs before any access.       */
+                     sram2_parity_init() performs before any access.
+
+     NOTE: this block MUST stay *before* .fw_crc — .sram2 has its load image
+     in Flash (AT> FLASH), so placing it after the CRC word would push loaded
+     bytes past __fw_crc_start and break the boot CRC32 check (W2 / PR #10). */
   _sisram2 = LOADADDR(.sram2);
 
   .sram2 :
@@ -191,11 +195,9 @@ SECTIONS
   _sram2_region_start = ORIGIN(RAM2);
   _sram2_region_end   = ORIGIN(RAM2) + LENGTH(RAM2);
 
-  /* Firmware image CRC32 — MUST stay the last loaded section (it follows the
-     .sram2 load image on purpose) so that the checked region is exactly
-     [__fw_image_start, __fw_crc_start) and the stored CRC word is the last
-     4 bytes of the .bin image. The SRAM2 initialised image is therefore
-     covered by the boot CRC too.
+  /* Firmware image CRC32 — MUST stay the last loaded section so that the
+     checked region is exactly [__fw_image_start, __fw_crc_start) and the
+     stored CRC word is the last 4 bytes of the .bin image.
      Contents are the placeholder 0x00000000 (deliberately NOT the erased
      Flash pattern) until `make crc-stamp` / tools/fw_crc_stamp.py patches
      the built binary. */

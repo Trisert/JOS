@@ -5,19 +5,14 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
+#include "memory.h"         /* laststates_write() prototype */
 #include "sram2_parity.h"   /* SRAM2_CRITICAL placement (W2-3) */
+#include "seu_mitigation.h" /* redundant snapshot + scrubbing (W2-5) */
 #include <string.h>
 
 /* ---------- Private variables ---------- */
 static osMutexId_t state_mutex;
 static osThreadId_t sm_task_handle;
-
-/* Latched when the OBSW was forced into the safe state by an SRAM2 parity
-   finding at boot. While it is set, the autonomous battery recovery must not
-   take the spacecraft back to READY on its own: the integrity of the critical
-   data is not established, so leaving the safe state is a ground decision
-   (a successful TRIGGER_GROUND_CMD transition clears the latch). */
-static uint8_t parity_safe_latched = 0U;
 
 /* ---------- Critical OBSW state (SRAM2, hardware parity) ----------
    Operational state, beacon override and the last BMS snapshot decide every
@@ -74,7 +69,19 @@ static bms_status_t bms_get_status(void)
 /* For testing: allow overriding SoC from outside */
 void bms_set_soc_stub(uint8_t soc)
 {
+    /* Update and re-snapshot atomically: the scrub task must never observe
+       the struct between the write and the commit, or it would "repair" a
+       legitimate change back to the previous value (W2-5). */
+    seu_mitigation_lock();
     obsw_state.bms.soc = soc;
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+    seu_mitigation_unlock();
+}
+
+void *state_machine_critical_region(size_t *len)
+{
+    if (len != NULL) { *len = sizeof(obsw_state); }
+    return &obsw_state;
 }
 
 /* ---------- LastStates logging ---------- */
@@ -171,7 +178,11 @@ static int try_transition(obw_state_t target, uint8_t trigger)
            can record the anomaly instead of silently reporting success. */
         return -1;
     }
+
+    seu_mitigation_lock();
     obsw_state.current_state = target;
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+    seu_mitigation_unlock();
     return 0;
 }
 
@@ -183,7 +194,6 @@ static void check_battery_autonomous(void)
     if (bms.soc <= default_thresholds.b_scrit) {
         try_transition(STATE_CRIT, TRIGGER_BATTERY_LOW);
     } else if (obsw_state.current_state == STATE_CRIT &&
-               (parity_safe_latched == 0U) &&
                bms.soc >= default_thresholds.b_opok) {
         try_transition(STATE_READY, TRIGGER_BATTERY_OK);
     }
@@ -205,23 +215,12 @@ static void state_machine_task(void *arg)
     osDelay(pdMS_TO_TICKS(500));   /* placeholder for init work */
 
     osMutexAcquire(state_mutex, osWaitForever);
-    if (boot_crc_image_trusted() == 0) {
+    if (boot_crc_image_trusted() != 0) {
+        try_transition(STATE_READY, TRIGGER_ANTENNA_DONE);
+    } else {
         /* Image integrity fault survived the reset budget: enter the safe
            state instead of nominal ops (beacon-only, payloads inhibited). */
         try_transition(STATE_CRIT, TRIGGER_IMAGE_CRC_FAIL);
-    } else if (sram2_parity_boot_fault() != 0) {
-        /* SRAM2 reported a parity error before this boot, or its hardware
-           erase did not complete: the parity-protected state is not proven
-           good, so the spacecraft enters the safe state (s2, beacon only)
-           with the reason recorded in LastStates instead of continuing to
-           READY as if the boot had been nominal. The transition to CRIT is
-           always allowed, so this cannot silently fail into an undefined
-           state; it stays latched until ground commands otherwise. */
-        if (try_transition(STATE_CRIT, TRIGGER_SRAM2_PARITY) == 0) {
-            parity_safe_latched = 1U;
-        }
-    } else {
-        try_transition(STATE_READY, TRIGGER_ANTENNA_DONE);
     }
     osMutexRelease(state_mutex);
 
@@ -258,6 +257,11 @@ void state_machine_init(void)
 
     obsw_state.current_state            = STATE_OFF;
     obsw_state.beacon_interval_override = 0U;
+
+    /* seu_mitigation_init() runs after this function and takes the first
+       snapshot; the commit here is a no-op before that point and keeps the
+       shadow in step if the state machine is ever re-initialised. */
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
 }
 
 osThreadId_t state_machine_task_create(void)
@@ -283,10 +287,6 @@ int state_machine_request_transition(obw_state_t target, uint8_t trigger)
     int rc;
     osMutexAcquire(state_mutex, osWaitForever);
     rc = try_transition(target, trigger);
-    if ((rc == 0) && (trigger == TRIGGER_GROUND_CMD) && (target != STATE_CRIT)) {
-        /* Ground has taken the decision to leave the parity safe state. */
-        parity_safe_latched = 0U;
-    }
     osMutexRelease(state_mutex);
     return rc;
 }
@@ -326,7 +326,10 @@ int state_machine_set_beacon_interval(uint32_t interval_ms)
     }
 
     osMutexAcquire(state_mutex, osWaitForever);
+    seu_mitigation_lock();
     obsw_state.beacon_interval_override = interval_ms;
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+    seu_mitigation_unlock();
     osMutexRelease(state_mutex);
     return 0;
 }

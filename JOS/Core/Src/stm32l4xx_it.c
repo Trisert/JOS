@@ -26,6 +26,7 @@
 /* USER CODE BEGIN Includes */
 #include "dual_bank.h"
 #include "sram2_parity.h"
+#include "seu_mitigation.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -74,17 +75,21 @@
 void NMI_Handler(void)
 {
   /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
-  /* Both the SRAM2 parity error (SYSCFG_CFGR2.SPF) and the RCC clock-security
-     system vector here, as does the dual-bank early-boot fault hook (W2-2).
-     Dispatch on the actual NMI source: sram2_parity_nmi_handler() records the
-     failure context in the LastStates pool and resets the OBSW; it never
-     returns, so the spin below is unreachable (W2-3). If no SRAM2 parity flag
-     is latched the NMI is the dual-bank boot-fault path, which records and
-     resets (or spins, under -DDUAL_BANK_FAULT_NO_RESET). */
-  if (__HAL_SYSCFG_GET_FLAG(SYSCFG_FLAG_SRAM2_PE) != 0U) {
-      sram2_parity_nmi_handler();
-  }
+  /* Record the boot-phase fault for the dual-bank fallback and reset (W2-2).
+     Recording is RAM-only and ISR-safe (no Flash, no HAL, no blocking); the
+     reset is issued here because this build has no IWDG to do it for us, so
+     the loop below would otherwise be a permanent silent hang and the
+     fallback threshold could never be reached. See Core/Inc/dual_bank.h. */
   dual_bank_handle_boot_fault();
+  /* SRAM2 parity error (SYSCFG_CFGR2.SPF) and the RCC clock security
+     system both vector here. sram2_parity_nmi_handler() records the
+     failure context in the LastStates pool and resets the OBSW; it
+     never returns, so the spin below is unreachable (W2-3). */
+  /* Count the upset in the RTC backup domain first: the call below
+     records the context and resets, so an in-RAM counter would not
+     survive its own event (W2-5). */
+  seu_mitigation_nmi_hook();
+  sram2_parity_nmi_handler();
   /* USER CODE END NonMaskableInt_IRQn 0 */
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
    while (1)

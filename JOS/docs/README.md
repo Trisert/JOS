@@ -10,6 +10,7 @@ Welcome to the JOS (RedPill) On-Board Software documentation.
 | Verification simulation | [docs/dev/simulation.md](dev/simulation.md) |
 | Fault tolerance (boot CRC, watchdog) | [docs/dev/hardening.md](dev/hardening.md) |
 | SRAM2 parity / critical data | [docs/dev/sram2_parity.md](dev/sram2_parity.md) |
+| SEU mitigation / RAM scrubbing | [docs/dev/seu_mitigation.md](dev/seu_mitigation.md) |
 | Understanding modules | [docs/api/](api/) |
 | System design | [docs/arch/README.md](arch/README.md) |
 | Operating the satellite | [docs/user/README.md](user/README.md) |
@@ -33,6 +34,7 @@ docs/
 │   ├── simulation.md   # ESP32 dual-board HIL verification
 │   ├── hardening.md    # Boot CRC32 integrity + task watchdog monitoring
 │   ├── sram2_parity.md # SRAM2 parity NMI for critical data (W2-3)
+│   ├── seu_mitigation.md # Periodic RAM scrubbing + SEU counters (W2-5)
 │   ├── coding_standards.md
 │   └── debugging.md
 └── user/               # User manual (ground operators)

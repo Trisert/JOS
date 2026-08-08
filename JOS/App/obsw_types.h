@@ -50,14 +50,15 @@ enum {
     TRIGGER_STACK_OVERFLOW  = 9,  /* FreeRTOS stack overflow hook             */
     TRIGGER_IMAGE_CRC_FAIL  = 10, /* boot CRC32 integrity fault */
     TRIGGER_MPU_FAULT       = 11, /* MemManage fault recorded before reset */
+    TRIGGER_SRAM2_PARITY    = 12, /* SRAM2 parity error NMI (see sram2_parity.h) */
+    TRIGGER_SEU_SCRUB       = 13, /* SEU scrub / SEU history (seu_mitigation.h) */
     /* Dual-bank golden-image fallback bookkeeping (Core/Src/dual_bank.c).
        Entries carrying these triggers are tagged 'DBNK' in context[0..3].
-       Numbered after the fault/CRC/MPU triggers already merged on main
-       (#9/#10/#13); the wire values are part of the ground telemetry
-       contract, so existing codes are never renumbered. */
-    TRIGGER_BOOT_FAULT      = 12,  /* HardFault/NMI during early boot */
-    TRIGGER_BOOT_OK         = 13,  /* boot reached the scheduler      */
-    TRIGGER_SRAM2_PARITY    = 14, /* SRAM2 parity error NMI (see sram2_parity.h) */
+       Numbered after the fault/CRC/MPU/SRAM2/SEU triggers already merged on
+       main (#9/#10/#13/#14/#17); the wire values are part of the ground
+       telemetry contract, so existing codes are never renumbered. */
+    TRIGGER_BOOT_FAULT      = 14,  /* HardFault/NMI during early boot */
+    TRIGGER_BOOT_OK         = 15,  /* boot reached the scheduler      */
 };
 
 /* ---------- BMS interface (stub for now) ---------- */

@@ -9,9 +9,10 @@
 
 /* TODO: include RadioLib headers and implement STM32 HAL wrapper */
 
-/* Packet sizes live in comms.h (COMMS_MAX_PACKET / COMMS_BEACON_SIZE) because
-   the buffers themselves are now SRAM2-resident; telecommand opcodes belong to
-   the uplink validation gate, not to this transport layer. */
+/* Packet buffer sizes now live in comms.h as COMMS_MAX_PACKET /
+   COMMS_BEACON_SIZE — the parity-protected SRAM2 buffers below are sized
+   from them, and callers need the same sizes. */
+
 extern SPI_HandleTypeDef hspi1;
 
 /* ---------- Packet buffers in SRAM2 (hardware parity) ----------
@@ -174,8 +175,6 @@ void lora_beacon_task(void *arg)
 
     for (;;) {
         uint32_t interval = state_machine_get_beacon_interval();
-        size_t beacon_len = 0U;
-        uint8_t *beacon = comms_beacon_buffer(&beacon_len);
 
         /* The beacon cadence is state-dependent (1..16 min) and can also be
            retargeted from ground via CMD_SET_BEACON_INTERVAL. Registering the
@@ -193,6 +192,10 @@ void lora_beacon_task(void *arg)
         }
 
         watchdog_alive_self();
+
+        size_t beacon_len = 0U;
+        uint8_t *beacon = comms_beacon_buffer(&beacon_len);
+
         /* TODO: build beacon packet (96 B telemetry + 32 B sys) in `beacon` */
         (void)beacon;
         (void)beacon_len;
@@ -238,8 +241,7 @@ void lora_rx_task(void *arg)
         uint8_t *rx = comms_rx_buffer(&rx_len);
 
         /* TODO: enter RX mode, wait for the DIO1 IRQ, read the PHY payload into
-         *       rx / rx_len (the SRAM2 parity-protected RX buffer), then gate
-         *       it through:
+         *       `rx` / rx_len, then gate it through:
          *           comms_tc_result_t r = comms_rx_handle_frame(rx, rx_len);
          *           if (r != COMMS_TC_OK) { log comms_tc_result_str(r); }
          *       which performs structure + CRC + opcode + range validation and

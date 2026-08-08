@@ -32,6 +32,7 @@
 #include "faults.h"
 #include "mpu.h"
 #include "sram2_parity.h"
+#include "seu_mitigation.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -112,9 +113,7 @@ int main(void)
   /* USER CODE BEGIN Init */
   /* SRAM2 hardware-parity protection for the critical OBSW data (W2-3).
      Runs before every other init: it hardware-erases SRAM2 and restores
-     the .sram2 image, so no SRAM2_CRITICAL object may be touched earlier.
-     Boot-time findings are only captured here; they are persisted by
-     sram2_parity_persist_boot_records() after laststates_init(). */
+     the .sram2 image, so no SRAM2_CRITICAL object may be touched earlier. */
   sram2_parity_init();
 
   /* USER CODE END Init */
@@ -167,14 +166,6 @@ int main(void)
      CRC policy below, which may reset and never return. */
   (void)mpu_fault_log_flush();
 
-  /* The LastStates pool write index only becomes valid here, so the parity
-     findings latched by sram2_parity_init() (which must run before every
-     other init) are written now - before any transition can claim index 0
-     and overwrite them (W2-3). Like the MPU flush above this deliberately
-     runs BEFORE boot_crc_apply_policy(), because that call may reset the OBC
-     and would otherwise drop the parity evidence of this boot. */
-  (void)sram2_parity_persist_boot_records();
-
   /* Act on the integrity result now that the fault can be persisted.
      BOOT_CRC_FATAL (=1 by default, see App/obsw/boot_crc.h): the fault is
      written to LastStates and the OBC resets up to
@@ -189,6 +180,11 @@ int main(void)
   lora_init();
   state_machine_init();
   watchdog_monitor_init();
+  /* SEU mitigation (W2-5): snapshot the critical structures once their
+     owners are initialised, so the periodic scrub has a trustworthy
+     reference to vote against. Must run after sram2_parity_init(),
+     laststates_init(), lora_init() and state_machine_init(). */
+  seu_mitigation_init();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -225,6 +221,7 @@ int main(void)
   watchdog_task_create();
   lora_beacon_task_create();
   lora_rx_task_create();
+  seu_scrub_task_create();   /* low-priority RAM scrubber (W2-5) */
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */

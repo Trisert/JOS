@@ -41,43 +41,13 @@ link-time `ASSERT` against overflowing the 64 KB block.
 other init, because it wipes the whole block:
 
 1. enable the SYSCFG clock (parity flag + SRAM2 erase control live there);
-2. if `SYSCFG_CFGR2.SPF` is already latched, **build** a
-   `SRAM2_EVENT_BOOT_LATCH` entry (all status registers are sampled here) and
-   clear the flag (a stale flag would mask the next event);
+2. if `SYSCFG_CFGR2.SPF` is already latched, record a `SRAM2_EVENT_BOOT_LATCH`
+   entry in LastStates and clear it (a stale flag would mask the next event);
 3. hardware-erase SRAM2 (`SYSCFG_SCSR.SRAM2ER`) — this writes valid parity for
-   every byte, so no later read can trip a spurious NMI. The erase is started
-   after the `SYSCFG_SKR` unlock sequence (`0xCA`, `0x53`) and the write
-   protection of `SRAM2ER` is **re-armed straight after** by writing a
-   non-key value, so no stray write can wipe the block at runtime. Completion
-   is detected on `SRAM2ER` clearing (not on `SRAM2BSY` alone, which can still
-   read 0 while the APB write that starts the erase is posted);
-4. copy the `.sram2` load image out of Flash — **skipped** when the erase did
-   not complete, so a half-erased block is never masked by fresh data; a
-   `SRAM2_EVENT_ERASE_FAIL` entry is built instead;
+   every byte, so no later read can trip a spurious NMI;
+4. copy the `.sram2` load image out of Flash;
 5. read back `FLASH_OPTR.SRAM2_PE` and expose the result via
    `sram2_parity_is_enabled()`.
-
-### Deferred persistence of the boot findings
-
-`sram2_parity_init()` must run before `laststates_init()`, which resets the
-LastStates pool write index. A record written from `init()` would therefore sit
-at an index the first post-boot transition overwrites (and on a pool that
-already holds an entry at index 0 the double-word program would fail with
-`PGSERR`). The entries are consequently only *built* at detection time and
-written by `sram2_parity_persist_boot_records()`, which `main()` calls
-immediately after `laststates_init()`. The write is one shot: a wedged Flash
-cannot turn boot into a write storm.
-
-### Safe state after a boot finding
-
-`sram2_parity_boot_fault()` reports a latched parity flag or a failed erase.
-The state-machine task consults it after `STATE_INIT` and transitions to
-`STATE_CRIT` (safe mode, beacon only) with trigger `TRIGGER_SRAM2_PARITY`
-instead of continuing to `STATE_READY`. The latch blocks the autonomous
-battery recovery out of `STATE_CRIT`; only a ground-commanded transition
-(`TRIGGER_GROUND_CMD`) clears it. The boot fault flag stays set even when the
-Flash record could not be written — the safe-state decision never depends on
-the evidence reaching Flash.
 
 ## Enabling the hardware check
 
@@ -111,16 +81,7 @@ which:
 3. clears the source flags, persists the record in the LastStates pool with
    trigger `TRIGGER_SRAM2_PARITY`, then `NVIC_SystemReset()`.
 
-Before the record is written the handler forces the actuators to their safe
-state at register level (`TIM1` `MOE` and `CEN` cleared, no HAL handle, no
-mutex), so nothing stays driven while the reset propagates.
-
 The old CubeMX behaviour (`while (1)`) is replaced: no silent hang.
-
-Known gap (tracked, must close before flight): the Flash write inside the NMI
-uses the HAL, whose `HAL_GetTick()` timeout cannot expire in NMI context, and
-the independent watchdog (IWDG) is not initialised in this build yet — a Flash
-controller that never clears `BSY` would hang the handler.
 
 ## Recovery helper
 

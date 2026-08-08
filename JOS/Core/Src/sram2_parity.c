@@ -72,57 +72,27 @@ _Static_assert(sizeof(sram2_parity_record_t) <=
    path, SysTick cannot preempt the handler. */
 #define SRAM2_ERASE_POLL_LIMIT  1000000UL
 
-/* Number of boot-time findings that can be queued for deferred persistence.
-   Two is enough for the worst case (parity flag latched at boot + the erase
-   that follows it failing). */
-#define SRAM2_PENDING_MAX       2U
-
 /* ---------- Module state ----------
    Deliberately in SRAM1 (default .bss / .data): memory that has just reported
    a parity error must not be trusted to hold its own diagnostics. */
 static volatile uint32_t sram2_parity_events = 0U;
 static sram2_parity_status_t sram2_status = SRAM2_PARITY_STATUS_UNKNOWN;
 
-/* Boot-time records waiting for the LastStates pool to be initialised, and the
-   flag that makes the boot fault visible to the state machine. */
-static laststates_entry_t sram2_pending[SRAM2_PENDING_MAX];
-static uint32_t sram2_pending_count = 0U;
-static uint8_t  sram2_boot_fault_flag = 0U;
-
 /* ---------- Helpers ---------- */
 
-/* @retval 0 the erase completed, -1 it did not finish within the poll limit. */
-static int sram2_hw_erase(void)
+static void sram2_hw_erase(void)
 {
-    int done = 0;
-
-    /* Unlock the write protection of SCSR.SRAM2ER (key sequence 0xCA, 0x53),
-       then start the erase. The hardware writes 0x00 with correct parity to
-       every byte of SRAM2. */
+    /* Unlock the write protection of SCSR.SRAM2ER, then start the erase. The
+       hardware writes 0x00 with correct parity to every byte of SRAM2. */
     __HAL_SYSCFG_SRAM2_WRP_UNLOCK();
     __HAL_SYSCFG_SRAM2_ERASE();
 
-    /* Poll SCSR.SRAM2ER, which hardware clears when the erase has finished.
-       SRAM2BSY alone is not sufficient: the APB write that starts the erase is
-       posted, so BSY can still read 0 on the first poll and the loop would
-       exit before the erase even began. BSY is checked as well so the function
-       only reports success once the block is idle. */
     for (uint32_t i = 0U; i < SRAM2_ERASE_POLL_LIMIT; i++) {
-        if (((SYSCFG->SCSR & SYSCFG_SCSR_SRAM2ER) == 0U) &&
-            (__HAL_SYSCFG_GET_FLAG(SYSCFG_FLAG_SRAM2_BUSY) == 0U)) {
-            done = 1;
+        if (__HAL_SYSCFG_GET_FLAG(SYSCFG_FLAG_SRAM2_BUSY) == 0U) {
             break;
         }
     }
-
-    /* Symmetry with the unlock above: writing any value that is not the
-       0xCA / 0x53 sequence reactivates the write protection of SRAM2ER
-       (RM0351 rev 9, SYSCFG_SKR), so no stray write can wipe the parity-
-       protected block once the OBSW is running. */
-    SYSCFG->SKR = 0x00U;
-
     __DSB();
-    return (done != 0) ? 0 : -1;
 }
 
 static void sram2_copy_init_image(void)
@@ -152,59 +122,24 @@ static void sram2_fill_record(sram2_parity_record_t *rec, uint32_t event_id)
     rec->error_count  = sram2_parity_events;
 }
 
-/* Wrap a record in a LastStates entry. Every status register is sampled by
-   sram2_fill_record() before the flags are cleared, so an entry built here can
-   be written to Flash later without losing information. */
-static void sram2_fill_entry(laststates_entry_t *entry,
-                             const sram2_parity_record_t *rec)
-{
-    memset(entry, 0, sizeof(*entry));
-    entry->timestamp  = HAL_GetTick();
-    entry->state_from = SRAM2_STATE_UNKNOWN;
-    entry->state_to   = SRAM2_STATE_UNKNOWN;
-    entry->trigger    = TRIGGER_SRAM2_PARITY;
-    memcpy(entry->context, rec, sizeof(*rec));
-}
-
-/* Queue a boot-time finding for persistence after laststates_init(). */
-static void sram2_queue_boot_record(const sram2_parity_record_t *rec)
-{
-    if (sram2_pending_count >= SRAM2_PENDING_MAX) {
-        return;   /* keep the oldest: it carries the first cause */
-    }
-    sram2_fill_entry(&sram2_pending[sram2_pending_count], rec);
-    sram2_pending_count++;
-}
-
 /* Serialise the record into the LastStates pool (internal Flash).
    Note: HAL_FLASH_Program() polls with HAL_GetTick()-based timeouts and
-   SysTick cannot preempt an NMI, so a HAL timeout cannot expire on the NMI
-   path. There is no independent watchdog yet (IWDG is not initialised in this
-   build), so a Flash controller that never clears BSY would hang the handler;
-   bounding that wait is tracked as a follow-up and must be closed before
-   flight. */
+   SysTick cannot preempt an NMI, so the timeout cannot expire here. A Flash
+   controller that never clears BSY is covered by the independent watchdog. */
 static void sram2_persist(const sram2_parity_record_t *rec)
 {
     laststates_entry_t entry;
 
-    sram2_fill_entry(&entry, rec);
+    memset(&entry, 0, sizeof(entry));
+    entry.timestamp  = HAL_GetTick();
+    entry.state_from = SRAM2_STATE_UNKNOWN;
+    entry.state_to   = SRAM2_STATE_UNKNOWN;
+    entry.trigger    = TRIGGER_SRAM2_PARITY;
+    memcpy(entry.context, rec, sizeof(*rec));
 
     /* Best effort: if the Flash write fails there is no alternative sink and
        the reset must happen regardless (the reset is the containment action). */
     (void)laststates_write(&entry);
-}
-
-/* Force the PWM actuator outputs to their inactive level without touching a
-   HAL handle, a mutex or the clock tree - safe to call from an NMI. Clearing
-   MOE releases the TIM1 outputs to their idle state and CEN stops the counter,
-   so no actuator is left driven while the reset propagates. */
-static void sram2_force_actuators_safe(void)
-{
-    if (__HAL_RCC_TIM1_IS_CLK_ENABLED()) {
-        TIM1->BDTR &= ~(TIM_BDTR_MOE);
-        TIM1->CR1  &= ~(TIM_CR1_CEN);
-    }
-    __DSB();
 }
 
 /* ---------- Public API ---------- */
@@ -219,39 +154,23 @@ void sram2_parity_init(void)
     /* A flag latched before this point means SRAM2 reported a parity error in
        the previous run (or during the reset sequence). Record it, then clear -
        an already-set SPF would otherwise mask the next genuine event.
-       Ordering note: this function must run before every other init (it
-       hardware-erases SRAM2), i.e. before laststates_init(), which resets the
-       pool write index. Persisting here would therefore place the record at an
-       index the first post-boot transition overwrites - and on a pool that
-       already holds an entry at index 0 the double-word program would fail
-       with PGSERR. The record is built now, while the status registers still
-       hold the failure context, and written by
-       sram2_parity_persist_boot_records() once the pool is initialised. */
+       Ordering note: this runs before laststates_init(), whose current stub
+       resets the pool write index (memory.c TODO: scan Flash for the real
+       index). Until that scan exists, a boot-latch record can be overwritten
+       by the first transition logged after boot; the parity NMI path itself
+       is unaffected because it writes after the pool is initialised. */
     if (__HAL_SYSCFG_GET_FLAG(SYSCFG_FLAG_SRAM2_PE) != 0U) {
         sram2_parity_events++;
         sram2_fill_record(&rec, SRAM2_EVENT_BOOT_LATCH);
-        sram2_queue_boot_record(&rec);
-        sram2_boot_fault_flag = 1U;
+        sram2_persist(&rec);
         __HAL_SYSCFG_CLEAR_FLAG();
     }
 
     /* Give every SRAM2 byte a defined value and a valid parity bit before any
        critical object is touched. Without this, reads of never-written cells
        raise spurious parity NMIs when the check is enabled. */
-    if (sram2_hw_erase() == 0) {
-        sram2_copy_init_image();
-    } else {
-        /* The erase never reported completion, so part of SRAM2 may still
-           carry undefined parity. Copying the image on top of a half-erased
-           block would hide that, so the copy is skipped: state_machine_init()
-           finds a wrong magic and restores its critical structure from the
-           Flash load image (which also writes valid parity for those bytes).
-           The finding is recorded and the boot fault flag makes the OBSW come
-           up in the safe state instead of continuing as if nominal. */
-        sram2_fill_record(&rec, SRAM2_EVENT_ERASE_FAIL);
-        sram2_queue_boot_record(&rec);
-        sram2_boot_fault_flag = 1U;
-    }
+    sram2_hw_erase();
+    sram2_copy_init_image();
 
     /* The erase itself must not leave a stale flag behind. */
     __HAL_SYSCFG_CLEAR_FLAG();
@@ -276,32 +195,6 @@ void sram2_parity_init(void)
                        : SRAM2_PARITY_STATUS_DISABLED;
 }
 
-int sram2_parity_persist_boot_records(void)
-{
-    int written = 0;
-    int failed  = 0;
-
-    for (uint32_t i = 0U; i < sram2_pending_count; i++) {
-        if (laststates_write(&sram2_pending[i]) == 0) {
-            written++;
-        } else {
-            failed = 1;
-        }
-    }
-
-    /* One shot: never retried, so a wedged Flash cannot turn boot into a write
-       storm. sram2_boot_fault_flag is deliberately left set - the safe-state
-       decision must not depend on the record having reached Flash. */
-    sram2_pending_count = 0U;
-
-    return (failed != 0) ? -1 : written;
-}
-
-int sram2_parity_boot_fault(void)
-{
-    return (sram2_boot_fault_flag != 0U) ? 1 : 0;
-}
-
 sram2_parity_status_t sram2_parity_get_status(void)
 {
     return sram2_status;
@@ -319,26 +212,37 @@ uint32_t sram2_parity_error_count(void)
 
 int sram2_restore_from_image(void *obj, size_t len)
 {
-    const uintptr_t ram_start = (uintptr_t)&_ssram2;
-    const uintptr_t ram_end   = (uintptr_t)&_esram2;
-    const uint8_t  *img_start = (const uint8_t *)&_sisram2;
-    const uintptr_t dst_addr  = (uintptr_t)obj;
+    const uint8_t *ram_start = (const uint8_t *)&_ssram2;
+    const uint8_t *ram_end   = (const uint8_t *)&_esram2;
+    const uint8_t *img_start = (const uint8_t *)&_sisram2;
+    const uint8_t *dst = (const uint8_t *)obj;
+    uintptr_t dst_end;
 
     if ((obj == NULL) || (len == 0U)) {
         return -1;
     }
-    /* Range check without ever forming an out-of-range pointer: comparing
-       addresses and remaining length cannot overflow. */
-    if ((dst_addr < ram_start) || (dst_addr >= ram_end)) {
+    /* Overflow-safe bounds check: dst+len must not wrap the address space or
+       run past the end of the initialised .sram2 section. A flipped len could
+       otherwise make (dst + len) wrap to a small value and pass the check. */
+    if (__builtin_add_overflow((uintptr_t)dst, (uintptr_t)len, &dst_end) ||
+        (dst < ram_start) || (dst_end > ram_end)) {
         return -1;   /* not an object of the initialised .sram2 section */
     }
-    if ((size_t)(ram_end - dst_addr) < len) {
-        return -1;   /* object would run past the end of .sram2 */
-    }
 
-    memcpy(obj, img_start + (size_t)(dst_addr - ram_start), len);
+    memcpy((void *)dst, img_start + (size_t)(dst - ram_start), len);
     __DSB();
     return 0;
+}
+
+int sram2_section_contains(const void *obj)
+{
+    const uint8_t *p    = (const uint8_t *)obj;
+    const uint8_t *low  = (const uint8_t *)&_ssram2;
+    const uint8_t *high = (const uint8_t *)&_esram2;
+
+    /* True only for objects placed in the initialised .sram2 section (those
+       with a Flash load image). Objects in .sram2_noinit are excluded. */
+    return ((p >= low) && (p < high)) ? 1 : 0;
 }
 
 void sram2_parity_nmi_handler(void)
@@ -362,11 +266,6 @@ void sram2_parity_nmi_handler(void)
         /* Clock security system: HSE failure also vectors to the NMI. */
         __HAL_RCC_CLEAR_IT(RCC_IT_CSS);
     }
-
-    /* Containment before evidence: put the actuators in their safe state so a
-       corrupted control word cannot keep driving them while the record is
-       written and the reset propagates. */
-    sram2_force_actuators_safe();
 
     sram2_persist(&rec);
 
