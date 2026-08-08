@@ -15,8 +15,47 @@
 #ifndef HOST_SUPPORT_H
 #define HOST_SUPPORT_H
 
+#include <setjmp.h>
 #include <stdint.h>
 #include <stddef.h>
+
+/* ==========================================================================
+ * CMSIS / HAL doubles (support/hal_stubs.c)
+ * ========================================================================== */
+
+/* Restart the deterministic millisecond tick returned by HAL_GetTick(): the
+ * counter advances by one per call, so a test can predict the timestamp of a
+ * record the code under test writes. */
+void host_hal_tick_reset(void);
+
+/* NVIC_SystemReset() capture.
+ *
+ * By default the double fails the test: nothing asked for a reboot, so a
+ * reboot is a defect. A test that *expects* the reset (boot_crc_apply_policy()
+ * reboots while the retry budget lasts) wraps the call in
+ * HOST_EXPECT_NVIC_RESET(), which arms the capture and long-jumps back here
+ * from inside NVIC_SystemReset() - i.e. the flight code really does not
+ * continue past the reset request, exactly as on target. */
+extern jmp_buf host_nvic_reset_jmp;
+
+void     host_nvic_reset_arm(void);
+void     host_nvic_reset_disarm(void);
+void     host_nvic_reset_clear(void);   /* disarm + zero the counter */
+uint32_t host_nvic_reset_count(void);   /* total reset requests seen */
+
+/* Run `stmt_` expecting it to request a reboot. Fails the test if it returns
+ * normally. Requires unity.h (every test file includes it). */
+#define HOST_EXPECT_NVIC_RESET(stmt_)                                        \
+    do {                                                                     \
+        host_nvic_reset_arm();                                               \
+        if (setjmp(host_nvic_reset_jmp) == 0) {                              \
+            stmt_;                                                           \
+            host_nvic_reset_disarm();                                        \
+            TEST_FAIL_MESSAGE("expected NVIC_SystemReset(), "                \
+                              "but the call returned normally");             \
+        }                                                                    \
+        host_nvic_reset_disarm();                                            \
+    } while (0)
 
 /* ==========================================================================
  * Firmware image doubles (support/stubs.c)
