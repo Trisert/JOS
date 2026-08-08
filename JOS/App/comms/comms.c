@@ -4,14 +4,43 @@
 #include "watchdog.h"
 #include "cmsis_os.h"
 #include "main.h"
+#include "sram2_parity.h"   /* SRAM2_CRITICAL_NOINIT placement (W2-3) */
 #include <string.h>
 
 /* TODO: include RadioLib headers and implement STM32 HAL wrapper */
 
-#define LORA_MAX_PACKET  64
-#define BEACON_SIZE      128
-
+/* Packet sizes live in comms.h (COMMS_MAX_PACKET / COMMS_BEACON_SIZE) because
+   the buffers themselves are now SRAM2-resident; telecommand opcodes belong to
+   the uplink validation gate, not to this transport layer. */
 extern SPI_HandleTypeDef hspi1;
+
+/* ---------- Packet buffers in SRAM2 (hardware parity) ----------
+   Placed in the NOLOAD .sram2_noinit section: the SRAM2 hardware erase run by
+   sram2_parity_init() zeroes them at boot with valid parity, so they cost no
+   Flash. A single-event upset in a frame being assembled or decoded now
+   raises an NMI (recorded + reset) instead of transmitting or executing
+   corrupted data. */
+static SRAM2_CRITICAL_NOINIT uint8_t comms_beacon_buf[COMMS_BEACON_SIZE];
+static SRAM2_CRITICAL_NOINIT uint8_t comms_rx_buf[COMMS_MAX_PACKET];
+static SRAM2_CRITICAL_NOINIT uint8_t comms_tx_buf[COMMS_MAX_PACKET];
+
+uint8_t *comms_beacon_buffer(size_t *len)
+{
+    if (len != NULL) { *len = sizeof(comms_beacon_buf); }
+    return comms_beacon_buf;
+}
+
+uint8_t *comms_rx_buffer(size_t *len)
+{
+    if (len != NULL) { *len = sizeof(comms_rx_buf); }
+    return comms_rx_buf;
+}
+
+uint8_t *comms_tx_buffer(size_t *len)
+{
+    if (len != NULL) { *len = sizeof(comms_tx_buf); }
+    return comms_tx_buf;
+}
 
 /* ---------- Stub implementations ---------- */
 
@@ -23,9 +52,22 @@ int lora_init(void)
 
 int lora_send_chunked(const uint8_t *data, size_t len)
 {
-    /* TODO: fragment into 64-byte chunks with seq numbers, TX each */
-    (void)data;
-    (void)len;
+    size_t chunk_max = 0U;
+    uint8_t *tx = comms_tx_buffer(&chunk_max);
+    size_t off = 0U;
+
+    if ((data == NULL) && (len != 0U)) {
+        return -1;
+    }
+
+    /* TODO: add sequence numbers + CRC and hand each chunk to RadioLib.
+       The staging buffer already lives in parity-protected SRAM2. */
+    while (off < len) {
+        size_t n = ((len - off) < chunk_max) ? (len - off) : chunk_max;
+        memcpy(tx, data + off, n);
+        /* TODO: lora_tx(tx, n); */
+        off += n;
+    }
     return 0;
 }
 
@@ -132,6 +174,8 @@ void lora_beacon_task(void *arg)
 
     for (;;) {
         uint32_t interval = state_machine_get_beacon_interval();
+        size_t beacon_len = 0U;
+        uint8_t *beacon = comms_beacon_buffer(&beacon_len);
 
         /* The beacon cadence is state-dependent (1..16 min) and can also be
            retargeted from ground via CMD_SET_BEACON_INTERVAL. Registering the
@@ -149,8 +193,10 @@ void lora_beacon_task(void *arg)
         }
 
         watchdog_alive_self();
-        /* TODO: build beacon packet (96 B telemetry + 32 B sys) */
-        /* TODO: lora_tx(beacon_buf, BEACON_SIZE); */
+        /* TODO: build beacon packet (96 B telemetry + 32 B sys) in `beacon` */
+        (void)beacon;
+        (void)beacon_len;
+        /* TODO: lora_tx(beacon, beacon_len); */
 
         osDelay(pdMS_TO_TICKS(interval));
     }
@@ -188,13 +234,19 @@ void lora_rx_task(void *arg)
     (void)arg;
 
     for (;;) {
+        size_t rx_len = 0U;
+        uint8_t *rx = comms_rx_buffer(&rx_len);
+
         /* TODO: enter RX mode, wait for the DIO1 IRQ, read the PHY payload into
-         *       rx_buf / rx_len, then gate it through:
-         *           comms_tc_result_t r = comms_rx_handle_frame(rx_buf, rx_len);
+         *       rx / rx_len (the SRAM2 parity-protected RX buffer), then gate
+         *       it through:
+         *           comms_tc_result_t r = comms_rx_handle_frame(rx, rx_len);
          *           if (r != COMMS_TC_OK) { log comms_tc_result_str(r); }
          *       which performs structure + CRC + opcode + range validation and
          *       dispatches only valid telecommands. The rejection reason must be
          *       logged/telemetered, not discarded. */
+        (void)rx;
+        (void)rx_len;
         osDelay(pdMS_TO_TICKS(100));
     }
 }

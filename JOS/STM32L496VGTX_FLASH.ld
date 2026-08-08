@@ -156,9 +156,46 @@ SECTIONS
 
   } >RAM AT> FLASH
 
-  /* Firmware image CRC32 — MUST stay the last loaded section so that the
-     checked region is exactly [__fw_image_start, __fw_crc_start) and the
-     stored CRC word is the last 4 bytes of the .bin image.
+  /* ---- Critical runtime data in SRAM2 (hardware parity) - W2-3 ----
+     SRAM2 (64 KB @ 0x10000000) is the only RAM block on the STM32L496 with a
+     hardware parity bit per byte. The OBSW state struct and the comms buffers
+     live here so that a bit flip is detected (NMI) instead of silently used.
+
+     .sram2        : initialised data, load image kept in Flash and copied by
+                     sram2_parity_init() (startup.s only copies .data).
+     .sram2_noinit : NOLOAD buffers, zeroed by the SRAM2 hardware erase that
+                     sram2_parity_init() performs before any access.       */
+  _sisram2 = LOADADDR(.sram2);
+
+  .sram2 :
+  {
+    . = ALIGN(8);
+    _ssram2 = .;       /* start of the initialised SRAM2 image */
+    KEEP(*(.sram2))
+    KEEP(*(.sram2.*))
+    . = ALIGN(8);
+    _esram2 = .;       /* end of the initialised SRAM2 image */
+  } >RAM2 AT> FLASH
+
+  .sram2_noinit (NOLOAD) :
+  {
+    . = ALIGN(8);
+    _ssram2_noinit = .;
+    KEEP(*(.sram2_noinit))
+    KEEP(*(.sram2_noinit.*))
+    . = ALIGN(8);
+    _esram2_noinit = .;
+  } >RAM2
+
+  /* Bounds of the parity-protected block, used by sram2_parity.c */
+  _sram2_region_start = ORIGIN(RAM2);
+  _sram2_region_end   = ORIGIN(RAM2) + LENGTH(RAM2);
+
+  /* Firmware image CRC32 — MUST stay the last loaded section (it follows the
+     .sram2 load image on purpose) so that the checked region is exactly
+     [__fw_image_start, __fw_crc_start) and the stored CRC word is the last
+     4 bytes of the .bin image. The SRAM2 initialised image is therefore
+     covered by the boot CRC too.
      Contents are the placeholder 0x00000000 (deliberately NOT the erased
      Flash pattern) until `make crc-stamp` / tools/fw_crc_stamp.py patches
      the built binary. */
@@ -234,3 +271,7 @@ SECTIONS
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }
+
+/* Fail the build rather than silently truncating critical data. */
+ASSERT(_esram2_noinit <= (ORIGIN(RAM2) + LENGTH(RAM2)),
+       "SRAM2 critical data (.sram2 + .sram2_noinit) overflows the RAM2 region")
