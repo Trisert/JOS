@@ -31,6 +31,7 @@
 #include "comms.h"
 #include "faults.h"
 #include "mpu.h"
+#include "sram2_parity.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -109,6 +110,12 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+  /* SRAM2 hardware-parity protection for the critical OBSW data (W2-3).
+     Runs before every other init: it hardware-erases SRAM2 and restores
+     the .sram2 image, so no SRAM2_CRITICAL object may be touched earlier.
+     Boot-time findings are only captured here; they are persisted by
+     sram2_parity_persist_boot_records() after laststates_init(). */
+  sram2_parity_init();
 
   /* USER CODE END Init */
 
@@ -159,6 +166,14 @@ int main(void)
      bounded — never from the MemManage handler itself. Done before the boot
      CRC policy below, which may reset and never return. */
   (void)mpu_fault_log_flush();
+
+  /* The LastStates pool write index only becomes valid here, so the parity
+     findings latched by sram2_parity_init() (which must run before every
+     other init) are written now - before any transition can claim index 0
+     and overwrite them (W2-3). Like the MPU flush above this deliberately
+     runs BEFORE boot_crc_apply_policy(), because that call may reset the OBC
+     and would otherwise drop the parity evidence of this boot. */
+  (void)sram2_parity_persist_boot_records();
 
   /* Act on the integrity result now that the fault can be persisted.
      BOOT_CRC_FATAL (=1 by default, see App/obsw/boot_crc.h): the fault is

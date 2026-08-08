@@ -57,6 +57,7 @@ enum {
        contract, so existing codes are never renumbered. */
     TRIGGER_BOOT_FAULT      = 12,  /* HardFault/NMI during early boot */
     TRIGGER_BOOT_OK         = 13,  /* boot reached the scheduler      */
+    TRIGGER_SRAM2_PARITY    = 14, /* SRAM2 parity error NMI (see sram2_parity.h) */
 };
 
 /* ---------- BMS interface (stub for now) ---------- */
