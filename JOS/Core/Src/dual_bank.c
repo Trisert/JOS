@@ -315,16 +315,26 @@ static laststates_entry_t db_ls_entry;
 static int ls_append(uint8_t trigger, uint32_t value)
 {
     const int lock_held = laststates_pool_lock();
+
+    /* Serialisation required but unavailable: refuse rather than program an
+     * unsynchronised pool (Kilo #21). The caller treats this exactly like a
+     * Flash failure; App/memory/memory.c counts the dropped record. */
+    if (lock_held == LASTSTATES_LOCK_FAILED) {
+        return -1;
+    }
+
     const uint32_t slot = ls_first_free_slot();
 
     if (slot >= LASTSTATES_MAX_ENTRIES) {
         laststates_pool_unlock(lock_held);
         return -1;
     }
-    /* Re-check under the lock: with the lock stubbed out (boot, before the
-     * scheduler) nothing can have moved, but when it is live this is what
-     * guarantees the other writer did not claim this slot between
-     * ls_first_free_slot() and the first HAL_FLASH_Program(). */
+    /* Defensive re-validation, not the mutual-exclusion guarantee: that comes
+     * from holding the pool mutex across BOTH the scan above and the whole
+     * programming loop below, so when the lock is real there is no window left
+     * between them. This check only earns its keep on the paths where the lock
+     * is a no-op by design (boot before the scheduler, exception context) and
+     * against a scan result corrupted after the fact. */
     if (!ls_slot_is_erased(ls_slot(slot))) {
         laststates_pool_unlock(lock_held);
         return -1;
@@ -536,6 +546,21 @@ dual_bank_status_t dual_bank_init(void)
 {
     scratch_init_if_needed();
 
+    /* ok_pending is a ONE-SHOT token, honoured only by the boot immediately
+     * after the one that raised it (Kilo #21, comment id 3740842364).
+     *
+     * dual_bank_boot_complete() raises it whenever its ls_append() fails for
+     * ANY reason - a transient HAL_FLASH_Unlock() failure, a PGSERR, the
+     * "slot not erased" bail-out - not only on a full pool. Left in the warm
+     * scratch it could sit there for months and then, on the boot where the
+     * image genuinely starts looping and the pool finally fills, zero
+     * fault_count from a fossilised "trust me, I booted fine once" token: the
+     * golden-image fallback would disarm itself at the precise moment it is
+     * the only thing left. Snapshotting and clearing it here bounds its
+     * lifetime to exactly one boot, whatever path is taken below. */
+    const uint32_t ok_pending_snapshot = db_scratch.ok_pending;
+    db_scratch.ok_pending = 0U;
+
     db_optr        = read_user_option_bytes();
     db_active_bank = dual_bank_active_bank();
     db_bfb2_armed  = option_bfb2_enabled(db_optr);
@@ -553,12 +578,13 @@ dual_bank_status_t dual_bank_init(void)
          *
          * The RAM scratch is not automatically fresher: dual_bank_boot_complete()
          * cannot clear db_scratch.fault_count when its ls_append() fails, it
-         * only raises ok_pending. Consuming ok_pending here is the ESCAPE from
-         * the otherwise permanent "pool full + fault_count >= threshold =>
-         * boot_looping on every warm boot, forever, on a healthy image" trap
-         * (W2-2 review): a previous boot did prove itself, it just could not
-         * say so in Flash. Honour that proof and clear the evidence. */
-        if (db_scratch.ok_pending != 0U) {
+         * only raises ok_pending. Consuming the one-shot token here is the
+         * ESCAPE from the otherwise permanent "pool full + fault_count >=
+         * threshold => boot_looping on every warm boot, forever, on a healthy
+         * image" trap (W2-2 review): the PREVIOUS boot did prove itself, it
+         * just could not say so in Flash. Honour that proof once, and only
+         * for the boot that directly follows it. */
+        if (ok_pending_snapshot != 0U) {
             db_scratch.fault_count = 0U;
             db_fault_count         = 0U;
         } else {
@@ -567,10 +593,9 @@ dual_bank_status_t dual_bank_init(void)
              * thrown away. */
             db_fault_count = in_ram;
         }
-        /* Neither flag can ever be serviced while the pool is full; leaving
-         * them set would make every later boot re-read stale evidence. */
-        db_scratch.pending    = 0U;
-        db_scratch.ok_pending = 0U;
+        /* `pending` can never be serviced while the pool is full; leaving it
+         * set would make every later boot re-read stale evidence. */
+        db_scratch.pending = 0U;
     } else if (db_scratch.pending != 0U) {
         /* Write the RAM evidence through to Flash now that we are in thread
          * mode with the HAL available. One entry per faulting boot. */

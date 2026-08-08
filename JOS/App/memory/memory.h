@@ -62,14 +62,57 @@ uint32_t laststates_count(void);
    BOTH writers, and each writer re-checks that its target slot is still
    erased while holding it.
 
-   laststates_pool_lock() returns 1 when it actually took the mutex and 0 when
-   no lock was needed or possible: in ISR context (the fault, MPU and parity
-   handlers log through here and then reset — they must never block) and
-   before the scheduler runs (boot is single-threaded). The result MUST be
-   handed back to laststates_pool_unlock() so it can never release a mutex it
-   does not own. */
+   laststates_pool_lock() has THREE outcomes, not two (Kilo #21, comment id
+   3740842366: "one return value, two completely different meanings"). A lock
+   that fails open is a lock-shaped decoration, so "no lock was needed" and
+   "the lock could not be taken" must be distinguishable by the caller:
+
+     LASTSTATES_LOCK_HELD (1)
+       The mutex was acquired. It MUST be handed back to
+       laststates_pool_unlock() so the release can never touch a mutex this
+       caller does not own.
+
+     LASTSTATES_LOCK_NOT_NEEDED (0)
+       No serialisation is required and none was taken: before
+       laststates_init() has created the mutex, or before the scheduler runs
+       (boot is single-threaded), or on the exception path once the Flash
+       controller has been proven idle and sanitised (see below).
+
+     LASTSTATES_LOCK_FAILED (-1)
+       Serialisation is REQUIRED but unavailable: osMutexNew() returned NULL
+       at init (FreeRTOS heap exhausted) or osMutexAcquire() failed, or the
+       exception path found the Flash controller mid-sequence and could not
+       bring it to a safe state inside its bounded wait. Every writer must
+       REFUSE the write and touch no Flash at all — a torn 128-byte entry
+       destroys existing forensic history, which is strictly worse than one
+       lost record. The refusal is counted (laststates_dropped_records()) so
+       the loss is visible from the ground instead of silent.
+
+   Exception context (the fault, MPU and parity handlers log through
+   laststates_write() and then reset) can never block on the mutex. It gets a
+   cycle-bounded FLASH_SR.BSY wait plus a FLASH->CR sanitisation instead
+   (clear PG/FSTPG/PER/MER1/MER2/PNB and the error flags), because a preempted
+   task can leave PG or PER+PNB set with BSY not yet asserted: programming on
+   top of that is a programming-sequence error, i.e. exactly the post-mortem
+   record we most wanted, filed under "dropped". The preempted task never
+   resumes (the handler resets), so taking the controller over is safe. */
+#define LASTSTATES_LOCK_FAILED      (-1)
+#define LASTSTATES_LOCK_NOT_NEEDED  (0)
+#define LASTSTATES_LOCK_HELD        (1)
+
 int      laststates_pool_lock(void);
 void     laststates_pool_unlock(int held);
+
+/* Telemetry for the degraded paths above (both saturate-free 32-bit counters,
+   zero after reset):
+     laststates_lock_failures()   times serialisation was required and could
+                                  not be obtained;
+     laststates_dropped_records() records refused because of that, i.e. the
+                                  forensic entries ground will never see.
+   Ground reads these so an unsynchronised pool is observable instead of being
+   inferred from missing records. */
+uint32_t laststates_lock_failures(void);
+uint32_t laststates_dropped_records(void);
 
 /* ---------- LastStates bookkeeping mirror (SEU scrubbing, W2-5) ----------
    The write index and the entry count decide where the next post-mortem
@@ -99,6 +142,12 @@ void *laststates_mirror_region(size_t *len);
    the dual-bank golden image can be unit-tested directly. Not compiled into
    the flight image. */
 int laststates_erase_addr_allowed(uintptr_t addr);
+
+/* Host-test-only: force the next laststates_pool_lock() results. The flight
+   lock depends on CMSIS-RTOS2 and __get_IPSR(), neither of which exists on the
+   host, so this is the only way to exercise the LASTSTATES_LOCK_FAILED
+   refusal path (Kilo #21) from a test. Reset to LASTSTATES_LOCK_NOT_NEEDED. */
+void laststates_pool_lock_set_result_for_test(int result);
 #endif
 
 #endif /* MEMORY_H */

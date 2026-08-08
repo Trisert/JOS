@@ -102,6 +102,7 @@ void setUp(void)
 {
     host_flash_reset();
     seu_stub_reset();
+    laststates_pool_lock_set_result_for_test(LASTSTATES_LOCK_NOT_NEEDED);
     laststates_init();
 }
 
@@ -367,4 +368,55 @@ void test_laststates_write_fails_cleanly_when_the_target_row_is_unprogrammable(v
     TEST_ASSERT_EQUAL_INT(commits_before, seu_stub_commit_count());  /* no advance */
     TEST_ASSERT_EQUAL_INT(0, seu_stub_lock_depth());
     TEST_ASSERT_EQUAL_UINT32(1u, mirror()->idx);   /* bookkeeping untouched */
+}
+
+
+/* =====================================================================
+ * Pool lock: "no lock needed" and "the lock failed" are different answers
+ * (Kilo #21, comment id 3740842366)
+ * ===================================================================== */
+
+/* laststates_pool_lock() used to answer 0 both when serialisation was
+ * unnecessary (boot, exception context) and when it was necessary but
+ * unobtainable (osMutexNew() returned NULL because the FreeRTOS heap was
+ * tight, or osMutexAcquire() failed). Both writers then programmed the SHARED
+ * pool with no synchronisation at all - the exact race the mutex exists to
+ * prevent, re-entered silently through the front door.
+ *
+ * The contract now: LASTSTATES_LOCK_FAILED means REFUSE. Nothing is unlocked,
+ * nothing is programmed, no bookkeeping moves, and the loss is counted so
+ * ground can see the pool went unsynchronised instead of inferring it from a
+ * hole in the trail. */
+void test_laststates_write_refuses_the_write_when_the_pool_lock_fails(void)
+{
+    laststates_entry_t entry = make_entry(0x2222u, STATE_READY, STATE_CRIT,
+                                          TRIGGER_FAULT, 0x5Au);
+    uint32_t programs_before;
+    uint32_t unlocks_before;
+    uint32_t dropped_before;
+    int      commits_before;
+
+    programs_before = host_flash_program_count();
+    unlocks_before  = host_flash_unlock_count();
+    dropped_before  = laststates_dropped_records();
+    commits_before  = seu_stub_commit_count();
+
+    laststates_pool_lock_set_result_for_test(LASTSTATES_LOCK_FAILED);
+    TEST_ASSERT_EQUAL_INT(-1, laststates_write(&entry));
+    laststates_pool_lock_set_result_for_test(LASTSTATES_LOCK_NOT_NEEDED);
+
+    /* Not one Flash cycle: the controller was never even unlocked. */
+    TEST_ASSERT_EQUAL_UINT32(programs_before, host_flash_program_count());
+    TEST_ASSERT_EQUAL_UINT32(unlocks_before, host_flash_unlock_count());
+    TEST_ASSERT_FALSE(host_flash_is_unlocked());
+    TEST_ASSERT_EQUAL_UINT32(0u, mirror()->idx);
+    TEST_ASSERT_EQUAL_INT(commits_before, seu_stub_commit_count());
+    TEST_ASSERT_EQUAL_INT(0, seu_stub_lock_depth());
+
+    /* ...and the refusal is observable from the ground. */
+    TEST_ASSERT_EQUAL_UINT32(dropped_before + 1u, laststates_dropped_records());
+
+    /* The pool is still usable once serialisation is available again. */
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&entry));
+    TEST_ASSERT_EQUAL_UINT32(1u, mirror()->idx);
 }
