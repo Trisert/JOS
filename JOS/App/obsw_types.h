@@ -46,6 +46,8 @@ enum {
     TRIGGER_TASK_COMPLETE   = 5,
     TRIGGER_ANTENNA_DONE    = 6,
     TRIGGER_WATCHDOG        = 7,
+    TRIGGER_FAULT           = 8,  /* Cortex-M4 fault exception (see faults.h) */
+    TRIGGER_STACK_OVERFLOW  = 9,  /* FreeRTOS stack overflow hook             */
 };
 
 /* ---------- BMS interface (stub for now) ---------- */
