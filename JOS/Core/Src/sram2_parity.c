@@ -445,9 +445,14 @@ static void sram2_store_recover(void)
            comment id 3741302888).
 
            Two of the three version-1 shapes carry a checksum, at DIFFERENT
-           offsets, so each is tried through its own view. The 11-word shape of
-           a975896 is tried first because it is the richest - and because it is
-           the one actually flashed on hardware, which is why leaving it out
+           offsets, so each is tried through its own view. The SHORTER 8-word
+           shape is authenticated FIRST and the 11-word shape of a975896 only
+           if the 8-word formula fails (see the note on v1_11w_authentic below:
+           the two formulas are not independent, and the longer one false-
+           positives on an 8-word store). The checksum-less 6-word shape is the
+           last resort - it can only be recognised by its own self-consistency.
+           The 11-word shape still has to be in the catalogue at all because it
+           is the one actually flashed on hardware, which is why leaving it out
            re-armed the erase budget on the first boot after this very update
            (Kilo #26, sram2_parity.c:184).
 
@@ -509,12 +514,17 @@ static void sram2_store_recover(void)
             resets  = sram2_store_image.v1.parity_resets;
             dropped = sram2_store_image.v1.dropped_records;
             event   = sram2_store_image.v1.last_event;
-            /* Resolve the latch UPWARDS across BOTH readings of these bytes:
-               whichever view is the wrong one, a finding seen through either
-               of them is still a finding, and losing it is the fail-open
-               direction (Kilo #26, comment id 3741302888). */
-            fault   = ((sram2_store_image.v1.boot_fault != 0U) ||
-                       (sram2_store.boot_fault != 0U)) ? 1U : 0U;
+            /* This branch has already concluded the payload is version 1, so
+               the latch is read through the v1 view and ONLY through it. OR-ing
+               in sram2_store.boot_fault looked like fail-safe redundancy but
+               was not a second reading of the same cell at all: the v2 view
+               keeps a version word at index 2, so its boot_fault is word 3 -
+               which in version 1 is last_event. Any non-zero old event (a
+               re-noted SRAM2_EVENT_PARITY_DISABLED, a CLOCK_NMI) would have
+               forged a boot fault out of an unrelated word and parked a healthy
+               unit in the fault path on every boot (Kilo #26, comment on
+               sram2_parity.c:517). */
+            fault   = (sram2_store_image.v1.boot_fault != 0U) ? 1U : 0U;
             busy    = ((v1_11w_authentic != 0) || (v1_authentic != 0))
                           ? sram2_store_image.v1.erase_busy_resets : 0U;
             /* clock_faults / first_busy_* exist only in the 11-word shape, and
