@@ -74,6 +74,30 @@ static void program_dword(uint32_t byte_offset, uint64_t value)
     TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Lock());
 }
 
+/* Program a WHOLE 128 B record without going through laststates_write(), the
+ * way Core/Src/dual_bank.c ls_append() does it: HAL_FLASH_Unlock() once, then
+ * all 16 double words in ascending order. A single double word is NOT a
+ * second-writer record - it is a torn write, which memory.c deliberately
+ * treats as unusable (see slot_is_complete()). */
+static void program_full_record(uint32_t slot, const laststates_entry_t *entry)
+{
+    const uint8_t *bytes = (const uint8_t *)entry;
+    uint32_t       off;
+
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Unlock());
+    for (off = 0u; off < (uint32_t)LASTSTATES_ENTRY_SIZE; off += 8u) {
+        uint64_t dword;
+
+        memcpy(&dword, bytes + off, sizeof(dword));
+        TEST_ASSERT_EQUAL_INT(HAL_OK,
+                              HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                                (uint32_t)(flash_base +
+                                                           slot * LASTSTATES_ENTRY_SIZE + off),
+                                                dword));
+    }
+    TEST_ASSERT_EQUAL_INT(HAL_OK, HAL_FLASH_Lock());
+}
+
 void setUp(void)
 {
     host_flash_reset();
@@ -219,9 +243,18 @@ void test_laststates_write_resyncs_when_a_second_writer_took_the_slot(void)
 {
     laststates_entry_t entry = make_entry(0x1234u, STATE_READY, STATE_CRIT,
                                           TRIGGER_BOOT_FAULT, 0x42u);
+    laststates_entry_t marker = make_entry(0x0Eu, STATE_READY, STATE_READY,
+                                           TRIGGER_BOOT_OK, 0x00u);
 
-    /* 'DBNK' marker dropped into slot 0 behind the module's back. */
-    program_dword(0u, 0x4B4E42440000000EULL);
+    /* 'DBNK' marker dropped into slot 0 behind the module's back. It is a
+     * COMPLETE 128 B record, exactly like the one dual_bank.c ls_append()
+     * programs - a lone double word would be a torn write, which the ring now
+     * refuses to report (finding C4). */
+    {
+        const uint32_t tag = 0x4B4E4244u;   /* 'D','B','N','K' little endian */
+        memcpy(marker.context, &tag, sizeof(tag));
+    }
+    program_full_record(0u, &marker);
     TEST_ASSERT_EQUAL_UINT32(0u, mirror()->idx);   /* cursor is now stale */
 
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&entry));
@@ -230,6 +263,8 @@ void test_laststates_write_resyncs_when_a_second_writer_took_the_slot(void)
     TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&entry,
                                   host_flash_pool() + LASTSTATES_ENTRY_SIZE,
                                   LASTSTATES_ENTRY_SIZE);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&marker,
+                                  host_flash_pool(), LASTSTATES_ENTRY_SIZE);
     TEST_ASSERT_EQUAL_UINT32(2u, mirror()->idx);
     TEST_ASSERT_EQUAL_UINT32(2u, laststates_count());
     TEST_ASSERT_EQUAL_UINT32(0u, host_flash_erase_count());   /* no page recycled */
@@ -255,21 +290,73 @@ void test_laststates_write_clamps_an_out_of_range_cursor(void)
 }
 
 /* A slot whose first double word still reads erased while a later row is
- * already programmed (a write interrupted by a reset, or an SEU) cannot be
- * completed: the second row raises PROGERR. The write must report the
- * failure, re-lock the Flash controller and leave the ring bookkeeping
- * untouched - advancing the cursor over a half-written record would hide it
- * from the post-mortem dump and skip a slot forever. */
-void test_laststates_write_fails_cleanly_on_a_partially_programmed_slot(void)
+ * already programmed (a write interrupted by a reset, or an SEU) is DAMAGED:
+ * it can neither be completed (re-programming a non-erased row raises
+ * PROGERR) nor reported (its header is 0xFF filler).
+ *
+ * Before the finding-C4 fix, slot_is_erased() looked at double word 0 only,
+ * so the module happily started writing into such a slot, hit PROGERR on the
+ * damaged row and returned -1 WITHOUT advancing the cursor - which means the
+ * very next write, and every write after it, failed in exactly the same place.
+ * One damaged slot killed the forensic log permanently, in flight, silently.
+ *
+ * The contract is now: the damaged slot is skipped, the record lands in the
+ * next free slot, the Flash controller is left locked, and the damaged slot
+ * is not counted or dumped. Logging survives the damage. */
+void test_laststates_write_skips_a_partially_programmed_slot(void)
 {
+    laststates_entry_t entry = make_entry(0x7777u, STATE_READY, STATE_CRIT,
+                                          TRIGGER_FAULT, 0x77u);
+
+    /* Row 8 of slot 0 is already programmed; row 0 still reads erased, so the
+     * old dword-0-only test would have seen a free slot here. */
+    program_dword(64u, 0x0011223344556677ULL);
+    TEST_ASSERT_EQUAL_UINT32(0u, mirror()->idx);
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&entry));
+
+    /* Landed in slot 1, no page recycled, nothing lost. */
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&entry,
+                                  host_flash_pool() + LASTSTATES_ENTRY_SIZE,
+                                  LASTSTATES_ENTRY_SIZE);
+    TEST_ASSERT_EQUAL_UINT32(2u, mirror()->idx);
+    TEST_ASSERT_EQUAL_UINT32(0u, host_flash_erase_count());
+
+    /* The damaged slot is never reported as a record. */
+    TEST_ASSERT_EQUAL_UINT32(1u, laststates_count());
+
+    /* Flash controller left locked and the SEU lock balanced. */
+    TEST_ASSERT_FALSE(host_flash_is_unlocked());
+    TEST_ASSERT_EQUAL_UINT32(host_flash_unlock_count(), host_flash_lock_count());
+    TEST_ASSERT_EQUAL_INT(0, seu_stub_lock_depth());
+}
+
+/* The failure path still has to exist: when the Flash controller cannot
+ * program the slot it selected, laststates_write() must report -1, leave the
+ * Flash controller locked and leave the bookkeeping untouched.
+ *
+ * A TORN slot (reset mid-write) is NOT this case: laststates_resync() skips it
+ * and the record lands in the next free slot, so logging survives (see
+ * test_laststates_write_skips_a_partially_programmed_slot). The genuinely
+ * unprogrammable case is a worn/stuck cell or a supply glitch that makes a
+ * perfectly-erased row raise PROGERR - the host model injects exactly that via
+ * host_flash_fail_program_after(), the only way to reach this branch once the
+ * module refuses to write into anything that is not fully erased. */
+void test_laststates_write_fails_cleanly_when_the_target_row_is_unprogrammable(void)
+{
+    laststates_entry_t first = make_entry(0x1111u, STATE_INIT, STATE_READY,
+                                          TRIGGER_BOOT, 0x11u);
     laststates_entry_t entry = make_entry(0x7777u, STATE_READY, STATE_CRIT,
                                           TRIGGER_FAULT, 0x77u);
     int commits_before;
 
-    /* Row 8 of slot 0 is already programmed; row 0 still reads erased, so the
-     * module sees a free slot and starts writing into it. */
-    program_dword(64u, 0x0011223344556677ULL);
-    TEST_ASSERT_EQUAL_UINT32(0u, mirror()->idx);
+    /* Slot 0 is filled normally; the next write targets slot 1 (erased). */
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&first));
+    TEST_ASSERT_EQUAL_UINT32(1u, mirror()->idx);
+
+    /* Make the very next double-word program fail, as a stuck cell would on
+     * real silicon. */
+    host_flash_fail_program_after(0u);
 
     commits_before = seu_stub_commit_count();
 
@@ -279,5 +366,5 @@ void test_laststates_write_fails_cleanly_on_a_partially_programmed_slot(void)
     TEST_ASSERT_EQUAL_UINT32(host_flash_unlock_count(), host_flash_lock_count());
     TEST_ASSERT_EQUAL_INT(commits_before, seu_stub_commit_count());  /* no advance */
     TEST_ASSERT_EQUAL_INT(0, seu_stub_lock_depth());
-    TEST_ASSERT_EQUAL_UINT32(0u, mirror()->idx);
+    TEST_ASSERT_EQUAL_UINT32(1u, mirror()->idx);   /* bookkeeping untouched */
 }
