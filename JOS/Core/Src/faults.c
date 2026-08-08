@@ -62,6 +62,37 @@ _Static_assert(FAULT_ID_USAGEFAULT == 3, "UsageFault stub literal out of sync");
 /* Number of words the core stacks on exception entry (without FP context). */
 #define FAULT_FRAME_WORDS     8U
 
+/* Re-entrancy latch for the capture path.
+ *
+ * fault_capture() dereferences the stacked frame and programs Flash. Either
+ * can itself fault (wild SP, wedged Flash controller, a BusFault on the
+ * LastStates pool). On ARMv7-M a fault taken while already inside the
+ * HardFault handler does not re-enter the handler: the core goes to LOCKUP,
+ * where no instruction ever retires again and NVIC_SystemReset() - the entire
+ * containment strategy of this module - becomes unreachable. That is a
+ * permanent, unobservable hang, i.e. exactly the failure this file exists to
+ * prevent.
+ *
+ * So on re-entry we skip everything that can fault and reset immediately. The
+ * evidence from the *first* fault is worth less than a guaranteed reboot, and
+ * hw_watchdog (IWDG) covers the residual case where even this reset is not
+ * reached. Not reset before NVIC_SystemReset(): it lives in ordinary .bss and
+ * is re-zeroed by startup on the way back up. */
+static volatile uint32_t s_fault_nesting = 0U;
+
+/* Unrecoverable-but-bounded exit: request a reset and, should the request not
+ * take effect, let the IWDG do it. Never returns. */
+static void fault_reset_now(void)
+{
+    NVIC_SystemReset();
+
+    for (;;) {
+        /* NVIC_SystemReset() does not return. If it somehow did, the IWDG
+           (Core/Src/hw_watchdog.c) is deliberately NOT kicked here, so this
+           spin is bounded by the watchdog timeout instead of being forever. */
+    }
+}
+
 static int fault_frame_is_readable(const uint32_t *frame)
 {
     uint32_t addr = (uint32_t)frame;
@@ -132,6 +163,13 @@ void fault_capture(const uint32_t *frame, uint32_t fault_id, uint32_t exc_return
 {
     fault_record_t rec;
 
+    /* Second fault while handling the first: reset, do not recurse into
+       LOCKUP. See s_fault_nesting above. */
+    if (s_fault_nesting != 0U) {
+        fault_reset_now();
+    }
+    s_fault_nesting = 1U;
+
     /* Dual-bank fallback evidence (W2-2) FIRST: RAM-only, ISR-safe, no Flash
        and no HAL, so it cannot block or fault. It must be recorded before the
        Flash write below, which may legitimately fail on a corrupted image -
@@ -155,18 +193,34 @@ void fault_capture(const uint32_t *frame, uint32_t fault_id, uint32_t exc_return
     }
 
     fault_fill_scb(&rec);
+
+    /* Distinguish the escalated stack-overflow path from a generic HardFault.
+       HFSR.FORCED says this HardFault was escalated from a configurable fault;
+       CFSR.MSTKERR says the escalation happened because the core could not
+       stack the exception frame - which is what a task overflowing into its
+       read-only MPU guard band produces. Both bits are already in `rec`, so
+       the raw registers stay available to ground either way. */
+    if ((fault_id == (uint32_t)FAULT_ID_HARDFAULT) &&
+        ((rec.hfsr & SCB_HFSR_FORCED_Msk) != 0UL) &&
+        ((rec.cfsr & SCB_CFSR_MSTKERR_Msk) != 0UL)) {
+        rec.fault_id = (uint32_t)FAULT_ID_HARDFAULT_STACKING;
+    }
+
     fault_persist(&rec, TRIGGER_FAULT);
 
-    NVIC_SystemReset();
-
-    for (;;) {
-        /* NVIC_SystemReset() does not return; guard against a failed reset. */
-    }
+    fault_reset_now();
 }
 
 void fault_log_stack_overflow(const char *task_name)
 {
     fault_record_t rec;
+
+    /* Same latch as fault_capture(): the FreeRTOS overflow hook also programs
+       Flash, and it can be reached from a task whose stack is already gone. */
+    if (s_fault_nesting != 0U) {
+        fault_reset_now();
+    }
+    s_fault_nesting = 1U;
 
     memset(&rec, 0, sizeof(rec));
     rec.magic    = FAULT_RECORD_MAGIC;
@@ -184,11 +238,7 @@ void fault_log_stack_overflow(const char *task_name)
     fault_fill_scb(&rec);
     fault_persist(&rec, TRIGGER_STACK_OVERFLOW);
 
-    NVIC_SystemReset();
-
-    for (;;) {
-        /* NVIC_SystemReset() does not return; guard against a failed reset. */
-    }
+    fault_reset_now();
 }
 
 /* ---------- Exception entry stubs ----------

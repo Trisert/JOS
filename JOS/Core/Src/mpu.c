@@ -393,8 +393,25 @@ void mpu_memmanage_fault(const uint32_t *frame)
   s_fault_record.sp    = (uint32_t)frame;
 
   /* The stacked frame is only trustworthy if the fault did not happen while
-     stacking it (CFSR MSTKERR); guard the dereference either way. */
-  if (frame != NULL)
+     stacking it, and only dereferenceable if the stack pointer is sane.
+
+     - CFSR.MSTKERR set means the core failed to write the frame: frame[5..7]
+       were never stored, so reading them would checksum raw stack garbage and
+       mpu_fault_log_flush() would commit that to Flash as if it were forensic
+       evidence.
+     - A wild or corrupted SP is precisely the class of failure that produces
+       MPU faults in the first place. Dereferencing it here would fault
+       *inside* this handler; MemManage cannot pre-empt itself, so the core
+       would escalate to HardFault, and a further fault there ends in LOCKUP.
+
+     mpu_is_sram() already validates a 32-byte window, which is exactly the
+     size of the basic exception frame, so it is reused verbatim. The FP
+     extended frame is longer but its first eight words - the ones read below -
+     live at the same offsets. */
+  if ((frame != NULL) &&
+      ((s_fault_record.cfsr & SCB_CFSR_MSTKERR_Msk) == 0UL) &&
+      (((uint32_t)frame & 3U) == 0U) &&
+      (mpu_is_sram((uint32_t)frame) != 0U))
   {
     s_fault_record.pc  = frame[6];
     s_fault_record.lr  = frame[5];
@@ -402,6 +419,9 @@ void mpu_memmanage_fault(const uint32_t *frame)
   }
   else
   {
+    /* Zeroed rather than left stale: a flush must not present unstacked or
+       unreadable registers as though they had been captured. The SP and CFSR
+       above still record where and why it happened. */
     s_fault_record.pc  = 0UL;
     s_fault_record.lr  = 0UL;
     s_fault_record.psr = 0UL;
