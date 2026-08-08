@@ -353,7 +353,7 @@ static void sram2_store_recover(void)
             if (event > (uint32_t)SRAM2_EVENT_LAST) {
                 event = (uint32_t)SRAM2_EVENT_STORE_LOST;
             } else if ((event == (uint32_t)SRAM2_EVENT_PARITY_NMI) &&
-                       (fault == 0U)) {
+                       (fault == 0U) && (resets == 0U)) {
                 /* Version 1 had no SRAM2_EVENT_NONE: id 0 meant BOTH "a
                    parity NMI was recorded" and "nothing has ever been
                    recorded" (the cold-start store was all zeros). Migrating
@@ -361,9 +361,27 @@ static void sram2_store_recover(void)
                    this branch removed - a later checksum failure would read
                    event == PARITY_NMI, corroborate the flag out of silence
                    and park a healthy spacecraft in STATE_CRIT (Kilo #26,
-                   comment id 3741110976). A genuinely recorded parity NMI
-                   always came with boot_fault set, so only the boot_fault==0
-                   case is re-labelled. */
+                   comment id 3741110976).
+
+                   boot_fault alone CANNOT disambiguate the two, though: the
+                   deployed version-1 image consumes the latch at boot
+                   (sram2_boot_fault_flag = 1U; sram2_store.boot_fault = 0U)
+                   and leaves last_event at PARITY_NMI for the rest of the
+                   mission, so the steady state of every v1 unit that has ever
+                   been bitten is exactly (boot_fault == 0, last_event == 0,
+                   parity_resets > 0) - the tuple this branch used to re-label
+                   as "nothing has ever been recorded", reporting a unit with a
+                   real parity hit as pristine (Kilo #26, comment id
+                   3741302889).
+
+                   So let the salvaged reset counter vote: v1 bumped
+                   parity_resets only in sram2_store_note_fault(), i.e. only on
+                   a real parity NMI, so resets > 0 is positive evidence that
+                   the id is a genuine (already acked) historical NMI and it
+                   migrates verbatim. Only silence with no resets behind it is
+                   really silence, and only that is re-labelled - corroboration
+                   still never fires on a cold-start store, and the evidence of
+                   a real hit is never erased. */
                 event = (uint32_t)SRAM2_EVENT_NONE;
             }
             /* Any other recorded event id survives the migration unchanged:
