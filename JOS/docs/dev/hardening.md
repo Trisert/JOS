@@ -177,3 +177,5 @@ is deliberately not monitored.
   product assurance.
 - MISRA C:2025 — Guidelines for the use of the C language in critical systems.
 - STM32L496xx Reference Manual — dual-bank flash (DUALBANK), SRAM2 parity.
+
+<!-- webhook probe: ignore -->
