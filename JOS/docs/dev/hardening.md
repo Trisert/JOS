@@ -39,7 +39,7 @@ Every recommendation below cites the standard that motivates it:
 | 2.1 | **MPU**: configure regions to isolate kernel / task stacks / FRAM driver from app data; block execute on SRAM | [NASA-PoT] #4 (no pointer arithmetic on cast), [JPL-182] | Med | Med |
 | 2.2 | **HardFault / MemManage / BusFault handlers** with register dump to LastStates + reboot — **DONE**: handlers in `Core/Src/faults.c` (`fault_log_*`, LastStates dump) wired to the Cortex-M fault vectors | [NASA-STD-8739.8] (fault containment), [ECSS-E-ST-40C] | High | Low |
 | 2.3 | **Stack overflow hook** — **DONE**: `vApplicationStackOverflowHook` (`Core/Src/freertos.c:76-91`) already calls `fault_log_stack_overflow()` and reboots; `configCHECK_FOR_STACK_OVERFLOW=2` already set | [NASA-PoT], FreeRTOS `configCHECK_FOR_STACK_OVERFLOW=2` | High | Low |
-| 2.4 | **Watchdog** — **DONE**: software monitor in `App/obsw/watchdog.c` (500 ms tick, flags silence >3× period); `watchdog_register_task()` is called from 6 task creators (`comms.c:215/260`, `state_machine.c:398`, `clear.c:159`, `cloud.c:148`, `aocs.c:43`) and `watchdog_alive_self()` runs in every task loop. Hardware IWDG is **also active** (~31 s, `Core/Src/hw_watchdog.c` configures it, `main.c:115` inits, `watchdog.c`/main kick it) | [NASA-STD-8739.8] (watchdog/monitoring), [ECSS-E-ST-40C] | High | Med |
+| 2.4 | **Watchdog** — **DONE**: software monitor in `App/obsw/watchdog.c` (500 ms tick, flags silence >3× period); `watchdog_register_task()` is called from **7** task creators (`main.c:253` defaultTask, `comms.c:215/260`, `state_machine.c:398`, `clear.c:159`, `cloud.c:148`, `aocs.c:43`) and `watchdog_alive_self()` runs in every task loop. Hardware IWDG is **also active** (~31 s, `Core/Src/hw_watchdog.c` configures it, `main.c:115` inits, `watchdog.c`/main kick it) | [NASA-STD-8739.8] (watchdog/monitoring), [ECSS-E-ST-40C] | High | Med |
 | 2.5 | **SRAM2 parity**: the 64 KB SRAM2 block has hardware parity (linker region `RAM2` @ 0x10000000). Place critical structures (state, comms buffers) there; enable parity error NMI | [NASA-STD-8739.8] (data integrity) | Med | Low |
 
 ## 3. Boot & image integrity
@@ -122,11 +122,11 @@ four bytes of `build/JOS.bin`.
 | other        | real stamp, must match           | `BOOT_CRC_OK` / `BOOT_CRC_MISMATCH` | match only |
 
 `Error_Handler()` is **never** used for this: it is `__disable_irq(); while(1)`
-and would be an unrecoverable brick. The hardware IWDG (~31 s, `Core/Src/hw_watchdog.c`)
-does backstop the software watchdog, but RedPill carries **no golden image in
-flight** (the dual-bank fallback is implemented yet inhibited — see §3.2), so
-"halt on mismatch" is not an available safe state and the CRC policy degrades
-to beacon-only.
+and the IWDG (LSI-clocked, unmaskable) would simply reset the part in a loop
+rather than halt it. RedPill carries **no golden image in flight** (the
+dual-bank fallback is implemented yet inhibited — see §3.2), so "halt on
+mismatch" is not an available safe state and the CRC policy degrades to
+beacon-only.
 
 ### Evidence: task liveness monitoring (software watchdog, roadmap §2.4)
 
@@ -153,8 +153,10 @@ is deliberately not monitored.
 
 > Note: the hardware IWDG is **active** (~31 s, `Core/Src/hw_watchdog.c`, kicked
 > from `main.c` and `watchdog.c`); the software monitor in `App/obsw/watchdog.c`
-> runs alongside it. The dual-bank golden-image fallback is **not armed in this
-> build** (see §3.2) — that is the one recovery path still pending.
+> runs alongside it. The monitor's reaction to a flagged task is still a
+> `TODO` (`watchdog.c:217`: "log anomaly, optionally suspend/delete task"), so
+> the dual-bank golden-image fallback is **not** the only recovery path still
+> pending — closing that TODO is the other one.
 
 ### Verification
 
