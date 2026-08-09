@@ -43,8 +43,16 @@ make -C JOS cppcheck-print    # print the fully expanded cppcheck command line
 ```
 
 The include paths and defines are derived from the `$(INCLUDES)` and
-`$(C_DEFS)` variables the compiler already uses, so adding a header directory
-to the build automatically adds it to the analysis.
+`$(CPPCHECK_DEFS)` variables the compiler already uses — `CPPCHECK_DEFS` is the
+deduplicated union of `$(C_DEFS)` and `$(CXX_DEFS)`, so a C++ translation unit
+is never analysed under the C macro set — and adding a header directory to the
+build automatically adds it to the analysis.
+
+`--enable` is `warning,style,performance,portability,information`, deliberately
+not `all`: the two ids `all` adds on top (`unusedFunction`, `missingInclude`)
+are suppressed anyway. The `error` severity — `arrayIndexOutOfBounds`,
+`nullPointer`, `uninitvar`, … — is always on and is not part of `--enable`, so
+this cannot weaken the gate.
 
 ### Pinned version
 
@@ -53,15 +61,22 @@ the version shipped by the pinned `ubuntu-24.04` CI runner). `make cppcheck`
 refuses to run against any other version, because the finding set is
 version-dependent — for example `constParameter` was split into
 `constParameterPointer` in cppcheck 2.11+. To upgrade: bump both
-`CPPCHECK_VERSION` here and the `apt-get install cppcheck=<ver>` line in
-`.github/workflows/build.yml`, re-run the gate, and triage the new findings in
-the same PR.
+`CPPCHECK_VERSION` here and `PINNED_DEB`/`PINNED_VERSION` in the *Install
+pinned cppcheck* step of `.github/workflows/build.yml`, re-run the gate, and
+triage the new findings in the same PR.
+
+That CI step is a three-step fallback chain — exact Ubuntu revision, then any
+revision of the same upstream version, then a source build of the upstream tag
+— so one archive change cannot hard-block every PR, and it asserts the
+resulting `cppcheck --version` afterwards so a fallback can never smuggle in a
+different analyser.
 
 Install it locally with `sudo apt-get install cppcheck=2.13.0-2ubuntu3` on
 Ubuntu 24.04, or override the pin for a one-off experiment:
 
 ```bash
-make -C JOS cppcheck CPPCHECK_VERSION=$(cppcheck --version | awk '{print $2}')
+make -C JOS cppcheck \
+  CPPCHECK_VERSION=$(cppcheck --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -n 1)
 ```
 
 ### Scope
@@ -97,14 +112,18 @@ Every other check still runs on that file.
 | `-I…/FreeRTOS/Source/portable/GCC/ARM_CM4F` | same path the `Makefile` passes to GCC; without it `portmacro.h` is unresolvable. |
 | `--platform=arm32-wchar_t4` | the target is 32-bit ARM ILP32; the default native (x86-64 LP64) model gives wrong `sizeof()`/overflow reasoning. |
 | no `--suppress=preprocessorErrorDirective` | that suppression hides exactly the `#error` abort above and makes the gate vacuous. |
-| no `--suppress=missingInclude` | hides an unresolvable first-party header, i.e. a real config bug. |
+| `--suppress=missingInclude` | information-level noise here, not a signal: it fires for the vendored trees we only `-I`, and a genuinely unresolvable *first-party* header is already a hard error in the `build` job, which compiles every translation unit. Not to be confused with `preprocessorErrorDirective`, which stays un-suppressed. |
 
 ### The canary
 
 `make -C JOS cppcheck-canary` generates a throwaway C file containing an
 out-of-bounds array write and a NULL dereference, runs cppcheck over it with
-the **exact same flags** as the real gate, deletes the file, and fails if
-cppcheck came back clean. It `#include`s `main.h` and `FreeRTOS.h` so it walks
+the **exact same flags** as the real gate, deletes the file, and fails unless
+cppcheck both exits non-zero **and** actually names `arrayIndexOutOfBounds` and
+`nullPointer` in its output. Checking the exit code alone would accept a
+broken-but-noisy analyser — a bad flag or an unreadable include path exits
+non-zero too — so the canary asserts the findings, not the exit status.
+It `#include`s `main.h` and `FreeRTOS.h` so it walks
 the same HAL/CMSIS/FreeRTOS include chain as real code — which is what makes it
 reproduce (and therefore catch) the "aborted configuration, exit 0" regression
 class. CI runs it *before* the gate itself, so a green gate is never trusted

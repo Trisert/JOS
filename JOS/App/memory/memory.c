@@ -485,6 +485,22 @@ static int flash_wait_bsy_bounded(uint32_t budget)
            (unsignedLessThanZero). Both are artefacts of that folding, not
            defects — on the target CYCCNT increments every CPU cycle. Narrow,
            per-line suppressions; no check id is disabled anywhere else. */
+        /* Scope and staleness: these are the only two inline suppressions in
+           this file, they are attached to the single line below (not the
+           function, not the file), and each names one id. They are the
+           allowlisted exception to the rule that first-party code carries no
+           suppressions -- adding another one is a review decision, not a
+           routine fix.
+
+           They cannot be retired automatically: the gate runs
+           `--suppress=unmatchedSuppression`, deliberately, because the
+           multi-configuration analysis reports a suppression as unmatched in
+           every configuration where the guarded line is preprocessed out,
+           which would make the build fail for reasons unrelated to the code.
+           The cost is that a suppression that has become unnecessary goes
+           quiet instead of loud, so on a cppcheck bump (CPPCHECK_VERSION in
+           JOS/Makefile) delete these two lines, re-run `make -C JOS cppcheck`,
+           and keep them only if the findings come back. */
         /* cppcheck-suppress knownConditionTrueFalse */
         /* cppcheck-suppress unsignedLessThanZero */
         if ((have_cyccnt != 0) && ((DWT->CYCCNT - start) >= budget)) {

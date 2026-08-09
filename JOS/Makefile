@@ -214,6 +214,7 @@ CPPCHECK_EXCLUDE := \
 
 CPPCHECK_SUPPRESS := \
   --suppress=missingIncludeSystem \
+  --suppress=missingInclude \
   --suppress=unusedFunction \
   --suppress=checkersReport \
   --suppress=unmatchedSuppression \
@@ -226,7 +227,7 @@ CPPCHECK_SUPPRESS := \
 
 # Notes on the suppressions above (deliberately narrow -- no real check id is
 # switched off repo-wide):
-#   missingIncludeSystem / unusedFunction / checkersReport /
+#   missingIncludeSystem / missingInclude / unusedFunction / checkersReport /
 #   unmatchedSuppression / toomanyconfigs / normalCheckLevelMaxBranches
 #     -- cppcheck bookkeeping messages, not defects.
 #   *:JOS/Drivers/* , *:JOS/Middlewares/* , *:JOS/Core/Inc/RadioLib/*
@@ -252,14 +253,31 @@ CPPCHECK_SUPPRESS := \
 # --platform=arm32-wchar_t4 : the target is 32-bit ARM ILP32 with 4-byte
 #                 wchar_t; the default native (x86-64 LP64) model gives wrong
 #                 sizeof()/overflow reasoning for firmware.
+#
+# Macro set: the union of $(C_DEFS) and $(CXX_DEFS), deduplicated by $(sort).
+# Every first-party translation unit in $(CPPCHECK_SRC) is C today, but the
+# RadioLib-facing glue is C++ and a .cpp landing under JOS/App would otherwise
+# be analysed with the C macro set only (no -DRADIOLIB_STATIC_ONLY=1), i.e.
+# under a configuration that is never built. Passing both keeps analysis and
+# compilation on the same macros. The two sets agree on every shared macro, so
+# $(sort) cannot produce a contradictory -D pair.
+CPPCHECK_DEFS := $(sort $(C_DEFS) $(CXX_DEFS))
+
+# --enable: deliberately NOT `all`. `all` is `warning,style,performance,
+# portability,information,unusedFunction,missingInclude` -- the last two are
+# bookkeeping we suppress anyway, and `unusedFunction` is unsound in a
+# whole-program sense here (every RTOS entry point looks unused). The `error`
+# severity is always on and is never listed: that is where the canary ids
+# (arrayIndexOutOfBounds, nullPointer) and the rest of the real-defect checks
+# live, so narrowing here cannot weaken the gate.
 CPPCHECK_FLAGS := \
-  --enable=all \
+  --enable=warning,style,performance,portability,information \
   --std=c11 \
   --error-exitcode=1 \
   --inline-suppr \
   --platform=arm32-wchar_t4 \
   -D__GNUC__=10 \
-  $(C_DEFS) \
+  $(CPPCHECK_DEFS) \
   $(patsubst -I%,-I$(CPPCHECK_PREFIX)%,$(INCLUDES)) \
   $(CPPCHECK_SUPPRESS) \
   $(addprefix -i,$(addprefix $(CPPCHECK_PREFIX),$(CPPCHECK_EXCLUDE)))
@@ -270,10 +288,21 @@ CPPCHECK_CANARY_DIR := $(CURDIR)/$(BUILD_DIR)/cppcheck-canary
 .PHONY: cppcheck cppcheck-version cppcheck-canary cppcheck-print
 
 # Fail loudly if the installed cppcheck is not the pinned one.
+#
+# The version is parsed as "the first dotted number anywhere on the first line"
+# rather than by field position: `cppcheck --version` has printed
+# "Cppcheck 2.13.0", "Cppcheck 2.14.0 dev" and (in distro builds) a trailing
+# vendor suffix, so `awk '{print $$2}'` was one output-format change away from
+# hard-blocking CI on a correctly installed binary.
 cppcheck-version:
-	@found=$$($(CPPCHECK) --version 2>/dev/null | awk '{print $$2}'); \
+	@found=$$($(CPPCHECK) --version 2>/dev/null \
+	          | head -n 1 \
+	          | grep -oE '[0-9]+(\.[0-9]+)+' \
+	          | head -n 1); \
 	if [ -z "$$found" ]; then \
-	  echo "ERROR: '$(CPPCHECK)' not found. Install cppcheck $(CPPCHECK_VERSION)."; exit 1; \
+	  echo "ERROR: '$(CPPCHECK)' not found, or its --version output carries no"; \
+	  echo "       parsable version number. Install cppcheck $(CPPCHECK_VERSION)."; \
+	  exit 1; \
 	fi; \
 	if [ "$$found" != "$(CPPCHECK_VERSION)" ]; then \
 	  echo "ERROR: cppcheck $(CPPCHECK_VERSION) is pinned but $$found is installed."; \
@@ -305,6 +334,15 @@ cppcheck: cppcheck-version
 # WITHOUT analysing anything -- and if someone then silences that with
 # `--suppress=preprocessorErrorDirective`, cppcheck exits 0 and the gate is
 # vacuous. In that state the canary exits 0 too, and this target fails the build.
+#
+# A non-zero exit alone is NOT accepted as proof of life. cppcheck exits
+# non-zero for reasons that have nothing to do with finding the planted
+# defects -- a bad flag, an unreadable include path, an internal error -- so a
+# gate that is merely broken-and-noisy would have looked "live". The run is
+# therefore captured and the two planted ids (`arrayIndexOutOfBounds` and
+# `nullPointer`, printed by cppcheck's default `[id]` template) must BOTH
+# appear in the output. Missing either one fails the build even when the exit
+# code is non-zero.
 cppcheck-canary: cppcheck-version
 	@rm -rf $(CPPCHECK_CANARY_DIR)
 	@mkdir -p $(CPPCHECK_CANARY_DIR)
@@ -329,9 +367,15 @@ cppcheck-canary: cppcheck-version
 	  '}' \
 	  > $(CPPCHECK_CANARY_DIR)/canary.c
 	@echo "=== cppcheck canary: the gate must REJECT this file ==="
-	@set +e; \
-	 ( cd $(CPPCHECK_ROOT) && $(CPPCHECK) $(CPPCHECK_FLAGS) $(CPPCHECK_CANARY_DIR)/canary.c ); \
+	@log=$(CPPCHECK_CANARY_DIR)/canary.out; \
+	 set +e; \
+	 ( cd $(CPPCHECK_ROOT) && $(CPPCHECK) $(CPPCHECK_FLAGS) $(CPPCHECK_CANARY_DIR)/canary.c ) \
+	   > "$$log" 2>&1; \
 	 rc=$$?; \
+	 cat "$$log"; \
+	 missing=""; \
+	 grep -q 'arrayIndexOutOfBounds' "$$log" || missing="$$missing arrayIndexOutOfBounds"; \
+	 grep -q 'nullPointer' "$$log" || missing="$$missing nullPointer"; \
 	 rm -rf $(CPPCHECK_CANARY_DIR); \
 	 if [ $$rc -eq 0 ]; then \
 	   echo "CANARY FAILED: cppcheck exited 0 on a file with an out-of-bounds"; \
@@ -339,7 +383,16 @@ cppcheck-canary: cppcheck-version
 	   echo "actually gating -- check the flags/suppressions in JOS/Makefile."; \
 	   exit 1; \
 	 fi; \
-	 echo "canary OK: cppcheck exited $$rc on the buggy file (gate is live)"
+	 if [ -n "$$missing" ]; then \
+	   echo "CANARY FAILED: cppcheck exited $$rc, but did not report:$$missing"; \
+	   echo "A non-zero exit on its own only proves cppcheck was unhappy, not"; \
+	   echo "that it still detects defects -- a bad flag or an unreadable"; \
+	   echo "include path produces the same exit code. Run"; \
+	   echo "'make -C JOS cppcheck-print' and check the flags/suppressions."; \
+	   exit 1; \
+	 fi; \
+	 echo "canary OK: cppcheck exited $$rc and reported both arrayIndexOutOfBounds"; \
+	 echo "           and nullPointer on the buggy file (gate is live)"
 
 ##############################################################################
 # Source & Object files

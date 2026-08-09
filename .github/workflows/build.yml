@@ -35,22 +35,59 @@ jobs:
 
       - name: Install pinned cppcheck
         run: |
+          set -euo pipefail
           sudo apt-get update
-          # PINNED VERSION. ubuntu-24.04 (noble/universe) ships exactly
-          # cppcheck 2.13.0-2ubuntu3. Pinning matters because a cppcheck bump
-          # can add, drop or retune checks (e.g. `constParameter` was split into
-          # `constParameterPointer` in 2.11+) and would silently change what
-          # this gate accepts. If this install ever fails, the archive moved:
-          # bump it here AND bump CPPCHECK_VERSION in JOS/Makefile in the same
-          # PR, after re-running the gate and triaging any new findings.
-          sudo apt-get install -y --no-install-recommends cppcheck=2.13.0-2ubuntu3
+          # PINNED UPSTREAM VERSION: cppcheck 2.13.0, which is what
+          # CPPCHECK_VERSION in JOS/Makefile requires (the `cppcheck` target
+          # refuses to run anything else). Pinning matters because a cppcheck
+          # bump can add, drop or retune checks (e.g. `constParameter` was
+          # split into `constParameterPointer` in 2.11+) and would silently
+          # change what this gate accepts.
+          #
+          # Three ways to get it, tried in order, so that a single archive
+          # change cannot hard-block every PR. All three land on upstream
+          # 2.13.0, so the Makefile's version assertion holds either way; if
+          # all three fail, the job fails loudly with instructions rather than
+          # quietly analysing with the wrong version.
+          #
+          #   1. the exact Ubuntu 24.04 (noble/universe) package revision;
+          #   2. any Debian revision of the same upstream 2.13.0 (covers a
+          #      security/rebuild bump such as -2ubuntu3.1 or -2ubuntu4);
+          #   3. a source build of upstream tag 2.13.0 (slow, ~2 min, but
+          #      immune to the archive entirely).
+          #
+          # To move to a different cppcheck: change PINNED_DEB/PINNED_VERSION
+          # here AND CPPCHECK_VERSION in JOS/Makefile in the same PR, after
+          # re-running the gate and triaging every new finding.
+          PINNED_DEB=2.13.0-2ubuntu3
+          PINNED_VERSION=2.13.0
+          if sudo apt-get install -y --no-install-recommends "cppcheck=${PINNED_DEB}"; then
+            echo "installed cppcheck=${PINNED_DEB} from apt (pinned revision)"
+          elif sudo apt-get install -y --no-install-recommends "cppcheck=${PINNED_VERSION}*"; then
+            echo "::warning::cppcheck=${PINNED_DEB} is gone from the archive; used another revision of upstream ${PINNED_VERSION}."
+          else
+            echo "::warning::apt has no cppcheck ${PINNED_VERSION}; building it from source."
+            sudo apt-get install -y --no-install-recommends build-essential git libpcre3-dev
+            git clone --depth 1 --branch "${PINNED_VERSION}" https://github.com/danmar/cppcheck.git /tmp/cppcheck-src
+            make -C /tmp/cppcheck-src -j"$(nproc)" MATCHCOMPILER=no HAVE_RULES=no FILESDIR=/usr/share/cppcheck
+            sudo make -C /tmp/cppcheck-src install FILESDIR=/usr/share/cppcheck
+          fi
           cppcheck --version
+          # Hard assertion: whatever path we took must produce the pinned
+          # upstream version, otherwise the gate result is not comparable with
+          # the one this PR was reviewed against.
+          cppcheck --version | grep -qE "(^|[^0-9.])${PINNED_VERSION}([^0-9.]|$)" || {
+            echo "ERROR: expected cppcheck ${PINNED_VERSION}, got: $(cppcheck --version)"
+            exit 1
+          }
 
       # Canary: proves the gate is still capable of failing BEFORE we trust a
       # green result on the real tree. It generates a throwaway C file with an
       # out-of-bounds array write and a NULL dereference, runs cppcheck over it
-      # with the EXACT same flags as the real gate, deletes the file, and exits
-      # non-zero if cppcheck came back clean.
+      # with the EXACT same flags as the real gate, deletes the file, and fails
+      # unless cppcheck both exits non-zero AND names `arrayIndexOutOfBounds`
+      # and `nullPointer` in its output -- exit status alone would also be
+      # satisfied by an analyser that is merely broken and noisy.
       #
       # This is not theoretical: the first version of this gate suppressed
       # `preprocessorErrorDirective` and never defined `__GNUC__`, so
