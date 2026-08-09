@@ -3,7 +3,7 @@
 Goal: bring the RedPill (JOS) on-board software to a hardened, space-ready /
 QM-ready state for ESA Fly Your Satellite! 4. Target: STM32L496VGTx
 (Cortex-M4 @ 80 MHz, 1 MB dual-bank flash, 320 KB SRAM — 256 KB SRAM1 +
-64 KB SRAM2 with parity, 4 MB FRAM).
+| 64 KB SRAM2 with parity, 4× FM24VN10-G FRAM on I²C2 = 256 KB total).
 
 Every recommendation below cites the standard that motivates it:
 
@@ -37,9 +37,9 @@ Every recommendation below cites the standard that motivates it:
 | # | Recommendation | Standard | Priority | Effort |
 |---|----------------|----------|----------|--------|
 | 2.1 | **MPU**: configure regions to isolate kernel / task stacks / FRAM driver from app data; block execute on SRAM | [NASA-PoT] #4 (no pointer arithmetic on cast), [JPL-182] | Med | Med |
-| 2.2 | **HardFault / MemManage / BusFault handlers** with register dump to LastStates + reboot | [NASA-STD-8739.8] (fault containment), [ECSS-E-ST-40C] | High | Low |
-| 2.3 | **Stack overflow hook**: `vApplicationStackOverflowHook` currently empty — fill it to flag + record the offending task, then safe-reboot | [NASA-PoT], FreeRTOS `configCHECK_FOR_STACK_OVERFLOW=2` already set | High | Low |
-| 2.4 | **Watchdog**: `watchdog_register_task` / `watchdog_alive` exist but have **no callers** in the current source — wire every task to register + periodicaly kick; keep IWDG ~32 s as backstop | [NASA-STD-8739.8] (watchdog/monitoring), [ECSS-E-ST-40C] | High | Med |
+| 2.2 | **HardFault / MemManage / BusFault handlers** with register dump to LastStates + reboot — **DONE**: handlers in `Core/Src/faults.c` (`fault_log_*`, LastStates dump) wired to the Cortex-M fault vectors; `configCHECK_FOR_STACK_OVERFLOW=2` set | [NASA-STD-8739.8] (fault containment), [ECSS-E-ST-40C] | High | Low |
+| 2.3 | **Stack overflow hook** — **DONE**: `vApplicationStackOverflowHook` (`Core/Src/freertos.c:76-91`) already calls `fault_log_stack_overflow()` and reboots; `configCHECK_FOR_STACK_OVERFLOW=2` already set | [NASA-PoT], FreeRTOS `configCHECK_FOR_STACK_OVERFLOW=2` | High | Low |
+| 2.4 | **Watchdog** — **DONE (software)**: `watchdog_register_task()` is called from 6 task creators (`comms.c:215/260`, `state_machine.c:398`, `clear.c:159`, `cloud.c:148`, `aocs.c:43`) and `watchdog_alive_self()` runs in every task loop; monitor task flags silence >3× period. Hardware IWDG is **NOT yet configured** (`state_machine.c:133` TODO) — only the software watchdog is live today | [NASA-STD-8739.8] (watchdog/monitoring), [ECSS-E-ST-40C] | High | Med |
 | 2.5 | **SRAM2 parity**: the 64 KB SRAM2 block has hardware parity (linker region `RAM2` @ 0x10000000). Place critical structures (state, comms buffers) there; enable parity error NMI | [NASA-STD-8739.8] (data integrity) | Med | Low |
 
 ## 3. Boot & image integrity
@@ -47,7 +47,7 @@ Every recommendation below cites the standard that motivates it:
 | # | Recommendation | Standard | Priority | Effort |
 |---|----------------|----------|----------|--------|
 | 3.1 | **CRC32 of the firmware image** computed at build; verified at boot before jumping to `main()` | [ECSS-E-ST-40C] 5.4 (integrity), [NASA-STD-8739.8] | High | Low |
-| 3.2 | **Dual-bank flash fallback**: STM32L496 has dual-bank (option byte `DUALBANK`). Keep a known-good golden image in bank 2; on CRC fail or repeated boot fault, boot bank 2 | [NASA-STD-8739.8] (graceful degradation), [ECSS-Q-ST-80C] | High | Med |
+| 3.2 | **Dual-bank flash fallback** — **DONE (PR #21)**: STM32L496 dual-bank (`DUALBANK` option byte) with a known-good golden image in bank 2; on CRC fail or repeated boot fault the bootloader selects bank 2 (`Core/Src/dual_bank.c`). Boot-policy safe states described in `docs/dev/dual_bank.md` | [NASA-STD-8739.8] (graceful degradation), [ECSS-Q-ST-80C] | High | Med |
 | 3.3 | **Option bytes** read-back + lock (RDP level 1) to prevent readout; verify at boot | [ECSS-Q-ST-80C] | Med | Low |
 
 ## 4. Uplink / command validation
@@ -62,17 +62,17 @@ Every recommendation below cites the standard that motivates it:
 
 | # | Recommendation | Standard | Priority | Effort | Status |
 |---|----------------|----------|----------|--------|--------|
-| 5.1 | **LastStates pool wear**: erase uses STM32L4 **pages** (correct) but each entry rewrite erases a page — add a simple wear counter / rotate entries across pages to extend endurance | [ECSS-E-ST-40C] (reliability) | Med | Med | TODO |
+| 5.1 | **LastStates pool wear**: the ring erases the oldest 2 KB page **only on wrap** (`memory.c:156-177`), not on every entry rewrite — this is already the proposed mitigation. Optional: add a wear counter for telemetry | [ECSS-E-ST-40C] (reliability) | Med | Med | DONE (mitigation present) |
 | 5.2 | **SEU mitigation**: periodically re-write critical RAM structures (state, config) from FRAM; use the SRAM2 parity NMI to detect corruption | [NASA-STD-8739.8] (fault tolerance) | Med | Med | **DONE (W2-5)** — two complementary halves: `Core/Src/seu_mitigation.c` (in-RAM redundant shadows, periodic vote/repair) and `App/obsw/scrub.c` (CRC-protected golden copies in FRAM: boot repair, 5 s scrub pass, write-through on every committed mutation). Docs `docs/dev/seu_mitigation.md`, `docs/dev/scrub.md` |
 | 5.3 | **FRAM**: already non-volatile and radiation-tolerant (FeRAM) — good choice; add a CRC per FRAM record | [ECSS-E-ST-40C] | Low | Low | **DONE (W2-5)** — every golden record carries a CRC-32 over its payload; a corrupt backup is rejected (`SCRUB_ERR_CRC`), never restored into live RAM |
 
 ## 6. Cheap wins (do first)
 
-1. Fill `vApplicationStackOverflowHook` (2.3) — Low effort, catches a real gap.
-2. Add `-Werror=implicit-function-declaration` to `Makefile` (1.2) — already proven necessary (PR #5).
-3. CRC32 check at boot (3.1) — Low effort, high value.
-4. Wire `watchdog_register_task`/`watchdog_alive` into every task (2.4) — closes a stub.
-5. HardFault handler with LastStates dump (2.2) — Low effort, essential for forensics.
+1. ~~Fill `vApplicationStackOverflowHook` (2.3)~~ — **DONE** (`freertos.c:76-91`).
+2. Add `-Werror=implicit-function-declaration` to `Makefile` (1.2) — already proven necessary (PR #5); verify it is actually set.
+3. ~~CRC32 check at boot (3.1)~~ — **DONE** (documented in §Implemented status).
+4. ~~Wire `watchdog_register_task`/`watchdog_alive` into every task (2.4)~~ — **DONE** (6 task creators register).
+5. ~~HardFault handler with LastStates dump (2.2)~~ — **DONE** (`faults.c`).
 
 ## 7. Known stubs to finish (from source review)
 
@@ -82,7 +82,6 @@ must be implemented before "space-ready" claims:
 - `App/bms/` — EPS SPI slave interface (`TODO: init subsystem SPI master`)
 - `App/aocs/` — control law largely placeholder
 - Comms encryption key handling marked TBD
-- Watchdog registration callers absent
 
 Address these per the ECSS service alignment table in `docs/arch/README.md`.
 
@@ -98,7 +97,7 @@ not replace the roadmap but records what each item looks like on the OBC.
 Standards drawn on: ECSS-E-ST-40C §5.4 (software integrity), ECSS-Q-ST-80C
 §6.3.5 (post-mortem evidence), NASA-STD-8739.8 (fault detection and recovery).
 
-### 2.4 / 3.1 Boot-time firmware image CRC32
+### Evidence: boot-time firmware image CRC32 (roadmap §3.1)
 
 `App/obsw/boot_crc.c` computes a pure-software CRC-32 (IEEE 802.3, reflected,
 poly `0xEDB88320`, i.e. bit-identical to `zlib.crc32`) over
@@ -127,7 +126,7 @@ and the IWDG is not configured, so it would be an unrecoverable brick. RedPill
 carries no golden image and no bootloader, so "halt on mismatch" is not an
 available safe state.
 
-### 3.1 Task liveness monitoring (software watchdog)
+### Evidence: task liveness monitoring (software watchdog, roadmap §2.4)
 
 `App/obsw/watchdog.c` keeps a table of monitored tasks (`WDG_MAX_TASKS = 12`).
 A task registers with the loop period it promises to honour; the monitor task
