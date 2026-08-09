@@ -478,6 +478,15 @@ static int flash_wait_bsy_bounded(uint32_t budget)
     uint32_t       spins       = 0U;
 
     while (__HAL_FLASH_GET_FLAG(FLASH_FLAG_BSY)) {
+        /* cppcheck cannot model a memory-mapped register: it folds every read
+           of the volatile DWT->CYCCNT to the same value, concludes
+           dwt_cyccnt_running() always returns 0 (knownConditionTrueFalse) and
+           then reduces the cycle test to `budget <= 0` on an unsigned type
+           (unsignedLessThanZero). Both are artefacts of that folding, not
+           defects — on the target CYCCNT increments every CPU cycle. Narrow,
+           per-line suppressions; no check id is disabled anywhere else. */
+        /* cppcheck-suppress knownConditionTrueFalse */
+        /* cppcheck-suppress unsignedLessThanZero */
         if ((have_cyccnt != 0) && ((DWT->CYCCNT - start) >= budget)) {
             return -1;
         }
