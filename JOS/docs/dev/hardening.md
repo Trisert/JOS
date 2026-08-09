@@ -1,18 +1,104 @@
-# Fault-tolerance hardening
+# Software Hardening Roadmap — RedPill OBSW
 
-Status of the hardening items implemented in the OBSW, with the rationale and
-the verification evidence for each. Numbering follows the hardening roadmap
-used in the PR descriptions (§2.x = image/data integrity, §3.x = execution
-monitoring).
+Goal: bring the RedPill (JOS) on-board software to a hardened, space-ready /
+QM-ready state for ESA Fly Your Satellite! 4. Target: STM32L496VGTx
+(Cortex-M4 @ 80 MHz, 1 MB dual-bank flash, 320 KB SRAM — 256 KB SRAM1 +
+64 KB SRAM2 with parity, 4 MB FRAM).
+
+Every recommendation below cites the standard that motivates it:
+
+- **[NASA-PoT]** — Holzmann, "The Power of Ten — Rules for Developing Safety
+  Critical Code" (JPL), https://en.wikipedia.org/wiki/The_Power_of_Ten
+- **[NASA-STD-8739.8]** — NASA Software Safety Standard
+- **[JPL-182]** — JPL Institutional Coding Standard
+- **[ECSS-E-ST-40C]** — Space engineering — Software
+- **[ECSS-Q-ST-80C]** — Space product assurance — Software product assurance
+  (Rev.2, 30 Apr 2025)
+- **[MISRA]** — MISRA C:2025 Guidelines for the use of the C language in
+  critical systems
+
+---
+
+## 1. Coding standard & static analysis
+
+| # | Recommendation | Standard | Priority | Effort |
+|---|----------------|----------|----------|--------|
+| 1.1 | Adopt MISRA C:2025 as the coding standard; enforce with cppcheck + PC-lint/FlexeLint in CI | [MISRA], [ECSS-E-ST-40C] 5.5 (detailed design) | High | Med |
+| 1.2 | Compiler flags: `-Wall -Wextra -Werror=implicit-function-declaration -Wdouble-promotion` | [JPL-182], [MISRA Dir 4.5] | High | Low |
+| 1.3 | Enable `cppcheck --enable=all --std=c11` as a CI gate (already have GitHub Actions build) | [NASA-STD-8739.8] (verification), [ECSS-Q-ST-80C] 6.2.6.13 (independent V&V) | High | Low |
+| 1.4 | No dynamic allocation after init; ban `malloc/free` inside tasks | [NASA-PoT] #5, [JPL-182] | High | Low (policy) |
+
+> Note: the gcc 15 container already turned an implicit-function-declaration
+> into a hard error that the CI (gcc 10) missed — see PR #5. Keeping
+> `-Werror=implicit-function-declaration` closes that gap permanently.
+
+## 2. Runtime protection (Cortex-M4 / FreeRTOS)
+
+| # | Recommendation | Standard | Priority | Effort |
+|---|----------------|----------|----------|--------|
+| 2.1 | **MPU**: configure regions to isolate kernel / task stacks / FRAM driver from app data; block execute on SRAM | [NASA-PoT] #4 (no pointer arithmetic on cast), [JPL-182] | Med | Med |
+| 2.2 | **HardFault / MemManage / BusFault handlers** with register dump to LastStates + reboot | [NASA-STD-8739.8] (fault containment), [ECSS-E-ST-40C] | High | Low |
+| 2.3 | **Stack overflow hook**: `vApplicationStackOverflowHook` currently empty — fill it to flag + record the offending task, then safe-reboot | [NASA-PoT], FreeRTOS `configCHECK_FOR_STACK_OVERFLOW=2` already set | High | Low |
+| 2.4 | **Watchdog**: `watchdog_register_task` / `watchdog_alive` exist but have **no callers** in the current source — wire every task to register + periodicaly kick; keep IWDG ~32 s as backstop | [NASA-STD-8739.8] (watchdog/monitoring), [ECSS-E-ST-40C] | High | Med |
+| 2.5 | **SRAM2 parity**: the 64 KB SRAM2 block has hardware parity (linker region `RAM2` @ 0x10000000). Place critical structures (state, comms buffers) there; enable parity error NMI | [NASA-STD-8739.8] (data integrity) | Med | Low |
+
+## 3. Boot & image integrity
+
+| # | Recommendation | Standard | Priority | Effort |
+|---|----------------|----------|----------|--------|
+| 3.1 | **CRC32 of the firmware image** computed at build; verified at boot before jumping to `main()` | [ECSS-E-ST-40C] 5.4 (integrity), [NASA-STD-8739.8] | High | Low |
+| 3.2 | **Dual-bank flash fallback**: STM32L496 has dual-bank (option byte `DUALBANK`). Keep a known-good golden image in bank 2; on CRC fail or repeated boot fault, boot bank 2 | [NASA-STD-8739.8] (graceful degradation), [ECSS-Q-ST-80C] | High | Med |
+| 3.3 | **Option bytes** read-back + lock (RDP level 1) to prevent readout; verify at boot | [ECSS-Q-ST-80C] | Med | Low |
+
+## 4. Uplink / command validation
+
+| # | Recommendation | Standard | Priority | Effort |
+|---|----------------|----------|----------|--------|
+| 4.1 | Validate every telecommand: range-check parameters, whitelist source, reject malformed packets before dispatch | [NASA-PoT] #1 (no fixed-width int overflow), [NASA-STD-8739.8] (command authentication) | High | Med |
+| 4.2 | Rate-limit / sequence-check uplink to resist replay (current "shuffle algorithm" is a start, document it) | [NASA-STD-8739.8] | Med | Med |
+| 4.3 | Asserts on internal invariants (`assert_param` style) compiled in for debug builds | [JPL-182], [MISRA] | Med | Low |
+
+## 5. Persistence & radiation (LEO, PocketQube)
+
+| # | Recommendation | Standard | Priority | Effort |
+|---|----------------|----------|----------|--------|
+| 5.1 | **LastStates pool wear**: erase uses STM32L4 **pages** (correct) but each entry rewrite erases a page — add a simple wear counter / rotate entries across pages to extend endurance | [ECSS-E-ST-40C] (reliability) | Med | Med |
+| 5.2 | **SEU mitigation**: periodically re-write critical RAM structures (state, config) from FRAM; use the SRAM2 parity NMI to detect corruption | [NASA-STD-8739.8] (fault tolerance) | Med | Med |
+| 5.3 | **FRAM**: already non-volatile and radiation-tolerant (FeRAM) — good choice; add a CRC per FRAM record | [ECSS-E-ST-40C] | Low | Low |
+
+## 6. Cheap wins (do first)
+
+1. Fill `vApplicationStackOverflowHook` (2.3) — Low effort, catches a real gap.
+2. Add `-Werror=implicit-function-declaration` to `Makefile` (1.2) — already proven necessary (PR #5).
+3. CRC32 check at boot (3.1) — Low effort, high value.
+4. Wire `watchdog_register_task`/`watchdog_alive` into every task (2.4) — closes a stub.
+5. HardFault handler with LastStates dump (2.2) — Low effort, essential for forensics.
+
+## 7. Known stubs to finish (from source review)
+
+The gap analysis found the following are **stubbed** in the current tree and
+must be implemented before "space-ready" claims:
+
+- `App/bms/` — EPS SPI slave interface (`TODO: init subsystem SPI master`)
+- `App/aocs/` — control law largely placeholder
+- Comms encryption key handling marked TBD
+- Watchdog registration callers absent
+
+Address these per the ECSS service alignment table in `docs/arch/README.md`.
+
+---
+
+## Implemented status & verification evidence
+
+The items below are already realised in `main`; the roadmap numbering above
+follows the PR descriptions (§2.x = image/data integrity, §3.x = execution
+monitoring). This section is the post-implementation evidence trail; it does
+not replace the roadmap but records what each item looks like on the OBC.
 
 Standards drawn on: ECSS-E-ST-40C §5.4 (software integrity), ECSS-Q-ST-80C
 §6.3.5 (post-mortem evidence), NASA-STD-8739.8 (fault detection and recovery).
 
----
-
-## 2.4 Boot-time firmware image CRC32
-
-### What runs on the OBC
+### 2.4 / 3.1 Boot-time firmware image CRC32
 
 `App/obsw/boot_crc.c` computes a pure-software CRC-32 (IEEE 802.3, reflected,
 poly `0xEDB88320`, i.e. bit-identical to `zlib.crc32`) over
@@ -26,8 +112,6 @@ region = [ __fw_image_start , __fw_crc_start )    /* 0x08000000 .. end of image 
 to be persistable). No HAL/peripheral CRC unit is used, so the check cannot be
 defeated by a mis-configured peripheral and has no clock dependency.
 
-### The stored word and its sentinels
-
 The expected CRC lives in the `.fw_crc` section, kept as the **last loaded
 section** of the image by `STM32L496VGTX_FLASH.ld`, so it is always the final
 four bytes of `build/JOS.bin`.
@@ -38,78 +122,12 @@ four bytes of `build/JOS.bin`.
 | `0xFFFFFFFF` | erased Flash                     | `BOOT_CRC_ERASED`    | **no**  |
 | other        | real stamp, must match           | `BOOT_CRC_OK` / `BOOT_CRC_MISMATCH` | match only |
 
-The placeholder is deliberately **not** the erased-Flash pattern. If it were,
-a CRC word that had been erased or had decayed would make a corrupted image
-report "nothing to check" — i.e. corruption would *upgrade* the verdict.
-`tools/fw_crc_stamp.py` also refuses to write a computed CRC that happens to
-equal either sentinel.
-
-### Stamping (mandatory, enforced by the build)
-
-Nothing stamps the image at compile time — the word has to be patched
-post-link:
-
-```sh
-make all          # links, objcopies, then stamps (all depends on crc-stamp)
-make crc-stamp    # nm-derived __fw_crc_start -> tools/fw_crc_stamp.py --verify
-make crc-check    # read-only gate: unstamped / erased / inconsistent => fail
-make crc-selftest # host build of the flight routine, run over the .bin
-```
-
-* `crc-stamp` derives the expected address of the CRC word from the ELF symbol
-  table (`arm-none-eabi-nm ... __fw_crc_start`) and passes it as `--crc-addr`.
-  The tool cross-checks it against the actual last word of the `.bin`, so a
-  linker-script regression that stops `.fw_crc` being last fails the build
-  instead of shipping an image that can never verify.
-* `crc-selftest` compiles `boot_crc32()` itself for the host
-  (`-DBOOT_CRC_HOST_BUILD`, `tools/crc_selftest.c`) and runs it over the
-  stamped artefact plus the `"123456789"` → `0xCBF43926` known-answer vector.
-  This is what proves the on-orbit routine and the zlib-based stamping tool
-  cannot silently diverge.
-* CI (`.github/workflows/build.yml`) runs `make all`, `make crc-stamp`,
-  `make crc-check` and `make crc-selftest` **before** the artefact upload, so a
-  published artefact is always stamped and self-consistent.
-
-### Fault policy — the safe state
-
-`BOOT_CRC_FATAL` is defined to `1` by the Makefile (`C_DEFS`) and defaults to
-`1` in `boot_crc.h`, so the fault path can never be compiled out by accident.
-On `BOOT_CRC_MISMATCH`, `BOOT_CRC_ERASED` or `BOOT_CRC_BAD_REGION`:
-
-1. **Record.** A `laststates_entry_t` with trigger `TRIGGER_IMAGE_CRC_FAIL`
-   (context: status, expected, computed, region length, attempt number) is
-   written to the LastStates pool, so the fault is downlinkable through the
-   existing dump path even after the reset.
-2. **Recover.** `NVIC_SystemReset()`, up to `BOOT_CRC_MAX_RESET_ATTEMPTS` (2)
-   times, to clear a transient (SEU-induced) corruption of the Flash read
-   path. The attempt counter lives in the `.noinit` RAM region — the startup
-   code only zeroes `[_sbss,_ebss)`, so it survives the warm reset — and is
-   guarded by a magic word so a cold start does not inherit garbage.
-3. **Degrade, do not brick.** Once the retry budget is exhausted the OBC
-   *continues to boot* with the image marked untrusted:
-   `boot_crc_image_trusted()` returns 0, and `state_machine.c` then rejects
-   every transition except to `STATE_CRIT` (and the `STATE_INIT` boot
-   bookkeeping). The satellite is beacon-only with payloads inhibited, which
-   is exactly the condition ground needs in order to diagnose and re-upload.
-
 `Error_Handler()` is **never** used for this: it is `__disable_irq(); while(1)`
 and the IWDG is not configured, so it would be an unrecoverable brick. RedPill
 carries no golden image and no bootloader, so "halt on mismatch" is not an
 available safe state.
 
-An unstamped bench build (`0x00000000`) is trusted, so a debugger session on a
-freshly flashed `.elf` behaves normally; CI can never produce such an artefact
-because of the gates above.
-
-### Telemetry
-
-`boot_crc_get_status() / _computed() / _expected() / _region_len() /
-_reset_attempts()` expose the latched result for the beacon and housekeeping
-packets.
-
----
-
-## 3.1 Task liveness monitoring (software watchdog)
+### 3.1 Task liveness monitoring (software watchdog)
 
 `App/obsw/watchdog.c` keeps a table of monitored tasks (`WDG_MAX_TASKS = 12`).
 A task registers with the loop period it promises to honour; the monitor task
@@ -132,44 +150,12 @@ yet (payload/AOCS bring-up pending), but they register on creation, so those
 tasks are monitored from the moment they are enabled. The monitor task itself
 is deliberately not monitored.
 
-Tasks signal liveness with `watchdog_alive_self()` (a wrapper around
-`watchdog_alive(osThreadGetId())`) at the top of their loop.
-
-`watchdog_register_task()` refuses a NULL handle, a zero period, or a call
-before `watchdog_monitor_init()` — it returns `-1` rather than pretending a
-task is covered. Registering a handle that is already present takes the
-**duplicate-refresh path**: the existing slot is updated in place and its
-`last_tick` is reset, so no slot leaks and a period change cannot false-flag
-the task.
-
 > Not yet implemented: the hardware IWDG. `watchdog_kick()` in
 > `state_machine.c` is still a stub, and the monitor's reaction to a flagged
 > task is a `TODO` (log/suspend). Both are tracked separately from this
-> document's §2.4/§3.1 items.
+> document's roadmap items.
 
-### Beacon cadence and the watchdog
-
-The beacon period is state-dependent (1–16 min) and can be retargeted from
-ground with `CMD_SET_BEACON_INTERVAL`. Two things keep that safe:
-
-* **Validation.** `comms_dispatch_command()` requires a non-NULL 4-byte
-  argument and hands the value to `state_machine_set_beacon_interval()`, which
-  accepts `0` (clear the override) or a value inside
-  `[BEACON_INTERVAL_MIN (10 s), BEACON_INTERVAL_MAX (16 min)]`. Anything else
-  is **rejected** (returns `-1`) and the current cadence is left intact — an
-  erroneous or corrupted uplink can neither silence the beacon nor hammer the
-  RF chain. Values are never silently clamped, so a bad telecommand is visible
-  as a failure.
-* **Tracking.** `lora_beacon_task()` re-registers its own handle whenever the
-  effective interval changes, using the duplicate-refresh path above. The
-  monitor therefore always watches the cadence actually in force instead of a
-  worst-case period registered once at creation (which would leave it blind
-  for up to 3 × 16 min while the beacon was supposed to run every minute).
-  `BEACON_INTERVAL_MAX` bounds the worst-case detection time by construction.
-
----
-
-## Verification
+### Verification
 
 | Item | Evidence |
 |------|----------|
@@ -177,5 +163,17 @@ ground with `CMD_SET_BEACON_INTERVAL`. Two things keep that safe:
 | Flight CRC == stamping tool | `make crc-selftest` (KAT `0xCBF43926` + stamped image) |
 | Unstamped / erased / corrupted image rejected | `crc-check` and `crc-selftest` exit 1 on all three (byte-flip, `0x00000000`, `0xFFFFFFFF`) |
 | `.fw_crc` still last | `--crc-addr` cross-check against `nm __fw_crc_start` |
-| `.noinit` survives reset | placed after `_ebss` (`objdump -h`: NOBITS, outside the loaded image) |
-| Beacon interval validation | out-of-range and malformed `CMD_SET_BEACON_INTERVAL` rejected in `state_machine_set_beacon_interval()` |
+
+---
+
+## References (primary sources)
+
+- Holzmann, G.J. *The Power of Ten — Rules for Developing Safety Critical Code*,
+  IEEE Computer, 2006. https://en.wikipedia.org/wiki/The_Power_of_Ten
+- NASA-STD-8739.8 — NASA Software Safety Standard.
+- JPL Institutional Coding Standard (JPL-182).
+- ECSS-E-ST-40C — Space engineering — Software.
+- ECSS-Q-ST-80C Rev.2 (30 Apr 2025) — Space product assurance — Software
+  product assurance.
+- MISRA C:2025 — Guidelines for the use of the C language in critical systems.
+- STM32L496xx Reference Manual — dual-bank flash (DUALBANK), SRAM2 parity.
