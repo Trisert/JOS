@@ -60,11 +60,11 @@ Every recommendation below cites the standard that motivates it:
 
 ## 5. Persistence & radiation (LEO, PocketQube)
 
-| # | Recommendation | Standard | Priority | Effort |
-|---|----------------|----------|----------|--------|
-| 5.1 | **LastStates pool wear**: erase uses STM32L4 **pages** (correct) but each entry rewrite erases a page — add a simple wear counter / rotate entries across pages to extend endurance | [ECSS-E-ST-40C] (reliability) | Med | Med |
-| 5.2 | **SEU mitigation**: periodically re-write critical RAM structures (state, config) from FRAM; use the SRAM2 parity NMI to detect corruption | [NASA-STD-8739.8] (fault tolerance) | Med | Med |
-| 5.3 | **FRAM**: already non-volatile and radiation-tolerant (FeRAM) — good choice; add a CRC per FRAM record | [ECSS-E-ST-40C] | Low | Low |
+| # | Recommendation | Standard | Priority | Effort | Status |
+|---|----------------|----------|----------|--------|--------|
+| 5.1 | **LastStates pool wear**: erase uses STM32L4 **pages** (correct) but each entry rewrite erases a page — add a simple wear counter / rotate entries across pages to extend endurance | [ECSS-E-ST-40C] (reliability) | Med | Med | TODO |
+| 5.2 | **SEU mitigation**: periodically re-write critical RAM structures (state, config) from FRAM; use the SRAM2 parity NMI to detect corruption | [NASA-STD-8739.8] (fault tolerance) | Med | Med | **DONE (W2-5)** — two complementary halves: `Core/Src/seu_mitigation.c` (in-RAM redundant shadows, periodic vote/repair) and `App/obsw/scrub.c` (CRC-protected golden copies in FRAM: boot repair, 5 s scrub pass, write-through on every committed mutation). Docs `docs/dev/seu_mitigation.md`, `docs/dev/scrub.md` |
+| 5.3 | **FRAM**: already non-volatile and radiation-tolerant (FeRAM) — good choice; add a CRC per FRAM record | [ECSS-E-ST-40C] | Low | Low | **DONE (W2-5)** — every golden record carries a CRC-32 over its payload; a corrupt backup is rejected (`SCRUB_ERR_CRC`), never restored into live RAM |
 
 ## 6. Cheap wins (do first)
 

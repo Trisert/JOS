@@ -65,6 +65,13 @@ enum {
        ground (Kilo #26, comment id 3741110986). Next free value; the wire
        values above are never renumbered. */
     TRIGGER_CLOCK_FAULT     = 16,  /* RCC CSS: HSE/oscillator failure  */
+    /* SEU scrub (W2-5, App/obsw/scrub.c): the CRC-protected golden copy of a
+       critical struct in FRAM is unusable (never synced, transport failure or
+       FRAM bit flip), so the scrubber cannot repair that region. Distinct from
+       TRIGGER_SEU_SCRUB (13), which reports the RAM-shadow scrubber of
+       seu_mitigation.c. Next free value: the codes above are already on main
+       and are a ground telemetry contract, so they are never renumbered. */
+    TRIGGER_SCRUB_FAULT     = 17,  /* SEU scrub: golden FRAM record unusable */
 };
 
 /* ---------- BMS interface (stub for now) ---------- */
