@@ -249,7 +249,12 @@ void lora_rx_task(void *arg)
          *       logged/telemetered, not discarded. */
         (void)rx;
         (void)rx_len;
-        watchdog_alive_self();  /* keep the monitor happy while RX task is parked */
+        watchdog_alive_self();  /* keep the monitor happy while RX task is parked.
+                                  * NOTE: this arms a 3x100ms=300ms silence deadline;
+                                  * safe for the current 100ms poll placeholder, but
+                                  * the future blocking DIO1 wait (see TODO above) must
+                                  * call watchdog_alive_self() inside the wait or the
+                                  * task will be falsely flagged hung. */
         osDelay(pdMS_TO_TICKS(100));
     }
 }

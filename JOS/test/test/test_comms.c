@@ -548,22 +548,15 @@ static void run_task_iterations(void (*task)(void *))
     TEST_ASSERT_EQUAL_INT(3, delay_calls);
 }
 
-/* GAP, asserted deliberately: lora_rx_task() does NOT signal liveness.
- *
- * It is registered with the monitor at WDG_PERIOD_LORA_RX_MS (100 ms) by
- * lora_rx_task_create() and then never calls watchdog_alive_self(), so the
- * entry stays unarmed and is judged against WDG_STARTUP_GRACE_MS for ever.
- * No mock expectation for watchdog_alive_self() is queued here, so this test
- * FAILS the moment the kick is added - at which point the assertion below
- * must be replaced by three watchdog_alive_self_Expect() calls.
- *
- * Adding the kick is a flight-code change and is out of scope for this
- * test-only change set; it is recorded here so the omission is visible in the
- * test report rather than only in the source.
- */
+/* lora_rx_task() now signals liveness every iteration, mirroring the other
+ * monitored tasks. The loop runs three iterations before the escape stub
+ * longjmps out, so queue three expectations. */
 void test_lora_rx_task_loop_delays_at_the_registered_period(void)
 {
     osDelay_Stub(osDelay_escape_cb);
+    watchdog_alive_self_Expect();
+    watchdog_alive_self_Expect();
+    watchdog_alive_self_Expect();
     run_task_iterations(lora_rx_task);
 }
 
