@@ -249,6 +249,7 @@ void lora_rx_task(void *arg)
          *       logged/telemetered, not discarded. */
         (void)rx;
         (void)rx_len;
+        watchdog_alive_self();  /* keep the monitor happy while RX task is parked */
         osDelay(pdMS_TO_TICKS(100));
     }
 }
