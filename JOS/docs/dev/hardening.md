@@ -179,3 +179,5 @@ is deliberately not monitored.
 - STM32L496xx Reference Manual — dual-bank flash (DUALBANK), SRAM2 parity.
 
 <!-- webhook probe: ignore -->
+
+<!-- webhook probe 2 -->
