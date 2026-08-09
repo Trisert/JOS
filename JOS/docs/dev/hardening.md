@@ -3,7 +3,7 @@
 Goal: bring the RedPill (JOS) on-board software to a hardened, space-ready /
 QM-ready state for ESA Fly Your Satellite! 4. Target: STM32L496VGTx
 (Cortex-M4 @ 80 MHz, 1 MB dual-bank flash, 320 KB SRAM — 256 KB SRAM1 +
-| 64 KB SRAM2 with parity, 4× FM24VN10-G FRAM on I²C2 = 64 KB total (4 × 16 KB)).
+64 KB SRAM2 with parity, 4× FM24VN10-G FRAM on I²C2 = 64 KB total (4 × 16 KB)).
 
 Every recommendation below cites the standard that motivates it:
 
@@ -39,7 +39,7 @@ Every recommendation below cites the standard that motivates it:
 | 2.1 | **MPU**: configure regions to isolate kernel / task stacks / FRAM driver from app data; block execute on SRAM | [NASA-PoT] #4 (no pointer arithmetic on cast), [JPL-182] | Med | Med |
 | 2.2 | **HardFault / MemManage / BusFault handlers** with register dump to LastStates + reboot — **DONE**: handlers in `Core/Src/faults.c` (`fault_log_*`, LastStates dump) wired to the Cortex-M fault vectors | [NASA-STD-8739.8] (fault containment), [ECSS-E-ST-40C] | High | Low |
 | 2.3 | **Stack overflow hook** — **DONE**: `vApplicationStackOverflowHook` (`Core/Src/freertos.c:76-91`) already calls `fault_log_stack_overflow()` and reboots; `configCHECK_FOR_STACK_OVERFLOW=2` already set | [NASA-PoT], FreeRTOS `configCHECK_FOR_STACK_OVERFLOW=2` | High | Low |
-| 2.4 | **Watchdog** — **DONE**: software monitor in `App/obsw/watchdog.c` (500 ms tick, flags silence >3× period); `watchdog_register_task()` is called from **7** task creators (`main.c:253` defaultTask, `comms.c:215/260`, `state_machine.c:398`, `clear.c:159`, `cloud.c:148`, `aocs.c:43`) and `watchdog_alive_self()` runs in every task loop. Hardware IWDG is **also active** (~31 s, `Core/Src/hw_watchdog.c` configures it, `main.c:115` inits, `watchdog.c`/main kick it) | [NASA-STD-8739.8] (watchdog/monitoring), [ECSS-E-ST-40C] | High | Med |
+| 2.4 | **Watchdog** — **DONE**: software monitor in `App/obsw/watchdog.c` (500 ms tick, flags silence >3× period); `watchdog_register_task()` is called from **7** task creators (`main.c:253` defaultTask, `comms.c:215/260`, `state_machine.c:426`, `clear.c:159`, `cloud.c:148`, `aocs.c:43`) and `watchdog_alive_self()` runs in every task loop. Hardware IWDG is **also active** (~31 s, `Core/Src/hw_watchdog.c` configures it, `main.c:115` inits, `watchdog.c`/main kick it) | [NASA-STD-8739.8] (watchdog/monitoring), [ECSS-E-ST-40C] | High | Med |
 | 2.5 | **SRAM2 parity**: the 64 KB SRAM2 block has hardware parity (linker region `RAM2` @ 0x10000000). Place critical structures (state, comms buffers) there; enable parity error NMI | [NASA-STD-8739.8] (data integrity) | Med | Low |
 
 ## 3. Boot & image integrity
@@ -71,7 +71,7 @@ Every recommendation below cites the standard that motivates it:
 1. ~~Fill `vApplicationStackOverflowHook` (2.3)~~ — **DONE** (`freertos.c:76-91`).
 2. Add `-Werror=implicit-function-declaration` to `Makefile` (1.2) — already proven necessary (PR #5); verify it is actually set.
 3. ~~CRC32 check at boot (3.1)~~ — **DONE**: implemented in `App/obsw/boot_crc.c`, verified at boot, build-stamped (see §Implemented status).
-4. ~~Wire `watchdog_register_task`/`watchdog_alive` into every task (2.4)~~ — **DONE** (6 task creators register).
+4. ~~Wire `watchdog_register_task`/`watchdog_alive` into every task (2.4)~~ — **DONE** (7 task creators register).
 5. ~~HardFault handler with LastStates dump (2.2)~~ — **DONE** (`faults.c`).
 
 ## 7. Known stubs to finish (from source review)
