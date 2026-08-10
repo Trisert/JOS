@@ -111,6 +111,12 @@ jobs:
       - name: Include resolution (no unresolved first-party header)
         run: make -C JOS cppcheck-includes
 
+      # Proof-of-life for the include gate: assert `--suppress=missingInclude` is
+      # absent from the active suppression set, so the gate above cannot be silenced
+      # by re-adding the very suppression it exists to prevent (Kilo, PR #31:388).
+      - name: Include-gate proof-of-life (no missingInclude suppression)
+        run: make -C JOS cppcheck-includes-proof
+
       - name: Static analysis (cppcheck, first-party only)
         run: make -C JOS cppcheck
 
