@@ -265,7 +265,15 @@ typedef struct {
        view: the magic pair is validated once through the current (v2) view at
        the same .noinit address, and these entries exist so every field after
        them lands at the offset the deployed image wrote. cppcheck cannot see
-       that through the union, hence the narrow, per-member suppression. */
+       that through the union, hence the narrow, per-member suppression.
+
+       Policy: like the two in JOS/App/memory/memory.c, these are per-line,
+       name one id and carry their justification here. Because the gate runs
+       `--suppress=unmatchedSuppression` (see memory.c for why), they cannot go
+       stale loudly: on every CPPCHECK_VERSION bump in JOS/Makefile the
+       reviewer must delete the four `cppcheck-suppress unusedStructMember`
+       lines in this file, re-run `make -C JOS cppcheck`, and restore them only
+       if the findings come back. */
     /* cppcheck-suppress unusedStructMember */
     uint32_t magic;
     /* cppcheck-suppress unusedStructMember */

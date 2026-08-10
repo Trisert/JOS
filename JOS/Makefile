@@ -214,7 +214,6 @@ CPPCHECK_EXCLUDE := \
 
 CPPCHECK_SUPPRESS := \
   --suppress=missingIncludeSystem \
-  --suppress=missingInclude \
   --suppress=unusedFunction \
   --suppress=checkersReport \
   --suppress=unmatchedSuppression \
@@ -227,9 +226,11 @@ CPPCHECK_SUPPRESS := \
 
 # Notes on the suppressions above (deliberately narrow -- no real check id is
 # switched off repo-wide):
-#   missingIncludeSystem / missingInclude / unusedFunction / checkersReport /
+#   missingIncludeSystem / unusedFunction / checkersReport /
 #   unmatchedSuppression / toomanyconfigs / normalCheckLevelMaxBranches
-#     -- cppcheck bookkeeping messages, not defects.
+#     -- cppcheck bookkeeping messages, not defects. missingIncludeSystem is
+#        the `<stdio.h>`-shaped one: those headers belong to the toolchain, are
+#        deliberately not in the repo, and are not passed with -I.
 #   *:JOS/Drivers/* , *:JOS/Middlewares/* , *:JOS/Core/Inc/RadioLib/*
 #     -- PATH-SCOPED. Vendored code we do not own (HAL, CMSIS, FreeRTOS,
 #        RadioLib). Only used as include paths; never analysed.
@@ -240,6 +241,16 @@ CPPCHECK_SUPPRESS := \
 #        conflict with the HAL prototype and the file is CubeMX-generated, so
 #        an inline suppression outside a USER CODE block would be regenerated
 #        away. Every other check still runs on this file.
+#
+# DELIBERATELY ABSENT: `--suppress=missingInclude`. It was here briefly and was
+# wrong: the vendored trees that produce almost all missing-include noise are
+# already blanket-suppressed by path above, and toolchain headers are covered
+# by missingIncludeSystem, so the only thing a repo-wide missingInclude
+# suppression could still hide was a FIRST-PARTY header that does not resolve
+# -- precisely the case where the message is a real finding -- and neither the
+# `build` job nor the canary could see it happen. The condition is now asserted
+# instead of suppressed: see the `cppcheck-includes` target below, which CI
+# runs as its own step.
 #
 # NOT suppressed anywhere: variableScope, constParameter, constParameterPointer
 # (outside the one generated file above), arrayIndexOutOfBounds, nullPointer,
@@ -270,11 +281,26 @@ CPPCHECK_DEFS := $(sort $(C_DEFS) $(CXX_DEFS))
 # severity is always on and is never listed: that is where the canary ids
 # (arrayIndexOutOfBounds, nullPointer) and the rest of the real-defect checks
 # live, so narrowing here cannot weaken the gate.
+
+# Output template, pinned rather than left to cppcheck's default.
+#
+# `cppcheck-canary` proves the gate is alive by asserting that the two planted
+# ids come back in their bracketed `[{id}]` form. cppcheck's DEFAULT template
+# happens to print `[{id}]`, but it also appends `{code}` -- an echo of the
+# offending source line -- and both halves of that are a default, i.e. a thing
+# a version bump may change. Pinning removes the assumption: `[{id}]` is
+# guaranteed to be there, and the source-line echo is guaranteed NOT to be, so
+# no text from the analysed file can ever end up in the log and be mistaken for
+# a finding. The same template is used by `cppcheck` and `cppcheck-canary`
+# because they share $(CPPCHECK_FLAGS).
+CPPCHECK_TEMPLATE := '{file}:{line}:{column}: {severity}: {message} [{id}]'
+
 CPPCHECK_FLAGS := \
   --enable=warning,style,performance,portability,information \
   --std=c11 \
   --error-exitcode=1 \
   --inline-suppr \
+  --template=$(CPPCHECK_TEMPLATE) \
   --platform=arm32-wchar_t4 \
   -D__GNUC__=10 \
   $(CPPCHECK_DEFS) \
@@ -285,7 +311,7 @@ CPPCHECK_FLAGS := \
 CPPCHECK_TARGETS := $(addprefix $(CPPCHECK_PREFIX),$(CPPCHECK_SRC))
 CPPCHECK_CANARY_DIR := $(CURDIR)/$(BUILD_DIR)/cppcheck-canary
 
-.PHONY: cppcheck cppcheck-version cppcheck-canary cppcheck-print
+.PHONY: cppcheck cppcheck-version cppcheck-canary cppcheck-includes cppcheck-print
 
 # Fail loudly if the installed cppcheck is not the pinned one.
 #
@@ -320,6 +346,47 @@ cppcheck: cppcheck-version
 	@echo "=== cppcheck: first-party scope ($(CPPCHECK_SRC)) ==="
 	cd $(CPPCHECK_ROOT) && $(CPPCHECK) $(CPPCHECK_FLAGS) $(CPPCHECK_TARGETS)
 
+# Assert that every first-party #include resolves.
+#
+# This is the replacement for the repo-wide `--suppress=missingInclude` that
+# used to sit in $(CPPCHECK_SUPPRESS). A header we own that cppcheck cannot
+# find is not noise: it means the analysis of that translation unit ran against
+# an incomplete view of the code, so anything the gate did NOT report about it
+# is worth nothing. Suppressing the message made that state invisible; this
+# target makes it fail.
+#
+# `--check-config` is cppcheck's dedicated configuration pass -- it resolves
+# includes and reports what it could not find, without running the checks. The
+# real gate's flags (include paths, macro set, exclusions, path-scoped vendored
+# suppressions) are reused verbatim so the two agree on what "first-party"
+# means; `--enable=missingInclude` is added because that id is not part of the
+# gate's `--enable` set, and `missingIncludeSystem` stays suppressed because
+# toolchain headers are intentionally not in the repo.
+cppcheck-includes: cppcheck-version
+	@echo "=== cppcheck: every first-party #include must resolve ==="
+	@mkdir -p $(BUILD_DIR)
+	@log=$(CURDIR)/$(BUILD_DIR)/cppcheck-includes.out; \
+	 set +e; \
+	 ( cd $(CPPCHECK_ROOT) && $(CPPCHECK) --check-config --enable=missingInclude \
+	     $(CPPCHECK_FLAGS) $(CPPCHECK_TARGETS) ) > "$$log" 2>&1; \
+	 rc=$$?; \
+	 cat "$$log"; \
+	 if grep -q '\[missingInclude\]' "$$log"; then \
+	   echo "FAILED: cppcheck cannot resolve a first-party #include (above)."; \
+	   echo "Whatever translation unit it belongs to was analysed against an"; \
+	   echo "incomplete view of the code, so a clean 'make -C JOS cppcheck' does"; \
+	   echo "not mean much for it. Add the missing -I to INCLUDES, or the missing"; \
+	   echo "header -- do NOT re-add a repo-wide --suppress=missingInclude."; \
+	   exit 1; \
+	 fi; \
+	 if [ $$rc -ne 0 ]; then \
+	   echo "FAILED: the cppcheck configuration pass exited $$rc. No missing"; \
+	   echo "include was named, so this is a different problem (bad flag,"; \
+	   echo "unreadable path, internal error). Run 'make -C JOS cppcheck-print'."; \
+	   exit 1; \
+	 fi; \
+	 echo "includes OK: no unresolved first-party header"
+
 # Canary: prove the gate is still able to fail.
 #
 # Generates a throwaway C file with two unmistakable defects (out-of-bounds
@@ -340,9 +407,24 @@ cppcheck: cppcheck-version
 # defects -- a bad flag, an unreadable include path, an internal error -- so a
 # gate that is merely broken-and-noisy would have looked "live". The run is
 # therefore captured and the two planted ids (`arrayIndexOutOfBounds` and
-# `nullPointer`, printed by cppcheck's default `[id]` template) must BOTH
-# appear in the output. Missing either one fails the build even when the exit
-# code is non-zero.
+# `nullPointer`) must BOTH appear in the output. Missing either one fails the
+# build even when the exit code is non-zero.
+#
+# The assertion matches the BRACKETED form -- `[arrayIndexOutOfBounds]`,
+# `[nullPointer]` -- i.e. the `[{id}]` field cppcheck stamps on a report line,
+# never a bare word. This is deliberate and is the difference between asserting
+# on cppcheck's verdict and asserting on text that happens to be nearby:
+#   * $(CPPCHECK_TEMPLATE) is pinned in $(CPPCHECK_FLAGS) and used by BOTH this
+#     target and the real `cppcheck` target, so `[{id}]` is guaranteed present
+#     on every finding and the offending source line is not echoed back into
+#     the log at all;
+#   * the generated canary's marker comments say `/* OOB-write probe */` and
+#     `/* NULL-deref probe */`, never the id strings, so even a template that
+#     did echo the source line could not satisfy the grep;
+#   * a self-guard above refuses to run if the generated source ever regains a
+#     bracketed id.
+# Without all three, a cppcheck bump that renamed or dropped a check while the
+# buggy lines stayed put would have kept "passing" off the canary's own text.
 cppcheck-canary: cppcheck-version
 	@rm -rf $(CPPCHECK_CANARY_DIR)
 	@mkdir -p $(CPPCHECK_CANARY_DIR)
@@ -356,16 +438,26 @@ cppcheck-canary: cppcheck-version
 	  'int cppcheck_canary_oob(void)' \
 	  '{' \
 	  '    int buf[4] = {0, 0, 0, 0};' \
-	  '    buf[7] = 1;            /* arrayIndexOutOfBounds */' \
+	  '    buf[7] = 1;            /* OOB-write probe */' \
 	  '    return buf[0];' \
 	  '}' \
 	  'int cppcheck_canary_null(void)' \
 	  '{' \
 	  '    int *p = NULL;' \
-	  '    *p = 42;               /* nullPointer */' \
+	  '    *p = 42;               /* NULL-deref probe */' \
 	  '    return *p;' \
 	  '}' \
 	  > $(CPPCHECK_CANARY_DIR)/canary.c
+	@# Self-guard: the generated source must not contain the bracketed ids the
+	@# assertion below greps for, or an edit to the generator could satisfy the
+	@# assertion with its own text instead of with cppcheck's verdict.
+	@if grep -qE '\[(arrayIndexOutOfBounds|nullPointer)\]' $(CPPCHECK_CANARY_DIR)/canary.c; then \
+	  echo "CANARY BROKEN: the generated canary source itself contains a bracketed"; \
+	  echo "check id, so the assertion below could match the file instead of"; \
+	  echo "cppcheck's report. Rename the marker comments in JOS/Makefile."; \
+	  rm -rf $(CPPCHECK_CANARY_DIR); \
+	  exit 1; \
+	fi
 	@echo "=== cppcheck canary: the gate must REJECT this file ==="
 	@log=$(CPPCHECK_CANARY_DIR)/canary.out; \
 	 set +e; \
@@ -374,8 +466,8 @@ cppcheck-canary: cppcheck-version
 	 rc=$$?; \
 	 cat "$$log"; \
 	 missing=""; \
-	 grep -q 'arrayIndexOutOfBounds' "$$log" || missing="$$missing arrayIndexOutOfBounds"; \
-	 grep -q 'nullPointer' "$$log" || missing="$$missing nullPointer"; \
+	 grep -q '\[arrayIndexOutOfBounds\]' "$$log" || missing="$$missing arrayIndexOutOfBounds"; \
+	 grep -q '\[nullPointer\]' "$$log" || missing="$$missing nullPointer"; \
 	 rm -rf $(CPPCHECK_CANARY_DIR); \
 	 if [ $$rc -eq 0 ]; then \
 	   echo "CANARY FAILED: cppcheck exited 0 on a file with an out-of-bounds"; \

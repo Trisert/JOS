@@ -85,9 +85,12 @@ jobs:
       # green result on the real tree. It generates a throwaway C file with an
       # out-of-bounds array write and a NULL dereference, runs cppcheck over it
       # with the EXACT same flags as the real gate, deletes the file, and fails
-      # unless cppcheck both exits non-zero AND names `arrayIndexOutOfBounds`
-      # and `nullPointer` in its output -- exit status alone would also be
-      # satisfied by an analyser that is merely broken and noisy.
+      # unless cppcheck both exits non-zero AND names `[arrayIndexOutOfBounds]`
+      # and `[nullPointer]` -- matched in the bracketed `[{id}]` form cppcheck
+      # stamps on a report line, under a pinned --template, so the assertion
+      # cannot be satisfied by an echo of the canary's own source text. Exit
+      # status alone would also be satisfied by an analyser that is merely
+      # broken and noisy.
       #
       # This is not theoretical: the first version of this gate suppressed
       # `preprocessorErrorDirective` and never defined `__GNUC__`, so
@@ -98,6 +101,15 @@ jobs:
       # mode -- it is verified to go red under the old flags.
       - name: Canary (assert the cppcheck gate can fail)
         run: make -C JOS cppcheck-canary
+
+      # Include resolution, asserted rather than suppressed. `missingInclude`
+      # is not suppressed anywhere in JOS/Makefile: a first-party header that
+      # cppcheck cannot find means that translation unit was analysed against
+      # an incomplete view of the code, so a clean gate result for it is
+      # meaningless. This step makes that state fail loudly instead of hiding
+      # behind a repo-wide suppression.
+      - name: Include resolution (no unresolved first-party header)
+        run: make -C JOS cppcheck-includes
 
       - name: Static analysis (cppcheck, first-party only)
         run: make -C JOS cppcheck

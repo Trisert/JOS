@@ -485,22 +485,31 @@ static int flash_wait_bsy_bounded(uint32_t budget)
            (unsignedLessThanZero). Both are artefacts of that folding, not
            defects — on the target CYCCNT increments every CPU cycle. Narrow,
            per-line suppressions; no check id is disabled anywhere else. */
-        /* Scope and staleness: these are the only two inline suppressions in
-           this file, they are attached to the single line below (not the
-           function, not the file), and each names one id. They are the
-           allowlisted exception to the rule that first-party code carries no
-           suppressions -- adding another one is a review decision, not a
-           routine fix.
+        /* Scope: these are the only two inline suppressions in this file, they
+           are attached to the single line below (not the function, not the
+           file), and each names exactly one id. The repo policy they sit under
+           is not "first-party code carries no suppressions" -- it is that a
+           suppression must be per-line, must name one id, must carry a written
+           justification, and must stay rare. JOS/Core/Src/sram2_parity.c is
+           the only other first-party file that holds any (four, each justified
+           at its own site); adding one anywhere else is a review decision, not
+           a routine fix.
 
-           They cannot be retired automatically: the gate runs
-           `--suppress=unmatchedSuppression`, deliberately, because the
-           multi-configuration analysis reports a suppression as unmatched in
-           every configuration where the guarded line is preprocessed out,
-           which would make the build fail for reasons unrelated to the code.
-           The cost is that a suppression that has become unnecessary goes
-           quiet instead of loud, so on a cppcheck bump (CPPCHECK_VERSION in
-           JOS/Makefile) delete these two lines, re-run `make -C JOS cppcheck`,
-           and keep them only if the findings come back. */
+           Staleness: these cannot be retired automatically. The gate runs
+           `--suppress=unmatchedSuppression`, and that is intentional, not an
+           oversight -- the multi-configuration analysis reports a suppression
+           as unmatched in every configuration where the guarded line is
+           preprocessed out, so without it the build would fail for reasons
+           that have nothing to do with the code. The accepted cost is that a
+           suppression which has become unnecessary goes quiet instead of loud,
+           which makes detecting staleness a MANUAL, bump-time duty:
+
+             on every CPPCHECK_VERSION bump in JOS/Makefile the reviewer must
+             delete the two `cppcheck-suppress` lines below, re-run
+             `make -C JOS cppcheck`, and restore them only if those two
+             findings actually come back. The same re-verification applies to
+             the four suppressions in sram2_parity.c. A bump that skips this
+             has not been reviewed. */
         /* cppcheck-suppress knownConditionTrueFalse */
         /* cppcheck-suppress unsignedLessThanZero */
         if ((have_cyccnt != 0) && ((DWT->CYCCNT - start) >= budget)) {
