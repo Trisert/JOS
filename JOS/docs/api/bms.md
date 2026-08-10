@@ -13,5 +13,10 @@ SPI (OBC = master, EPS = slave).
 The OBC uses these thresholds to drive state transitions (see
 `docs/arch/README.md` §Battery thresholds).
 
-> Status: integrated. The EPS SPI slave interface is stubbed in `bms.c`
-> (`TODO: init subsystem SPI master to EPS STM32L496`).
+> Status: integrated. `bms_init()` brings up the subsystem SPI master to the
+> EPS STM32L496 (SPI2, PB13/14/15, mode 0, 8-bit MSB-first, 2.5 MHz from the
+> 80 MHz PCLK1) and `bms_spi_ready()` reports the link state. The telemetry
+> transaction itself is still stubbed in `bms.c`
+> (`TODO: query EPS MCU over subsystem SPI for BQ76905 telemetry`), and the
+> EPS chip-select pin is not assigned in the tree yet — define
+> `BMS_EPS_CS_PORT` / `BMS_EPS_CS_PIN` once the SATPF pinout fixes it.

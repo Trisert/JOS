@@ -79,7 +79,9 @@ Every recommendation below cites the standard that motivates it:
 The gap analysis found the following are **stubbed** in the current tree and
 must be implemented before "space-ready" claims:
 
-- `App/bms/` — EPS SPI slave interface (`TODO: init subsystem SPI master`)
+- `App/bms/` — subsystem SPI master to the EPS is initialised, but the
+  telemetry transaction is still a stub (`TODO: query EPS MCU over subsystem
+  SPI for BQ76905 telemetry`) and the EPS chip-select pin is unassigned
 - `App/aocs/` — control law largely placeholder
 - Comms encryption key handling marked TBD
 
