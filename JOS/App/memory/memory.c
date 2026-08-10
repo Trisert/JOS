@@ -495,21 +495,24 @@ static int flash_wait_bsy_bounded(uint32_t budget)
            at its own site); adding one anywhere else is a review decision, not
            a routine fix.
 
-           Staleness: these cannot be retired automatically. The gate runs
-           `--suppress=unmatchedSuppression`, and that is intentional, not an
-           oversight -- the multi-configuration analysis reports a suppression
-           as unmatched in every configuration where the guarded line is
-           preprocessed out, so without it the build would fail for reasons
-           that have nothing to do with the code. The accepted cost is that a
-           suppression which has become unnecessary goes quiet instead of loud,
-           which makes detecting staleness a MANUAL, bump-time duty:
+           Staleness: these cannot be retired automatically. The gate passes
+           `--suppress=unmatchedSuppression` on the cppcheck command line
+           (JOS/Makefile, pinned to cppcheck 2.13.0) -- that is a BUILD-LEVEL
+           bookkeeping flag, NOT a per-line directive in this file. It is
+           intentional, not an oversight: the multi-configuration analysis
+           reports a suppression as unmatched in every configuration where the
+           guarded line is preprocessed out, so without it the build would fail
+           for reasons that have nothing to do with the code. The accepted cost
+           is that a suppression which has become unnecessary goes quiet instead
+           of loud, which makes detecting staleness a MANUAL, bump-time duty:
 
              on every CPPCHECK_VERSION bump in JOS/Makefile the reviewer must
              delete the two `cppcheck-suppress` lines below, re-run
              `make -C JOS cppcheck`, and restore them only if those two
              findings actually come back. The same re-verification applies to
              the four suppressions in sram2_parity.c. A bump that skips this
-             has not been reviewed. */
+             has not been reviewed. Runtime re-verification requires the pinned
+             cppcheck 2.13.0 (installed by CI; presence is not assumed locally). */
         /* cppcheck-suppress knownConditionTrueFalse */
         /* cppcheck-suppress unsignedLessThanZero */
         if ((have_cyccnt != 0) && ((DWT->CYCCNT - start) >= budget)) {
