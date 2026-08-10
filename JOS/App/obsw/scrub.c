@@ -136,7 +136,7 @@ scrub_status_t scrub_register(void *ram, size_t len, uint8_t region_id)
 
 scrub_status_t scrub_sync(uint8_t region_id)
 {
-    scrub_region_t   *r;
+    const scrub_region_t *r;
     scrub_record_t    rec;
     uint32_t          slot;
 
@@ -165,7 +165,7 @@ scrub_status_t scrub_sync(uint8_t region_id)
 
 scrub_status_t scrub_refresh(uint8_t region_id)
 {
-    scrub_region_t   *r;
+    const scrub_region_t *r;
     scrub_record_t    rec;
     uint32_t          slot;
     uint32_t          live_crc;
