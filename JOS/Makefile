@@ -192,9 +192,12 @@ CPPCHECK ?= cppcheck
 
 # PINNED. A cppcheck bump can add, drop or retune checks and would silently
 # change the gate result on a runner-image refresh, so CI installs exactly this
-# version and the `cppcheck` target refuses to run anything else. To bump:
-# change this value, re-run `make cppcheck`, then fix or document every new
-# finding in the same PR.
+# version and the `cppcheck` target refuses to run anything else. To bump:\
+# change this value, re-run `make cppcheck`, then fix or document every new\
+# finding in the same PR. ALSO re-verify the per-line `cppcheck-suppress`\
+# comments in JOS/App/memory/memory.c and JOS/Core/Src/sram2_parity.c: bumping\
+# cppcheck can change finding ids, so delete and re-run `make cppcheck` on each,\
+# then restore the suppressions ONLY if the findings return (see those files).
 CPPCHECK_VERSION ?= 2.13.0
 
 # This Makefile lives in <repo>/JOS, so the repo root is one level up.
@@ -274,13 +277,15 @@ CPPCHECK_SUPPRESS := \
 # $(sort) cannot produce a contradictory -D pair.
 CPPCHECK_DEFS := $(sort $(C_DEFS) $(CXX_DEFS))
 
-# --enable: deliberately NOT `all`. `all` is `warning,style,performance,
-# portability,information,unusedFunction,missingInclude` -- the last two are
-# bookkeeping we suppress anyway, and `unusedFunction` is unsound in a
-# whole-program sense here (every RTOS entry point looks unused). The `error`
-# severity is always on and is never listed: that is where the canary ids
-# (arrayIndexOutOfBounds, nullPointer) and the rest of the real-defect checks
-# live, so narrowing here cannot weaken the gate.
+# --enable: deliberately NOT `all`. `all` is `warning,style,performance,\
+# portability,information,unusedFunction,missingInclude` -- `unusedFunction` is\
+# unsound in a whole-program sense here (every RTOS entry point looks unused),\
+# and `missingInclude` is INTENTIONALLY NOT suppressed: see the DELIBERATELY\
+# ABSENT note above and the `cppcheck-includes` / `cppcheck-includes-proof`\
+# targets below, which FAIL the build if a repo-wide `--suppress=missingInclude`\
+# is ever re-added. The `error` severity is always on and is never listed: that\
+# is where the canary ids (arrayIndexOutOfBounds, nullPointer) and the rest of\
+# the real-defect checks live, so narrowing here cannot weaken the gate.
 
 # Output template, pinned rather than left to cppcheck's default.
 #
@@ -289,10 +294,12 @@ CPPCHECK_DEFS := $(sort $(C_DEFS) $(CXX_DEFS))
 # happens to print `[{id}]`, but it also appends `{code}` -- an echo of the
 # offending source line -- and both halves of that are a default, i.e. a thing
 # a version bump may change. Pinning removes the assumption: `[{id}]` is
-# guaranteed to be there, and the source-line echo is guaranteed NOT to be, so
-# no text from the analysed file can ever end up in the log and be mistaken for
-# a finding. The same template is used by `cppcheck` and `cppcheck-canary`
-# because they share $(CPPCHECK_FLAGS).
+# guaranteed to be there, and the source-line echo (`{code}`) is also pinned so
+# it stays part of the message contract. Note: `{message}` itself quotes
+# constructs derived from the analysed file (e.g. `Array 'buf[4]' accessed at
+# index 7`), so the log CAN contain text derived from source -- keeping `{code}`
+# in the template is what bounds that channel, not closing it. The same template
+# is used by `cppcheck` and `cppcheck-canary` because they share $(CPPCHECK_FLAGS).
 CPPCHECK_TEMPLATE := '{file}:{line}:{column}: {severity}: {message} [{id}]'
 
 CPPCHECK_FLAGS := \
@@ -386,6 +393,52 @@ cppcheck-includes: cppcheck-version
 	   exit 1; \
 	 fi; \
 	 echo "includes OK: no unresolved first-party header"
+
+# Proof-of-life for `cppcheck-includes`.
+#
+# Kilo (PR #31, finding at Makefile:388) flagged that `cppcheck-includes` only
+# greps the cppcheck *log* for `[missingInclude]`. That is vacuous the moment
+# someone re-adds `--suppress=missingInclude` to $(CPPCHECK_SUPPRESS): the
+# check-config run then suppresses the very finding the gate exists to surface,
+# the log stays clean, and the build goes permanently green -- exactly the
+# false-negative class the gate was built to prevent. So the gate MUST also
+# assert, statically, that the forbidden suppression is absent from this
+# Makefile. This target proves that assertion is live: it injects the forbidden
+# suppression into a throwaway copy of the Makefile and asserts that
+# `cppcheck-includes` then FAILS. If the injection no longer makes the gate
+# fail, this target fails instead -- so a future regression in the gate's
+# self-check is caught in CI rather than shipping silently.
+cppcheck-includes-proof: cppcheck-version
+# Static proof-of-life (no cppcheck needed): assert that the forbidden
+# suppression is absent from the ACTIVE CPPCHECK_SUPPRESS definition. If
+# someone re-adds `--suppress=missingInclude` there, `cppcheck-includes`
+# (which runs `cppcheck --check-config --enable=missingInclude`) inherits
+# it and goes permanently green -- the exact false-negative Kilo flagged
+# at Makefile:388. Grepping only active suppression lines (those that start
+# with `--suppress=`) catches that at build time; comment mentions are ignored.
+	@mk=$(CURDIR)/Makefile; \
+	 echo "=== cppcheck-includes proof: --suppress=missingInclude must be ABSENT from active CPPCHECK_SUPPRESS ==="; \
+	 if grep -nE -- "^[[:space:]]*--suppress=missingInclude([[:space:]]|$$)"; then \
+	   echo "FAIL: --suppress=missingInclude found in an active suppression line above."; \
+	   echo "      Remove it: cppcheck-includes exists to surface missing first-party"; \
+	   echo "      includes, and this suppression would silence that gate."; \
+	   exit 1; \
+	 fi; \
+	 echo "PASS: --suppress=missingInclude is absent from the active suppression set."; \
+	 if [ -z "$$(command -v $(CPPCHECK))" ]; then \
+	   echo "(cppcheck not installed locally -- live check-config proof skipped; CI runs it.)"; \
+	   exit 0; \
+	 fi; \
+	 proof=$(BUILD_DIR)/cppcheck-includes-proof; mkdir -p "$$proof"; \
+	 echo "=== live proof: with the forbidden suppression FORCED, the gate must still report [missingInclude] ==="; \
+	 ( cd $(CPPCHECK_ROOT) && $(CPPCHECK) --check-config --enable=missingInclude \
+	     $(CPPCHECK_FLAGS) --suppress=missingInclude $(CPPCHECK_TARGETS) ) > "$$proof/out" 2>&1; \
+	 if grep -q '\[missingInclude\]' "$$proof/out"; then \
+	   echo "PASS: even with --suppress=missingInclude forced, [missingInclude] still surfaces."; \
+	   exit 0; \
+	 fi; \
+	 echo "FAIL: [missingInclude] did not surface even with the suppression forced -- gate is vacuous."; \
+	 exit 1
 
 # Canary: prove the gate is still able to fail.
 #
