@@ -415,12 +415,14 @@ cppcheck-includes-proof:
 # flagged that `cppcheck-includes` runs `cppcheck --check-config --enable=missingInclude`
 # while inheriting $(CPPCHECK_SUPPRESS); if that set ever re-includes
 # `--suppress=missingInclude`, the very finding the gate exists to surface is silenced
-# and the gate goes permanently green -- a false negative. Grepping only the active
-# suppression lines (those that begin with `--suppress=`) catches that at build time;
-# comment mentions of missingInclude are ignored. Invoked by .github/workflows/build.yml.
+# and the gate goes permanently green -- a false negative. The recipe below greps ONLY the
+# active suppression lines (those that begin with `--suppress=`) of this Makefile; comment
+# mentions of missingInclude are ignored. Invoked by .github/workflows/build.yml so CI
+# catches a re-add of the suppression. NOTE: grep is given $$mk as its file operand -- a
+# vacuous grep reading stdin would print PASS on zero evidence (the exact bug this guards).
 	@mk=$(CURDIR)/Makefile; \
 	 echo "=== cppcheck-includes proof: --suppress=missingInclude must be ABSENT from active CPPCHECK_SUPPRESS ==="; \
-	 if grep -nE -- "^[[:space:]]*--suppress=missingInclude([[:space:]]|$$)"; then \
+	 if grep -nE -- "^[[:space:]]*--suppress=missingInclude([[:space:]]|$$)" "$$mk"; then \
 	   echo "FAIL: --suppress=missingInclude found in an active suppression line above."; \
 	   echo "      Remove it: cppcheck-includes exists to surface missing first-party"; \
 	   echo "      includes, and this suppression would silence that gate."; \
