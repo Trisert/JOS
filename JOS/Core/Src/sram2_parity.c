@@ -261,7 +261,22 @@ typedef struct {
    whatever follows in .noinit and must not be believed unless chk validates
    them (see sram2_store_v1_checksum()). */
 typedef struct {
+    /* The two magic words are LAYOUT, not fields anyone reads through this
+       view: the magic pair is validated once through the current (v2) view at
+       the same .noinit address, and these entries exist so every field after
+       them lands at the offset the deployed image wrote. cppcheck cannot see
+       that through the union, hence the narrow, per-member suppression.
+
+       Policy: like the two in JOS/App/memory/memory.c, these are per-line,
+       name one id and carry their justification here. Because the gate runs
+       `--suppress=unmatchedSuppression` (see memory.c for why), they cannot go
+       stale loudly: on every CPPCHECK_VERSION bump in JOS/Makefile the
+       reviewer must delete the four `cppcheck-suppress unusedStructMember`
+       lines in this file, re-run `make -C JOS cppcheck`, and restore them only
+       if the findings come back. */
+    /* cppcheck-suppress unusedStructMember */
     uint32_t magic;
+    /* cppcheck-suppress unusedStructMember */
     uint32_t magic_inv;
     uint32_t boot_fault;
     uint32_t last_event;
@@ -278,7 +293,10 @@ typedef struct {
    migration path that actually gets exercised by this PR - which is exactly
    why its absence from the catalogue silently zeroed erase_busy_resets. */
 typedef struct {
+    /* Layout placeholders, as in sram2_fault_store_v1_t above. */
+    /* cppcheck-suppress unusedStructMember */
     uint32_t magic;
+    /* cppcheck-suppress unusedStructMember */
     uint32_t magic_inv;
     uint32_t boot_fault;
     uint32_t last_event;
@@ -828,12 +846,17 @@ static int sram2_erase_settle_wait(void)
    Only legal when the erase engine is idle - see SRAM2_ERASE_BUSY above. */
 static void sram2_sw_fill(void)
 {
-    volatile uint32_t *p   = (volatile uint32_t *)&_sram2_region_start;
-    volatile uint32_t *end = (volatile uint32_t *)&_sram2_region_end;
+    /* Walked as an address, not as a pointer pair: `_sram2_region_start` and
+       `_sram2_region_end` are two DISTINCT linker symbols, so an ordered
+       compare between pointers derived from them is undefined behaviour in
+       ISO C (cppcheck `comparePointers`) even though the layout guarantees
+       they bracket the region. uintptr_t arithmetic is well defined here. */
+    uintptr_t       addr = (uintptr_t)&_sram2_region_start;
+    const uintptr_t end  = (uintptr_t)&_sram2_region_end;
 
-    while (p < end) {
-        *p = 0U;
-        p++;
+    while (addr < end) {
+        *(volatile uint32_t *)addr = 0U;
+        addr += sizeof(uint32_t);
     }
     __DSB();
 }
@@ -842,9 +865,11 @@ static void sram2_copy_init_image(void)
 {
     const uint32_t *src = (const uint32_t *)&_sisram2;
     uint32_t *dst       = (uint32_t *)&_ssram2;
-    const uint32_t *end = (const uint32_t *)&_esram2;
+    /* Same reason as sram2_sw_fill(): `_ssram2` and `_esram2` are distinct
+       linker symbols, so the loop bound is compared as an address. */
+    const uintptr_t end = (uintptr_t)&_esram2;
 
-    while (dst < end) {
+    while ((uintptr_t)dst < end) {
         *dst++ = *src++;
     }
     __DSB();
@@ -1094,9 +1119,25 @@ void sram2_parity_init(void)
                pending queue (Kilo #26, comment id 3741110980). */
             sram2_store_note_erase_busy(rec.scsr, rec.cfgr2);
             NVIC_SystemReset();
-            for (;;) {
-                /* NVIC_SystemReset() does not return. */
-            }
+            /* DELIBERATE: no `for (;;)` guard at this one site. It is not an
+               oversight and must not be "restored".
+
+               This call is the last statement of an `if` block, so control
+               flows on to the budget-spent path below when the reset does not
+               happen -- a `for (;;)` here would not be a safety net, it would
+               be dead code: __NVIC_SystemReset() is declared __NO_RETURN by
+               CMSIS, so cppcheck flags anything after it as `unreachableCode`
+               and the gate goes red. The graceful degradation this site wants
+               is exactly the fall-through: STATE_CRIT, not a hang.
+
+               The reset sites that DO keep a `for (;;)` guard by design --
+               faults.c fault_reset_now(), dual_bank.c
+               dual_bank_handle_boot_fault() and sram2_parity_nmi_handler()
+               below -- are all the *final* statement of a function that must
+               never return to its caller if the reset silently fails: the
+               loop is reachable in cppcheck's model only because it is the
+               function's fall-off point, and there is no degraded path left
+               to fall through to. This site has one, so it uses it. */
         }
 
         /* Budget spent: continue into STATE_CRIT instead of looping forever.
@@ -1285,7 +1326,11 @@ int sram2_restore_from_image(void *obj, size_t len)
     const uint8_t *ram_start = (const uint8_t *)&_ssram2;
     const uint8_t *ram_end   = (const uint8_t *)&_esram2;
     const uint8_t *img_start = (const uint8_t *)&_sisram2;
-    const uint8_t *dst = (const uint8_t *)obj;
+    /* `dst` is a WRITE target (the memcpy below restores into it), so it is a
+       non-const pointer: casting the const away at the memcpy made cppcheck
+       conclude the parameter could be `const void *` (constParameterPointer),
+       which would have been an outright wrong signature for a restore API. */
+    uint8_t *dst = (uint8_t *)obj;
     uintptr_t dst_end;
 
     if ((obj == NULL) || (len == 0U)) {
@@ -1313,7 +1358,16 @@ int sram2_restore_from_image(void *obj, size_t len)
         return -1;   /* not an object of the initialised .sram2 section */
     }
 
-    memcpy((void *)dst, img_start + (size_t)(dst - ram_start), len);
+    /* Offset of dst within .sram2, computed in uintptr_t rather than as a
+       pointer difference. `dst` and `ram_start` point into distinct declared
+       objects, so `(const uint8_t *)dst - ram_start` is undefined behaviour by
+       C11 6.5.6p9 even though the addresses are adjacent in the same section,
+       and ptrdiff_t is signed where this offset is not. The bounds check above
+       has already established ram_start <= dst < ram_end, so the subtraction
+       cannot underflow. */
+    memcpy(dst,
+           img_start + (size_t)((uintptr_t)dst - (uintptr_t)ram_start),
+           len);
     __DSB();
     return 0;
 }

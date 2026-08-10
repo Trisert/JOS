@@ -93,7 +93,16 @@ boot_crc_status_t boot_crc_verify(void)
     const uint8_t *start = __fw_image_start;
     const uint8_t *end   = __fw_crc_start;
 
-    if (end <= start) {
+    /* Compared and subtracted as integers, never as pointers: `start` and
+       `end` are two DISTINCT linker symbols, so an ordered pointer compare (or
+       a pointer difference) between them is undefined behaviour in ISO C even
+       though the layout guarantees they bracket one region. cppcheck flags it
+       as `comparePointers`; going through uintptr_t is the idiom used
+       everywhere else in this tree (see sram2_restore_from_image()). */
+    const uintptr_t start_addr = (uintptr_t)start;
+    const uintptr_t end_addr   = (uintptr_t)end;
+
+    if (end_addr <= start_addr) {
         /* Linker layout broken: cannot verify anything. Treated as a fault,
            not as "nothing to check". */
         crc_status     = BOOT_CRC_BAD_REGION;
@@ -101,7 +110,7 @@ boot_crc_status_t boot_crc_verify(void)
         return crc_status;
     }
 
-    crc_region_len = (uint32_t)(end - start);
+    crc_region_len = (uint32_t)(end_addr - start_addr);
     crc_computed   = boot_crc32(start, (size_t)crc_region_len);
     crc_expected   = fw_crc_stored;
 

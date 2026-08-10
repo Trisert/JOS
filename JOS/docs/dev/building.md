@@ -37,14 +37,32 @@ The gate has **one** definition, the `cppcheck` target in `JOS/Makefile`. CI
 calls exactly the same target, so the workflow and a local run cannot drift:
 
 ```bash
-make -C JOS cppcheck          # the gate itself   -> exit 1 on any finding
-make -C JOS cppcheck-canary   # self-test: the gate must reject a buggy file
-make -C JOS cppcheck-print    # print the fully expanded cppcheck command line
+make -C JOS cppcheck            # the gate itself -> exit 1 on any finding
+make -C JOS cppcheck-canary     # self-test: the gate must reject a buggy file
+make -C JOS cppcheck-includes   # assert every first-party #include resolves
+make -C JOS cppcheck-print      # print the fully expanded cppcheck command line
 ```
 
 The include paths and defines are derived from the `$(INCLUDES)` and
-`$(C_DEFS)` variables the compiler already uses, so adding a header directory
-to the build automatically adds it to the analysis.
+`$(CPPCHECK_DEFS)` variables the compiler already uses — `CPPCHECK_DEFS` is the
+deduplicated union of `$(C_DEFS)` and `$(CXX_DEFS)`, so a C++ translation unit
+is never analysed under the C macro set — and adding a header directory to the
+build automatically adds it to the analysis.
+
+`--enable` is `warning,style,performance,portability,information`, deliberately
+not `all`. Of the two ids `all` adds on top, `unusedFunction` is suppressed
+(unsound whole-program here — every RTOS entry point looks unused) and
+`missingInclude` is *not* suppressed: it is asserted separately by
+`make -C JOS cppcheck-includes`, see below. The `error` severity —
+`arrayIndexOutOfBounds`, `nullPointer`, `uninitvar`, … — is always on and is
+not part of `--enable`, so this cannot weaken the gate.
+
+`--template` is pinned to `{file}:{line}:{column}: {severity}: {message} [{id}]`
+rather than left at cppcheck's default. The canary asserts on the bracketed
+`[{id}]` field, and the default template also echoes the offending source line
+back — pinning guarantees the id field is present and guarantees no text from
+the analysed file lands in the log, so the canary can only ever match
+cppcheck's verdict.
 
 ### Pinned version
 
@@ -53,15 +71,22 @@ the version shipped by the pinned `ubuntu-24.04` CI runner). `make cppcheck`
 refuses to run against any other version, because the finding set is
 version-dependent — for example `constParameter` was split into
 `constParameterPointer` in cppcheck 2.11+. To upgrade: bump both
-`CPPCHECK_VERSION` here and the `apt-get install cppcheck=<ver>` line in
-`.github/workflows/build.yml`, re-run the gate, and triage the new findings in
-the same PR.
+`CPPCHECK_VERSION` here and `PINNED_DEB`/`PINNED_VERSION` in the *Install
+pinned cppcheck* step of `.github/workflows/build.yml`, re-run the gate, and
+triage the new findings in the same PR.
+
+That CI step is a three-step fallback chain — exact Ubuntu revision, then any
+revision of the same upstream version, then a source build of the upstream tag
+— so one archive change cannot hard-block every PR, and it asserts the
+resulting `cppcheck --version` afterwards so a fallback can never smuggle in a
+different analyser.
 
 Install it locally with `sudo apt-get install cppcheck=2.13.0-2ubuntu3` on
 Ubuntu 24.04, or override the pin for a one-off experiment:
 
 ```bash
-make -C JOS cppcheck CPPCHECK_VERSION=$(cppcheck --version | awk '{print $2}')
+make -C JOS cppcheck \
+  CPPCHECK_VERSION=$(cppcheck --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -n 1)
 ```
 
 ### Scope
@@ -97,14 +122,40 @@ Every other check still runs on that file.
 | `-I…/FreeRTOS/Source/portable/GCC/ARM_CM4F` | same path the `Makefile` passes to GCC; without it `portmacro.h` is unresolvable. |
 | `--platform=arm32-wchar_t4` | the target is 32-bit ARM ILP32; the default native (x86-64 LP64) model gives wrong `sizeof()`/overflow reasoning. |
 | no `--suppress=preprocessorErrorDirective` | that suppression hides exactly the `#error` abort above and makes the gate vacuous. |
-| no `--suppress=missingInclude` | hides an unresolvable first-party header, i.e. a real config bug. |
+| `--template=…[{id}]` | pinned so the canary's assertion matches cppcheck's own `[{id}]` field and never an echo of the analysed source line. |
+| **no** `--suppress=missingInclude` | it was briefly suppressed repo-wide; that was wrong. The vendored trees are already blanket-suppressed *by path* and toolchain headers are covered by `missingIncludeSystem`, so the only thing left for a repo-wide suppression to hide was an unresolvable **first-party** header — the one case where the message is a real finding. It is now asserted instead: see below. |
+
+### Include resolution
+
+`make -C JOS cppcheck-includes` runs cppcheck's `--check-config` pass with the
+gate's exact flags plus `--enable=missingInclude`, and fails if any
+`[missingInclude]` is reported. A first-party header cppcheck cannot find means
+that translation unit was analysed against an incomplete view of the code, so a
+clean gate result for it means nothing — the failure mode a repo-wide
+`--suppress=missingInclude` would silently reintroduce. `missingIncludeSystem`
+stays suppressed: `<stdio.h>` and friends belong to the toolchain, are
+deliberately not in the repo, and are not passed with `-I`. CI runs this as its
+own step between the canary and the gate.
 
 ### The canary
 
 `make -C JOS cppcheck-canary` generates a throwaway C file containing an
 out-of-bounds array write and a NULL dereference, runs cppcheck over it with
-the **exact same flags** as the real gate, deletes the file, and fails if
-cppcheck came back clean. It `#include`s `main.h` and `FreeRTOS.h` so it walks
+the **exact same flags** as the real gate, deletes the file, and fails unless
+cppcheck both exits non-zero **and** actually names `[arrayIndexOutOfBounds]`
+and `[nullPointer]` in its output. Checking the exit code alone would accept a
+broken-but-noisy analyser — a bad flag or an unreadable include path exits
+non-zero too — so the canary asserts the findings, not the exit status.
+
+The match is on the **bracketed** `[{id}]` form, i.e. on cppcheck's own report
+field, never on a bare word. Three things keep it that way: `--template` is
+pinned (so `[{id}]` is always present and the offending source line is never
+echoed), the generated file's marker comments read `/* OOB-write probe */` and
+`/* NULL-deref probe */` rather than the id strings, and the target refuses to
+run at all if the generated source ever regains a bracketed id. Without those,
+a cppcheck bump that renamed or dropped a check while `buf[7] = 1;` stayed put
+would have kept the canary "passing" off its own comment text.
+It `#include`s `main.h` and `FreeRTOS.h` so it walks
 the same HAL/CMSIS/FreeRTOS include chain as real code — which is what makes it
 reproduce (and therefore catch) the "aborted configuration, exit 0" regression
 class. CI runs it *before* the gate itself, so a green gate is never trusted
@@ -155,7 +206,7 @@ runs two independent jobs:
 
 | Job | Runner | What it does |
 |-----|--------|--------------|
-| `static-analysis` | `ubuntu-24.04` (pinned) | installs the pinned cppcheck, runs `make -C JOS cppcheck-canary` then `make -C JOS cppcheck` |
+| `static-analysis` | `ubuntu-24.04` (pinned) | installs the pinned cppcheck, then runs `make -C JOS cppcheck-canary`, `make -C JOS cppcheck-includes` and `make -C JOS cppcheck` in that order |
 | `build` | `ubuntu-latest` | installs `gcc-arm-none-eabi` + `libnewlib-arm-none-eabi` and runs `make all` in `JOS/`; uploads `JOS.elf/.bin/.hex` |
 
 Together these are the authoritative gate.
