@@ -34,7 +34,7 @@ It replaces the old Hermes kanban board (SQLite), which was archived on
 | 4 | done    | **Watchdog — suspend/delete task on anomaly (`watchdog.c:217`)** | [#36](https://github.com/Trisert/JOS/issues/36) · PR [#42](https://github.com/Trisert/JOS/pull/42) | MERGED. Suspend + LastStates log via `TRIGGER_WATCHDOG`; `stalled` latch; escalation outside `wdg_mutex`. |
 | 5 | done    | **BMS — init subsystem SPI master to EPS STM32L496** | [#37](https://github.com/Trisert/JOS/issues/37) · PR [#43](https://github.com/Trisert/JOS/pull/43) | MERGED. Bound `bms.c` to existing SPI2 master via `extern hspi2` + `bms_spi_init()` (2.5 MHz, mode 0). EPS CS + `bms_get_status()` txn remain stubs. |
 | 6 | done    | **Evaluate PR #17 (SEU mitigation) — closed, unmerged** | [#38](https://github.com/Trisert/JOS/issues/38) | CLOSED: superseded by #14 (sram2 parity NMI) + #16 (SEU scrub). No unique code to recover. |
-| 7 | done    | **PR #31 — `building.md` + clean merge vs main** | [#39](https://github.com/Trisert/JOS/issues/39) | Verified: merge against `main` is clean. |
+| 8 | done    | **scrub.c const-correctness (cppcheck constVariablePointer, 2.17.1)** | — | PR [#44](https://github.com/Trisert/JOS/pull/44) | MERGED. `scrub_sync()` lookup result marked `const`. cppcheck 2.17.1 now reports 0 findings on `main`. |
 
 ## Notes
 
