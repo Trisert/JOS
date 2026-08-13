@@ -5,10 +5,34 @@
  * real RadioLib HAL.
  *
  * Only the symbols comms.c / the test harness actually call are provided.
+ *
+ * Self-contained type handling: Ceedling's embedded-simulation toolchain may
+ * not expose <stdint.h>/<stddef.h> in support/ files, so fall back to local
+ * typedefs when the system headers are unavailable.
  * ------------------------------------------------------------------------- */
 
-#include <stdint.h>
-#include <stddef.h>
+#if defined(__has_include)
+  #if __has_include(<stdint.h>)
+    #include <stdint.h>
+    #define HAVE_STDINT 1
+  #endif
+  #if __has_include(<stddef.h>)
+    #include <stddef.h>
+    #define HAVE_STDDEF 1
+  #endif
+#else
+  #include <stdint.h>
+  #include <stddef.h>
+  #define HAVE_STDINT 1
+  #define HAVE_STDDEF 1
+#endif
+
+#ifndef HAVE_STDINT
+  typedef unsigned char uint8_t;
+#endif
+#ifndef HAVE_STDDEF
+  typedef unsigned long size_t;
+#endif
 
 int  lora_init(void)                          { return 0; }
 int  lora_tx(const uint8_t *data, size_t len) { (void)data; (void)len; return 0; }
