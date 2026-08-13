@@ -25,13 +25,22 @@ STM32Hal radioHal(&hspi1);
 Module   radioModule(&radioHal, RLIB_NSS, RLIB_DIO1, RLIB_RESET, RLIB_BUSY);
 SX1268   radio(&radioModule);
 
-/* Thread flag used to wake the TX path on DIO1 TX_DONE. */
+/* Thread flag used to wake the TX path on DIO1 TX_DONE. The RX task waits on
+ * LORA_FLAG_RX_DONE; comms.c must use the SAME value (it defines LORA_RX_FLAG
+ * for the osThreadFlagsWait call) — keep the two in sync. */
 #define LORA_FLAG_TX_DONE 0x01U
 #define LORA_FLAG_RX_DONE 0x02U
 
 static osThreadId_t g_tx_wait_handle = NULL;
+/* RX task handle, registered by lora_rx_task_create() so the DIO1 ISR can wake
+ * the correct task. NULL until the RX task has started. */
+static osThreadId_t g_rx_handle = NULL;
 
-int lora_init(void)
+/* All entry points below are extern "C": comms.c is compiled as C and links
+ * against unmangled names, and HAL_GPIO_EXTI_Callback (C) calls lora_on_dio1_irq.
+ * Without the linkage spec these symbols are C++-mangled and unreachable from C
+ * (the driver init would then be dead code shadowed by comms.c's stub). */
+extern "C" int lora_init(void)
 {
     /* Bind virtual pins to real CubeMX GPIO (placeholders until OBC schematic). */
     radioHal.addPin(RLIB_NSS,   CS_TTC_GPIO_Port,     CS_TTC_Pin);
@@ -58,7 +67,7 @@ int lora_init(void)
     return 0;
 }
 
-int lora_tx(const uint8_t* data, size_t len)
+extern "C" int lora_tx(const uint8_t* data, size_t len)
 {
     if (data == NULL || len == 0U) {
         return -1;
@@ -73,14 +82,14 @@ int lora_tx(const uint8_t* data, size_t len)
 }
 
 /* Block the calling task until DIO1 signals TX_DONE (or timeout). */
-int lora_tx_wait_done(uint32_t timeout_ms)
+extern "C" int lora_tx_wait_done(uint32_t timeout_ms)
 {
     uint32_t flags = osThreadFlagsWait(LORA_FLAG_TX_DONE, osFlagsWaitAny, timeout_ms);
     g_tx_wait_handle = NULL;
     return (flags == LORA_FLAG_TX_DONE) ? 0 : -1;
 }
 
-int lora_rx(uint8_t* buf, size_t* len)
+extern "C" int lora_rx(uint8_t* buf, size_t* len)
 {
     if (buf == NULL || len == NULL) {
         return -1;
@@ -92,7 +101,7 @@ int lora_rx(uint8_t* buf, size_t* len)
     return 0;
 }
 
-int lora_start_receive(void)
+extern "C" int lora_start_receive(void)
 {
     int16_t s = radio.startReceive();
     return (s == RADIOLIB_ERR_NONE) ? 0 : -1;
@@ -103,16 +112,24 @@ int lora_start_receive(void)
  * Distinguishes TX_DONE vs RX_DONE by the radio's current mode. The RX/TX tasks
  * register themselves so the right one is woken. (Mirrors RedPill-T ISR design.)
  */
+extern "C" void lora_rx_register_task(osThreadId_t handle)
+{
+    g_rx_handle = handle;
+}
+
 extern "C" void lora_on_dio1_irq(void)
 {
     /* Heuristic: if a TX is pending, it's TX_DONE; else assume RX_DONE.
-       A tighter check would read the SX1268 IRQ status register. */
+       A tighter check would read the SX1268 IRQ status register. The RX task
+       registers its handle via lora_rx_register_task() so we wake the right
+       task; until then the RX flag is dropped (no task to receive it). */
     if (g_tx_wait_handle != NULL) {
         osThreadFlagsSet(g_tx_wait_handle, LORA_FLAG_TX_DONE);
+    } else if (g_rx_handle != NULL) {
+        osThreadFlagsSet(g_rx_handle, LORA_FLAG_RX_DONE);
     } else {
-        /* RX task should have registered its handle; signal via a shared flag.
-           For scaffolding, the RX task polls lora_start_receive() + reads on
-           its own flag — wire the RX handle similarly to g_tx_wait_handle. */
-        osThreadFlagsSet(NULL, LORA_FLAG_RX_DONE);  /* placeholder: replace with RX handle */
+        /* No RX task registered yet (e.g. ISR fired before task start): the
+         * flag is dropped. This is benign — the RX task re-arms receive on its
+         * next iteration and will pick up subsequent frames. */
     }
 }

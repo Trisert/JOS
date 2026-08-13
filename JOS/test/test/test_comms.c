@@ -94,6 +94,19 @@ void test_comms_crc16_known_check_string(void)
     TEST_ASSERT_EQUAL_HEX16(0x29B1U, comms_crc16_ccitt((const uint8_t *)"123456789", 9U));
 }
 
+/* Second known-answer vector over a multi-byte buffer. The expected value
+ * 0xB19E was computed from the ORIGINAL bit-per-bit implementation (before the
+ * nibble-table rewrite) and pins parity: the tabular version must produce the
+ * identical result, not merely a valid CRC. */
+void test_comms_crc16_known_multibyte_buffer(void)
+{
+    static const uint8_t buf[16] = {
+        0x00U, 0x01U, 0x02U, 0x03U, 0xAAU, 0xBBU, 0xCCU, 0xDDU,
+        0x10U, 0x20U, 0x30U, 0x40U, 0xFFU, 0x7EU, 0x81U, 0x42U
+    };
+    TEST_ASSERT_EQUAL_HEX16(0xB19EU, comms_crc16_ccitt(buf, 16U));
+}
+
 void test_comms_crc16_null_returns_init_value(void)
 {
     TEST_ASSERT_EQUAL_HEX16(0xFFFFU, comms_crc16_ccitt(NULL, 4U));
