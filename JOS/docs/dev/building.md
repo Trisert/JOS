@@ -193,11 +193,36 @@ arm-none-eabi-size build/JOS.elf
 
 ## Build (local — any Linux/macOS with the toolchain)
 
+JOS exposes four explicit build profiles. The profile only changes
+optimization/symbol flags (and, for `bench`, flips the boot-CRC policy); it
+never touches first-party source.
+
+| Profile | Flags | Boot-CRC policy | Use |
+|---------|-------|----------------|-----|
+| `debug` (default) | `-O0 -g3` | `FATAL=1 TRUST_UNSTAMPED=0` (flight) | local GDB, full symbols |
+| `release` | `-Os -g3` | flight | size-optimized, symbols kept for backtraces |
+| `release-strip` | `-Os` (no `-g`) | flight | minimum Flash footprint check |
+| `bench` | `-O0 -g3` | `FATAL=0 TRUST_UNSTAMPED=1` | **BENCH BUILD ONLY — never flash to flight** |
+
 ```bash
 cd JOS
-make all
+make debug          # default; equivalent to the old `make all`
+make release        # -Os, symbols kept
+make release-strip  # -Os, no debug info (smallest image)
+make bench          # boot-CRC relaxed; prints BENCH BUILD ONLY warning
 arm-none-eabi-size build/JOS.elf
 ```
+
+`make all` without a profile defaults to `debug`. After building, stamp the
+image CRC before flashing a flight image:
+
+```bash
+make crc-stamp
+```
+
+> **Warning:** `make bench` compiles the boot-integrity recovery reset OUT and
+> treats an unstamped image as trusted. Its ELF must never be flashed to flight
+> hardware.
 
 ## Build (CI — GitHub Actions)
 
