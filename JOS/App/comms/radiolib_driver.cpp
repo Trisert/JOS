@@ -40,7 +40,7 @@ extern "C" void lora_rx_task_register(osThreadId_t handle)
     g_rx_handle = handle;
 }
 
-int lora_init(void)
+extern "C" int lora_init(void)
 {
     /* Bind virtual pins to real CubeMX GPIO (placeholders until OBC schematic). */
     radioHal.addPin(RLIB_NSS,   CS_TTC_GPIO_Port,     CS_TTC_Pin);
@@ -67,7 +67,7 @@ int lora_init(void)
     return 0;
 }
 
-int lora_tx(const uint8_t* data, size_t len)
+extern "C" int lora_tx(const uint8_t* data, size_t len)
 {
     if (data == NULL || len == 0U) {
         return -1;
@@ -87,14 +87,14 @@ int lora_tx(const uint8_t* data, size_t len)
 }
 
 /* Block the calling task until DIO1 signals TX_DONE (or timeout). */
-int lora_tx_wait_done(uint32_t timeout_ms)
+extern "C" int lora_tx_wait_done(uint32_t timeout_ms)
 {
     uint32_t flags = osThreadFlagsWait(LORA_FLAG_TX_DONE, osFlagsWaitAny, timeout_ms);
     g_tx_wait_handle = NULL;
     return (flags == LORA_FLAG_TX_DONE) ? 0 : -1;
 }
 
-int lora_rx(uint8_t* buf, size_t* len)
+extern "C" int lora_rx(uint8_t* buf, size_t* len)
 {
     if (buf == NULL || len == NULL) {
         return -1;
@@ -114,7 +114,7 @@ int lora_rx(uint8_t* buf, size_t* len)
     return 0;
 }
 
-int lora_start_receive(void)
+extern "C" int lora_start_receive(void)
 {
     int16_t s = radio.startReceive();
     return (s == RADIOLIB_ERR_NONE) ? 0 : -1;
