@@ -115,7 +115,19 @@ void STM32Hal::delayMicroseconds(RadioLibTime_t us)
 }
 
 unsigned long STM32Hal::millis()  { return (unsigned long)(HAL_GetTick()); }
-unsigned long STM32Hal::micros()  { return (unsigned long)(HAL_GetTick() * 1000UL); }
+
+/* Microseconds since boot, derived from the 1 kHz SysTick: the whole-ms part
+   from HAL_GetTick() and the sub-ms remainder from the current down-counter
+   value. This is the REAL elapsed time, not HAL_GetTick()*1000 (which would
+   be milliseconds mislabelled as microseconds). RadioLib relies on micros()
+   for reset-settling and preamble timing, so the unit must be correct. */
+unsigned long STM32Hal::micros()
+{
+    uint32_t ticks_per_us = SystemCoreClock / 1000000UL;
+    // cppcheck-suppress cstyleCast  // SysTick is a CMSIS macro cast; unavoidable
+    uint32_t elapsed_sub_ms = ((uint32_t)SysTick->LOAD - (uint32_t)SysTick->VAL) / ticks_per_us;
+    return (unsigned long)(HAL_GetTick()) * 1000UL + (unsigned long)elapsed_sub_ms;
+}
 
 long STM32Hal::pulseIn(uint32_t pin, uint32_t state, RadioLibTime_t timeout)
 {
