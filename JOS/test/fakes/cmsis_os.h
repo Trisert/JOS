@@ -105,6 +105,13 @@ osThreadId_t osThreadNew(osThreadFunc_t func, void *argument, const osThreadAttr
 osThreadId_t osThreadGetId(void);
 osStatus_t   osDelay(uint32_t ticks);
 
+/* ---------- Thread flags ---------- */
+#define osFlagsWaitAny    0x00000000U
+#define osFlagsWaitAll    0x00000001U
+#define osFlagsNoClear    0x00000002U
+uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout);
+osStatus_t osThreadFlagsSet(osThreadId_t thread_id, uint32_t flags);
+
 /* ---------- Mutexes ---------- */
 osMutexId_t osMutexNew(const osMutexAttr_t *attr);
 osStatus_t  osMutexAcquire(osMutexId_t mutex_id, uint32_t timeout);

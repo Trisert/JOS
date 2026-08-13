@@ -74,3 +74,22 @@ void host_dual_bank_reset(void)
     boot_complete_calls         = 0u;
     boot_complete_failures_left = 0u;
 }
+
+/* ---------- Thread flags (CMSIS-RTOS2 host double) ----------
+ * On the flight target these are provided by the FreeRTOS CMSIS wrapper. The
+ * host test build links these no-op stand-ins so comms.c (which parks the RX
+ * task on osThreadFlagsWait) compiles and links; the unit tests do not drive
+ * real RTOS scheduling, so returning "no flags" / osOK is sufficient. */
+#include "cmsis_os.h"
+
+uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout)
+{
+    (void)flags; (void)options; (void)timeout;
+    return 0u;
+}
+
+osStatus_t osThreadFlagsSet(osThreadId_t thread_id, uint32_t flags)
+{
+    (void)thread_id; (void)flags;
+    return osOK;
+}
