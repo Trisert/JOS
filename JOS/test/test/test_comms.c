@@ -552,10 +552,14 @@ static void run_task_iterations(void (*task)(void *))
  * monitored tasks. The loop runs three iterations before the escape stub
  * longjmps out, so queue three expectations. lora_rx_task_create() also calls
  * osThreadGetId() once to register the RX task handle with the driver ISR
- * hook (B3), so expect that call at the start of the loop. */
+ * hook (B3), and each iteration blocks on osThreadFlagsWait() (also B3), so
+ * expect those calls at the start / per iteration. */
 void test_lora_rx_task_loop_delays_at_the_registered_period(void)
 {
     osThreadGetId_ExpectAndReturn(RX_TH);
+    osThreadFlagsWait_ExpectAndReturn(LORA_RX_FLAG, LORA_RX_FLAG);
+    osThreadFlagsWait_ExpectAndReturn(LORA_RX_FLAG, LORA_RX_FLAG);
+    osThreadFlagsWait_ExpectAndReturn(LORA_RX_FLAG, LORA_RX_FLAG);
     osDelay_Stub(osDelay_escape_cb);
     watchdog_alive_self_Expect();
     watchdog_alive_self_Expect();

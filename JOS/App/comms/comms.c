@@ -27,8 +27,8 @@ extern int  lora_start_receive(void);
    on RX_DONE. Implemented in radiolib_driver.cpp. */
 extern void lora_rx_task_register(osThreadId_t handle);
 
-/* Must match LORA_FLAG_RX_DONE (0x02U) in radiolib_driver.cpp. */
-#define LORA_RX_FLAG 0x02U
+/* LORA_RX_FLAG is defined in comms.h (must match LORA_FLAG_RX_DONE in
+   radiolib_driver.cpp — see comment there). */
 
 /* ---------- Packet buffers in SRAM2 (hardware parity) ----------
    Placed in the NOLOAD .sram2_noinit section: the SRAM2 hardware erase run by

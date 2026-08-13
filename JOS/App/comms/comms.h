@@ -10,6 +10,10 @@
 #define COMMS_MAX_PACKET   64U    /* LoRa payload chunk */
 #define COMMS_BEACON_SIZE  128U   /* 96 B telemetry + 32 B system */
 
+/* RX task wake flag (DIO1 RX_DONE). Must match LORA_FLAG_RX_DONE in
+   radiolib_driver.cpp so the ISR and the task agree on the bit. */
+#define LORA_RX_FLAG 0x02U
+
 /* Initialise LoRa transceiver (SX1268 on SPI1) */
 int lora_init(void);
 
