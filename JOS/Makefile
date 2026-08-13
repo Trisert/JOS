@@ -96,6 +96,7 @@ else ifeq ($(BUILD_PROFILE),bench)
   OPT := -O0 -g3
   BOOT_CRC_FATAL           := 0
   BOOT_CRC_TRUST_UNSTAMPED := 1
+  $(warning *** BENCH BUILD ONLY: boot CRC recovery reset compiled OUT and unstamped images treated as trusted. NEVER flash this image to flight hardware.)
 else
   $(error BUILD_PROFILE must be debug|release|bench|release-strip, got '$(BUILD_PROFILE)')
 endif
