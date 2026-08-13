@@ -15,6 +15,21 @@
 
 extern SPI_HandleTypeDef hspi1;
 
+/* RadioLib SX1268 driver entry points (C linkage, implemented in
+   App/comms/radiolib_driver.cpp). Declared here so comms.c (compiled as C)
+   links against the unmangled symbols. */
+extern int  lora_init(void);
+extern int  lora_tx(const uint8_t *data, size_t len);
+extern int  lora_rx(uint8_t *data, size_t *len);
+extern int  lora_tx_wait_done(uint32_t timeout_ms);
+extern int  lora_start_receive(void);
+/* Registers the RX task handle with the driver so the DIO1 ISR wakes this task
+   on RX_DONE. Implemented in radiolib_driver.cpp. */
+extern void lora_rx_task_register(osThreadId_t handle);
+
+/* Must match LORA_FLAG_RX_DONE (0x02U) in radiolib_driver.cpp. */
+#define LORA_RX_FLAG 0x02U
+
 /* ---------- Packet buffers in SRAM2 (hardware parity) ----------
    Placed in the NOLOAD .sram2_noinit section: the SRAM2 hardware erase run by
    sram2_parity_init() zeroes them at boot with valid parity, so they cost no
@@ -45,11 +60,8 @@ uint8_t *comms_tx_buffer(size_t *len)
 
 /* ---------- Stub implementations ---------- */
 
-int lora_init(void)
-{
-    /* TODO: configure SX1268 via RadioLib — SF10, BW125, CR4/8, 433 MHz */
-    return 0;
-}
+/* lora_init() is implemented in radiolib_driver.cpp (target build). The host
+   unit-test build links a fake from test/fakes/ instead (see B4). */
 
 int lora_send_chunked(const uint8_t *data, size_t len)
 {
@@ -61,12 +73,18 @@ int lora_send_chunked(const uint8_t *data, size_t len)
         return -1;
     }
 
-    /* TODO: add sequence numbers + CRC and hand each chunk to RadioLib.
-       The staging buffer already lives in parity-protected SRAM2. */
+    /* Hand each chunk to RadioLib. TX is async (startTransmit); wait for the
+       DIO1 TX_DONE flag before staging the next chunk so we never overwrite
+       the buffer mid-air. 2000 ms covers SF10 @ 125 kHz for the largest chunk. */
     while (off < len) {
         size_t n = ((len - off) < chunk_max) ? (len - off) : chunk_max;
         memcpy(tx, data + off, n);
-        /* TODO: lora_tx(tx, n); */
+        if (lora_tx(tx, n) != 0) {
+            return -1;
+        }
+        if (lora_tx_wait_done(2000U) != 0) {
+            return -1;
+        }
         off += n;
     }
     return 0;
@@ -194,12 +212,15 @@ void lora_beacon_task(void *arg)
         watchdog_alive_self();
 
         size_t beacon_len = 0U;
-        uint8_t *beacon = comms_beacon_buffer(&beacon_len);
+        const uint8_t *beacon = comms_beacon_buffer(&beacon_len);
 
-        /* TODO: build beacon packet (96 B telemetry + 32 B sys) in `beacon` */
-        (void)beacon;
-        (void)beacon_len;
-        /* TODO: lora_tx(beacon, beacon_len); */
+        /* Build beacon packet (96 B telemetry + 32 B sys) in `beacon`.
+           TODO: full telemetry encoding. For now transmit the staging buffer
+           as-is so the link is exercised end-to-end. */
+        if (beacon_len > 0U) {
+            (void)lora_tx(beacon, beacon_len);
+            (void)lora_tx_wait_done(2000U);
+        }
 
         osDelay(pdMS_TO_TICKS(interval));
     }
@@ -226,36 +247,48 @@ static const osThreadAttr_t rx_attrs = {
 };
 
 /*
- * NOT YET WIRED: the SX1268 driver is still a stub, so nothing calls
- * comms_rx_handle_frame() on the flight target yet — the gate is dormant on
- * hardware and only exercised by the ESP32 simulation bridge and host tests.
- * When the radio driver lands, the ONLY permitted path from PHY payload to
- * dispatcher is comms_rx_handle_frame().
+ * NOW WIRED: the SX1268 driver (radiolib_driver.cpp) lands the PHY payload into
+ * `rx` via the DIO1 IRQ. The ONLY permitted path from PHY payload to dispatcher
+ * is comms_rx_handle_frame(), which performs structure + CRC + opcode + range
+ * validation and dispatches only valid telecommands. A rejection reason must be
+ * logged/telemetered, never discarded.
  */
 void lora_rx_task(void *arg)
 {
     (void)arg;
 
-    for (;;) {
-        size_t rx_len = 0U;
-        uint8_t *rx = comms_rx_buffer(&rx_len);
+    /* Tell the driver which task to wake on RX_DONE. */
+    lora_rx_task_register(osThreadGetId());
 
-        /* TODO: enter RX mode, wait for the DIO1 IRQ, read the PHY payload into
-         *       `rx` / rx_len, then gate it through:
-         *           comms_tc_result_t r = comms_rx_handle_frame(rx, rx_len);
-         *           if (r != COMMS_TC_OK) { log comms_tc_result_str(r); }
-         *       which performs structure + CRC + opcode + range validation and
-         *       dispatches only valid telecommands. The rejection reason must be
-         *       logged/telemetered, not discarded. */
-        (void)rx;
-        (void)rx_len;
-        watchdog_alive_self();  /* keep the monitor happy while RX task is parked.
-                                  * NOTE: this arms a 3x100ms=300ms silence deadline;
-                                  * safe for the current 100ms poll placeholder, but
-                                  * the future blocking DIO1 wait (see TODO above) must
-                                  * call watchdog_alive_self() inside the wait or the
-                                  * task will be falsely flagged hung. */
-        osDelay(pdMS_TO_TICKS(100));
+    /* Arm continuous RX so the DIO1 IRQ fires on the next downlink. */
+    (void)lora_start_receive();
+
+    for (;;) {
+        /* Block on the DIO1 RX_DONE flag (with timeout) and kick the watchdog
+           inside the loop so the blocking wait never arms a false 'hung' flag.
+           The 100 ms poll granularity keeps the monitor happy. */
+        uint32_t flags = osThreadFlagsWait(LORA_RX_FLAG, osFlagsWaitAny, 100U);
+        watchdog_alive_self();
+
+        if (flags == LORA_RX_FLAG) {
+            size_t rx_len = 0U;
+            uint8_t *rx = comms_rx_buffer(&rx_len);
+
+            if (lora_rx(rx, &rx_len) == 0) {
+                comms_tc_result_t r = comms_rx_handle_frame(rx, rx_len);
+                if (r != COMMS_TC_OK) {
+                    /* Rejection reason must be visible, not silently dropped.
+                       Route it to the telemetry/log sink once one exists; for
+                       now surface the human-readable reason via the existing
+                       comms_tc_result_str(). */
+                    const char *why = comms_tc_result_str(r);
+                    (void)why;  /* TODO: forward `why` to telemetry/log sink */
+                }
+            }
+
+            /* Re-arm RX for the next frame. */
+            (void)lora_start_receive();
+        }
     }
 }
 
