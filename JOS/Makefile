@@ -31,7 +31,7 @@ MCU   := $(CPU) -mthumb $(FPU) $(FLOAT)
 ##############################################################################
 BUILD_DIR   := build
 SRC_DIRS    := Core/Src Drivers/STM32L4xx_HAL_Driver/Src Middlewares/Third_Party/FreeRTOS/Source App/obsw App/bms App/memory App/comms App/aocs App/payloads
-CXX_SRC_DIRS := Core/Inc/RadioLib/src
+CXX_SRC_DIRS := Core/Inc/RadioLib/src App/comms
 ASM_SRC     := Core/Startup/startup_stm32l496vgtx.s
 LINKER_SCRIPT := STM32L496VGTX_FLASH.ld
 
