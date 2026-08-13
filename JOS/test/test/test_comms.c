@@ -557,9 +557,9 @@ static void run_task_iterations(void (*task)(void *))
 void test_lora_rx_task_loop_delays_at_the_registered_period(void)
 {
     osThreadGetId_ExpectAndReturn(RX_TH);
-    osThreadFlagsWait_ExpectAndReturn(LORA_RX_FLAG, LORA_RX_FLAG);
-    osThreadFlagsWait_ExpectAndReturn(LORA_RX_FLAG, LORA_RX_FLAG);
-    osThreadFlagsWait_ExpectAndReturn(LORA_RX_FLAG, LORA_RX_FLAG);
+    osThreadFlagsWait_ExpectAndReturn(LORA_RX_FLAG, osFlagsWaitAny, 100U, LORA_RX_FLAG);
+    osThreadFlagsWait_ExpectAndReturn(LORA_RX_FLAG, osFlagsWaitAny, 100U, LORA_RX_FLAG);
+    osThreadFlagsWait_ExpectAndReturn(LORA_RX_FLAG, osFlagsWaitAny, 100U, LORA_RX_FLAG);
     osDelay_Stub(osDelay_escape_cb);
     watchdog_alive_self_Expect();
     watchdog_alive_self_Expect();
