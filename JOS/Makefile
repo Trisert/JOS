@@ -78,6 +78,28 @@ INCLUDES := \
 BOOT_CRC_FATAL           := 1
 BOOT_CRC_TRUST_UNSTAMPED := 0
 
+# ---------------------------------------------------------------------------
+# Build profile: debug (default), release, bench, release-strip.
+# Changes only optimization/symbol flags. The boot-CRC policy stays on
+# BOOT_CRC_FATAL / BOOT_CRC_TRUST_UNSTAMPED (:=, override via CLI only); the
+# bench profile flips them explicitly (BENCH BUILD ONLY - never flashed to flight).
+# ---------------------------------------------------------------------------
+BUILD_PROFILE ?= debug
+
+ifeq ($(BUILD_PROFILE),debug)
+  OPT := -O0 -g3
+else ifeq ($(BUILD_PROFILE),release)
+  OPT := -Os -g3
+else ifeq ($(BUILD_PROFILE),release-strip)
+  OPT := -Os            # no -g: minimum size for Flash budget verification
+else ifeq ($(BUILD_PROFILE),bench)
+  OPT := -O0 -g3
+  BOOT_CRC_FATAL           := 0
+  BOOT_CRC_TRUST_UNSTAMPED := 1
+else
+  $(error BUILD_PROFILE must be debug|release|bench|release-strip, got '$(BUILD_PROFILE)')
+endif
+
 # Validation: anything other than 0/1 (typo, empty, "yes", "true") is a hard
 # build error instead of a define that quietly evaluates to 0 in #if.
 ifneq ($(filter-out 0 1,$(BOOT_CRC_FATAL)),)
@@ -135,7 +157,7 @@ C_WARNFLAGS := $(WARNFLAGS) -Werror=implicit-function-declaration
 # C Flags
 ##############################################################################
 CFLAGS  := $(MCU) $(C_DEFS)
-CFLAGS += -std=gnu11 -g3 -O0
+CFLAGS += -std=gnu11 $(OPT)
 CFLAGS += $(C_WARNFLAGS) -ffunction-sections -fdata-sections
 # -Wundef: a policy switch that is misspelled or never defined must not
 # silently evaluate to 0 inside #if. Applied to App/ only (see APP_CFLAGS
@@ -148,7 +170,7 @@ CFLAGS += $(INCLUDES)
 # C++ Flags
 ##############################################################################
 CXXFLAGS  := $(MCU) $(CXX_DEFS)
-CXXFLAGS += -std=gnu++14 -g3 -O0
+CXXFLAGS += -std=gnu++14 $(OPT)
 CXXFLAGS += $(WARNFLAGS) -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti
 CXXFLAGS += $(INCLUDES)
 
@@ -554,9 +576,17 @@ DEPS := $(C_DEPS) $(CXX_DEPS) $(ASM_DEPS)
 ##############################################################################
 # Default target
 ##############################################################################
-.PHONY: all clean flash test coverage crc-stamp sim sim-build sim-flash sim-monitor sim-clean sim-erase
+.PHONY: all clean flash test coverage crc-stamp sim sim-build sim-flash sim-monitor sim-clean sim-erase debug release bench release-strip
 
 all: $(BUILD_DIR)/$(PROJECT_NAME).elf $(BUILD_DIR)/$(PROJECT_NAME).hex $(BUILD_DIR)/$(PROJECT_NAME).bin
+
+# Build-profile shortcut targets. Each re-invokes make with BUILD_PROFILE set
+# so the profile selection and all of its flag/define consequences are applied
+# in a single recursive make (preserving the := boot-CRC policy semantics).
+debug:         ; $(MAKE) all BUILD_PROFILE=debug
+release:       ; $(MAKE) all BUILD_PROFILE=release
+bench:         ; $(MAKE) all BUILD_PROFILE=bench
+release-strip: ; $(MAKE) all BUILD_PROFILE=release-strip
 
 ##############################################################################
 # Firmware image CRC stamping
