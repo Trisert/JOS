@@ -40,7 +40,7 @@ extern "C" void lora_rx_task_register(osThreadId_t handle)
     g_rx_handle = handle;
 }
 
-extern "C" int lora_init(void)
+int lora_init(void)
 {
     /* Bind virtual pins to real CubeMX GPIO (placeholders until OBC schematic). */
     radioHal.addPin(RLIB_NSS,   CS_TTC_GPIO_Port,     CS_TTC_Pin);
@@ -62,14 +62,19 @@ extern "C" int lora_init(void)
         return -1;
     }
 
-    /* Put radio in standby; RX is armed by the RX task. */
+    /* Put radio to sleep; RX is armed by the RX task via lora_start_receive(). */
     radio.sleep();
     return 0;
 }
 
-extern "C" int lora_tx(const uint8_t* data, size_t len)
+int lora_tx(const uint8_t* data, size_t len)
 {
     if (data == NULL || len == 0U) {
+        return -1;
+    }
+    /* RadioLib startTransmit takes a uint8_t length; reject oversized payloads
+       instead of silently truncating (would corrupt the frame). */
+    if (len > 255U) {
         return -1;
     }
     g_tx_wait_handle = osThreadGetId();
@@ -82,26 +87,34 @@ extern "C" int lora_tx(const uint8_t* data, size_t len)
 }
 
 /* Block the calling task until DIO1 signals TX_DONE (or timeout). */
-extern "C" int lora_tx_wait_done(uint32_t timeout_ms)
+int lora_tx_wait_done(uint32_t timeout_ms)
 {
     uint32_t flags = osThreadFlagsWait(LORA_FLAG_TX_DONE, osFlagsWaitAny, timeout_ms);
     g_tx_wait_handle = NULL;
     return (flags == LORA_FLAG_TX_DONE) ? 0 : -1;
 }
 
-extern "C" int lora_rx(uint8_t* buf, size_t* len)
+int lora_rx(uint8_t* buf, size_t* len)
 {
     if (buf == NULL || len == NULL) {
         return -1;
     }
-    int16_t s = radio.readData(buf, (uint8_t)(*len));
+    /* In this RadioLib version readData() takes the length by value (no
+       writeback), so query the received packet length first and report it
+       back to the caller. getPacketLength() must be called BEFORE readData(). */
+    size_t received = radio.getPacketLength();
+    if (received > *len) {
+        received = *len;   /* truncate to buffer capacity */
+    }
+    int16_t s = radio.readData(buf, received);
     if (s != RADIOLIB_ERR_NONE) {
         return -1;
     }
+    *len = received;
     return 0;
 }
 
-extern "C" int lora_start_receive(void)
+int lora_start_receive(void)
 {
     int16_t s = radio.startReceive();
     return (s == RADIOLIB_ERR_NONE) ? 0 : -1;
