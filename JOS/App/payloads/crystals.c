@@ -73,7 +73,7 @@ void crystals_take_photo(void)
 {
     /* Pulse camera trigger: active-low, 100 ms */
     HAL_GPIO_WritePin(CRYSTALS_CAM_TRIG_PORT, CRYSTALS_CAM_TRIG_PIN, GPIO_PIN_RESET);
-    /* Yield the scheduler instead of busy-waiting; open question: if this wait is gated on a hardware exposure-end signal, replace with a semaphore. */
+    /* Yield instead of busy-wait; if gated on a hardware exposure-end signal, swap for a semaphore. */
     osDelay(pdMS_TO_TICKS(100));
     HAL_GPIO_WritePin(CRYSTALS_CAM_TRIG_PORT, CRYSTALS_CAM_TRIG_PIN, GPIO_PIN_SET);
 }
