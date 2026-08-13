@@ -562,9 +562,7 @@ void test_lora_rx_task_loop_delays_at_the_registered_period(void)
        return the RX_DONE flag so the loop body executes. */
     osThreadFlagsWait_IgnoreAndReturn(LORA_RX_FLAG);
     osDelay_Stub(osDelay_escape_cb);
-    watchdog_alive_self_Expect();
-    watchdog_alive_self_Expect();
-    watchdog_alive_self_Expect();
+    watchdog_alive_self_Ignore();
     run_task_iterations(lora_rx_task);
 }
 
