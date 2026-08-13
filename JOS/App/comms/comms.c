@@ -45,11 +45,8 @@ uint8_t *comms_tx_buffer(size_t *len)
 
 /* ---------- Stub implementations ---------- */
 
-int lora_init(void)
-{
-    /* TODO: configure SX1268 via RadioLib — SF10, BW125, CR4/8, 433 MHz */
-    return 0;
-}
+/* lora_init() is implemented in radiolib_driver.cpp (target build). The host
+   unit-test build links a fake from test/fakes/ instead (see B4). */
 
 int lora_send_chunked(const uint8_t *data, size_t len)
 {
