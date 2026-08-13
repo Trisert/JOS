@@ -65,7 +65,7 @@ public:
        interrupt-mode constants. We handle DIO1 via HAL_GPIO_EXTI_Callback, so
        we pass the "disabled" constants (RadioLib uses them only if you call
        attachInterrupt, which we leave empty). */
-    STM32Hal(SPI_HandleTypeDef* spiHandle);
+    explicit STM32Hal(SPI_HandleTypeDef* spiHandle);
 
     void addPin(uint32_t pinId, GPIO_TypeDef* port, uint16_t pin);
 
