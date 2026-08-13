@@ -30,6 +30,15 @@ SX1268   radio(&radioModule);
 #define LORA_FLAG_RX_DONE 0x02U
 
 static osThreadId_t g_tx_wait_handle = NULL;
+/* RX task handle, registered by lora_rx_task_create() so the DIO1 ISR can wake
+   the correct task on RX_DONE. NULL until the RX task has started. */
+static osThreadId_t g_rx_handle = NULL;
+
+/* Called by comms.c once the RX task is created, so the ISR knows whom to wake. */
+extern "C" void lora_rx_task_register(osThreadId_t handle)
+{
+    g_rx_handle = handle;
+}
 
 int lora_init(void)
 {
@@ -53,7 +62,7 @@ int lora_init(void)
         return -1;
     }
 
-    /* Put radio in standby; RX is armed by the RX task. */
+    /* Put radio to sleep; RX is armed by the RX task via lora_start_receive(). */
     radio.sleep();
     return 0;
 }
@@ -61,6 +70,11 @@ int lora_init(void)
 int lora_tx(const uint8_t* data, size_t len)
 {
     if (data == NULL || len == 0U) {
+        return -1;
+    }
+    /* RadioLib startTransmit takes a uint8_t length; reject oversized payloads
+       instead of silently truncating (would corrupt the frame). */
+    if (len > 255U) {
         return -1;
     }
     g_tx_wait_handle = osThreadGetId();
@@ -85,10 +99,18 @@ int lora_rx(uint8_t* buf, size_t* len)
     if (buf == NULL || len == NULL) {
         return -1;
     }
-    int16_t s = radio.readData(buf, (uint8_t)(*len));
+    /* In this RadioLib version readData() takes the length by value (no
+       writeback), so query the received packet length first and report it
+       back to the caller. getPacketLength() must be called BEFORE readData(). */
+    size_t received = radio.getPacketLength();
+    if (received > *len) {
+        received = *len;   /* truncate to buffer capacity */
+    }
+    int16_t s = radio.readData(buf, received);
     if (s != RADIOLIB_ERR_NONE) {
         return -1;
     }
+    *len = received;
     return 0;
 }
 
@@ -109,10 +131,7 @@ extern "C" void lora_on_dio1_irq(void)
        A tighter check would read the SX1268 IRQ status register. */
     if (g_tx_wait_handle != NULL) {
         osThreadFlagsSet(g_tx_wait_handle, LORA_FLAG_TX_DONE);
-    } else {
-        /* RX task should have registered its handle; signal via a shared flag.
-           For scaffolding, the RX task polls lora_start_receive() + reads on
-           its own flag — wire the RX handle similarly to g_tx_wait_handle. */
-        osThreadFlagsSet(NULL, LORA_FLAG_RX_DONE);  /* placeholder: replace with RX handle */
+    } else if (g_rx_handle != NULL) {
+        osThreadFlagsSet(g_rx_handle, LORA_FLAG_RX_DONE);
     }
 }
