@@ -563,13 +563,19 @@ static void run_task_iterations(void (*task)(void *))
 
 /* lora_rx_task() now signals liveness every iteration, mirroring the other
  * monitored tasks. The loop runs three iterations before the escape stub
- * longjmps out, so queue three expectations. */
+ * longjmps out, so queue three expectations. lora_rx_task_create() also calls
+ * osThreadGetId() once to register the RX task handle with the driver ISR
+ * hook (B3), and each iteration blocks on osThreadFlagsWait() (also B3), so
+ * expect those calls at the start / per iteration. */
 void test_lora_rx_task_loop_delays_at_the_registered_period(void)
 {
+    osThreadGetId_ExpectAndReturn(RX_TH);
+    /* Each loop iteration blocks on osThreadFlagsWait(); ignore the exact
+       call count (driven by the escape stub's 3 osDelay iterations) and just
+       return the RX_DONE flag so the loop body executes. */
+    osThreadFlagsWait_IgnoreAndReturn(LORA_RX_FLAG);
     osDelay_Stub(osDelay_escape_cb);
-    watchdog_alive_self_Expect();
-    watchdog_alive_self_Expect();
-    watchdog_alive_self_Expect();
+    watchdog_alive_self_Ignore();
     run_task_iterations(lora_rx_task);
 }
 

@@ -107,13 +107,8 @@ void STM32Hal::delay(RadioLibTime_t ms)
 
 void STM32Hal::delayMicroseconds(RadioLibTime_t us)
 {
-    /* Blocking microsecond spin — used by RadioLib during reset settling.
-       The loop body (decrement + __NOP + branch) costs ~4 Cortex-M4 cycles,
-       so scale the iteration count accordingly. Approximate by design: RadioLib
-       only uses this for short reset/power-up settles where ±a few µs is fine.
-       For cycle-accurate delays DWT should be used, but that needs the debug
-       clock enabled; this is the safe default. */
-    uint32_t cycles = ((SystemCoreClock / 1000000U) * (uint32_t)us) / 4U;
+    /* Blocking microsecond spin — used by RadioLib during reset settling. */
+    volatile uint32_t cycles = (SystemCoreClock / 1000000U) * (uint32_t)us;
     while (cycles--) {
         __NOP();
     }
