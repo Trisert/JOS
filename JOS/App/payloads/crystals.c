@@ -2,6 +2,7 @@
 #include "memory.h"
 #include "main.h"
 #include "stm32l4xx_hal.h"
+#include "cmsis_os.h"   /* osDelay() / pdMS_TO_TICKS() */
 #include <string.h>
 
 extern ADC_HandleTypeDef hadc1;
@@ -72,7 +73,8 @@ void crystals_take_photo(void)
 {
     /* Pulse camera trigger: active-low, 100 ms */
     HAL_GPIO_WritePin(CRYSTALS_CAM_TRIG_PORT, CRYSTALS_CAM_TRIG_PIN, GPIO_PIN_RESET);
-    HAL_Delay(100);
+    /* Yield instead of busy-wait; if gated on a hardware exposure-end signal, swap for a semaphore. */
+    osDelay(pdMS_TO_TICKS(100));
     HAL_GPIO_WritePin(CRYSTALS_CAM_TRIG_PORT, CRYSTALS_CAM_TRIG_PIN, GPIO_PIN_SET);
 }
 

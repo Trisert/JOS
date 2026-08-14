@@ -78,6 +78,18 @@ static uint32_t be32(const uint8_t *p)
 
 /* ---------- Public API ---------- */
 
+/* Nibble-wise CRC-16/CCITT-FALSE table (16 entries, 32 B of .rodata) — the
+ * MSB-first twin of the reflected crc32_nibble_table in App/obsw/boot_crc.c.
+ * table[n] = 4 CRC iterations applied to (n << 12) with poly 0x1021, so two
+ * table lookups per byte replace the 8-iteration inner bit loop while staying
+ * bit-for-bit identical to the original SHIFT-AND implementation above. */
+static const uint16_t crc16_nibble_table[16] = {
+    0x0000u, 0x1021u, 0x2042u, 0x3063u,
+    0x4084u, 0x50A5u, 0x60C6u, 0x70E7u,
+    0x8108u, 0x9129u, 0xA14Au, 0xB16Bu,
+    0xC18Cu, 0xD1ADu, 0xE1CEu, 0xF1EFu,
+};
+
 uint16_t comms_crc16_ccitt(const uint8_t *data, size_t len)
 {
     uint16_t crc = 0xFFFFU;
@@ -94,15 +106,15 @@ uint16_t comms_crc16_ccitt(const uint8_t *data, size_t len)
         len = (size_t)COMMS_TC_MAX_FRAME;
     }
 
+    /* MSB-first nibble table (App/obsw/boot_crc.c analogue). Two table
+     * lookups per byte replace the 8-iteration inner bit loop and stay
+     * bit-for-bit identical to the original SHIFT-AND implementation (poly
+     * 0x1021, init 0xFFFF, no final XOR). table[n] is 4 CRC iterations of
+     * (n << 12), so each (crc << 4) ^ table[top_nibble] folds in one nibble. */
     for (size_t i = 0U; i < len; i++) {
         crc ^= (uint16_t)((uint16_t)data[i] << 8);
-        for (uint8_t bit = 0U; bit < 8U; bit++) {
-            if ((crc & 0x8000U) != 0U) {
-                crc = (uint16_t)((uint16_t)(crc << 1) ^ 0x1021U);
-            } else {
-                crc = (uint16_t)(crc << 1);
-            }
-        }
+        crc = (uint16_t)((uint16_t)(crc << 4) ^ crc16_nibble_table[(crc >> 12) & 0x000FU]);
+        crc = (uint16_t)((uint16_t)(crc << 4) ^ crc16_nibble_table[(crc >> 12) & 0x000FU]);
     }
     return crc;
 }
