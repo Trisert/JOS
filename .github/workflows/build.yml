@@ -140,7 +140,7 @@ jobs:
 
       - name: Build firmware
         working-directory: JOS
-        run: make all
+        run: make release
 
       - name: Stamp firmware image CRC
         working-directory: JOS
