@@ -97,10 +97,15 @@ __asm__(".globl __fw_crc_start\n\t"
  * launders the qualifiers, so no -Wcast-qual diagnostic is triggered.
  * `volatile` keeps the compiler from caching the value.
  *
- * The page still has to be made writable at run time: a const object is
- * emitted into a read-only-mapped section, so a bare store would segfault.
- * One mprotect() on the containing page is enough and behaves the same on
- * aarch64 (developer machines) and x86_64 (CI).
+ * NOTE: the comment above previously claimed "one mprotect() on the
+ * containing page is enough and behaves the same on aarch64 and x86_64".
+ * That was FALSE: on aarch64 mprotect() RW on a .rodata page raises SIGSEGV
+ * instead of returning -1 (as x86_64 does), which crashed the harness on
+ * aarch64 hosts (PR #48). On the host build, the word is therefore emitted
+ * into RW .data (see boot_crc.c, under HOST_UNIT_TEST) and mprotect() is
+ * skipped entirely; the #else branch below is only ever reached when
+ * HOST_UNIT_TEST is undefined (a non-test host build that still needs the
+ * page flipped writable), never on the actual firmware/Flash target.
  * ------------------------------------------------------------------------- */
 extern const volatile uint32_t fw_crc_stored __attribute__((weak));
 
@@ -110,17 +115,28 @@ static volatile uint32_t *host_fw_crc_slot(void)
 }
 
 /* Make the page holding the stored-CRC word writable. Idempotent: the mprotect
- * is attempted once per process. */
+ * is attempted once per process.
+ *
+ * NOTE: under HOST_UNIT_TEST the word is emitted into RW .data (see
+ * boot_crc.c), so the page is already writable and mprotect() is skipped.
+ * This also avoids an aarch64-specific SIGSEGV: on aarch64, mprotect() RW on a
+ * .rodata page raises SIGSEGV instead of returning -1 (as x86_64 does), which
+ * crashed the harness on aarch64 hosts. */
 static int host_fw_crc_make_writable(volatile uint32_t *slot)
 {
     static int unprotected = 0;
 
-    long      page_size;
-    uintptr_t page_base;
-
     if (unprotected) {
         return 0;
     }
+
+#ifdef HOST_UNIT_TEST
+    /* Word lives in RW .data on the host build; nothing to do. */
+    unprotected = 1;
+    return 0;
+#else
+    long      page_size;
+    uintptr_t page_base;
 
     page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
@@ -135,6 +151,7 @@ static int host_fw_crc_make_writable(volatile uint32_t *slot)
 
     unprotected = 1;
     return 0;
+#endif
 }
 
 void host_fw_crc_stamp(uint32_t value)
