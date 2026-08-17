@@ -67,8 +67,20 @@ extern const uint8_t __fw_crc_start[];
  * The placeholder is 0x00000000 and NOT the erased-Flash pattern
  * 0xFFFFFFFF: an erased/decayed CRC word must be a fault, not a free pass.
  * ------------------------------------------------------------------------- */
+#ifdef HOST_UNIT_TEST
+/* Host test double: keep the stored-CRC word in .data (read-write) instead of
+ * the .fw_crc (read-only) section. The host harness stamps it via
+ * host_fw_crc_stamp(), which uses mprotect() to flip the page RW. On aarch64
+ * mprotect() RW on a .rodata page raises SIGSEGV instead of returning -1
+ * (unlike x86_64), so the stamp segfaults. Putting the word in RW .data makes
+ * the page already writable and removes the dependency on mprotect entirely.
+ * The firmware (ARM) build never defines HOST_UNIT_TEST, so the flight image
+ * is byte-for-byte unchanged. */
+volatile uint32_t fw_crc_stored = BOOT_CRC_UNSTAMPED_VALUE;
+#else
 __attribute__((section(".fw_crc"), used))
 const volatile uint32_t fw_crc_stored = BOOT_CRC_UNSTAMPED_VALUE;
+#endif
 
 /* ---------- Latched result (readable by telemetry / beacon) ---------- */
 static boot_crc_status_t crc_status     = BOOT_CRC_UNSTAMPED;

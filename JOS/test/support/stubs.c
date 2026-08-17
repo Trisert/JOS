@@ -110,17 +110,28 @@ static volatile uint32_t *host_fw_crc_slot(void)
 }
 
 /* Make the page holding the stored-CRC word writable. Idempotent: the mprotect
- * is attempted once per process. */
+ * is attempted once per process.
+ *
+ * NOTE: under HOST_UNIT_TEST the word is emitted into RW .data (see
+ * boot_crc.c), so the page is already writable and mprotect() is skipped.
+ * This also avoids an aarch64-specific SIGSEGV: on aarch64, mprotect() RW on a
+ * .rodata page raises SIGSEGV instead of returning -1 (as x86_64 does), which
+ * crashed the harness on aarch64 hosts. */
 static int host_fw_crc_make_writable(volatile uint32_t *slot)
 {
     static int unprotected = 0;
 
-    long      page_size;
-    uintptr_t page_base;
-
     if (unprotected) {
         return 0;
     }
+
+#ifdef HOST_UNIT_TEST
+    /* Word lives in RW .data on the host build; nothing to do. */
+    unprotected = 1;
+    return 0;
+#else
+    long      page_size;
+    uintptr_t page_base;
 
     page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
@@ -135,6 +146,7 @@ static int host_fw_crc_make_writable(volatile uint32_t *slot)
 
     unprotected = 1;
     return 0;
+#endif
 }
 
 void host_fw_crc_stamp(uint32_t value)
