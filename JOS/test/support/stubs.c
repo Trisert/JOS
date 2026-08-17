@@ -101,9 +101,11 @@ __asm__(".globl __fw_crc_start\n\t"
  * containing page is enough and behaves the same on aarch64 and x86_64".
  * That was FALSE: on aarch64 mprotect() RW on a .rodata page raises SIGSEGV
  * instead of returning -1 (as x86_64 does), which crashed the harness on
- * aarch64 hosts (PR #48). The firmware path below still uses mprotect() on
- * the real Flash-mapped page; the HOST_UNIT_TEST path keeps the word in RW
- * .data (see boot_crc.c) and skips mprotect() entirely.
+ * aarch64 hosts (PR #48). On the host build, the word is therefore emitted
+ * into RW .data (see boot_crc.c, under HOST_UNIT_TEST) and mprotect() is
+ * skipped entirely; the #else branch below is only ever reached when
+ * HOST_UNIT_TEST is undefined (a non-test host build that still needs the
+ * page flipped writable), never on the actual firmware/Flash target.
  * ------------------------------------------------------------------------- */
 extern const volatile uint32_t fw_crc_stored __attribute__((weak));
 
