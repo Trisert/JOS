@@ -548,16 +548,28 @@ static osStatus_t osDelay_escape_cb(uint32_t ticks, int cmock_num_calls)
     return osOK;
 }
 
+/* Shared escape scaffold for the RTOS task-loop tests: run `task`, expecting
+   the caller-installed counting stub to longjmp out via `loop_escape` once the
+   loop has completed enough iterations. A plain return from an RTOS task loop
+   is always a failure. Callers keep their own per-iteration counter and assert
+   it afterwards — the counted call differs by design (osDelay for the
+   delay-paced beacon loop, watchdog_alive_self() kick for the event-driven RX
+   loop), but the escape contract lives here and only here. */
+static void run_task_until_escape(void (*task)(void *))
+{
+    if (setjmp(loop_escape) == 0) {
+        task(NULL);
+        TEST_FAIL_MESSAGE("RTOS task loop returned - it must not exit");
+    }
+}
+
 /* Run `task` until the third osDelay() and assert it never returned. */
 static void run_task_iterations(void (*task)(void *))
 {
     delay_calls = 0;
     osDelay_Stub(osDelay_escape_cb);
 
-    if (setjmp(loop_escape) == 0) {
-        task(NULL);
-        TEST_FAIL_MESSAGE("RTOS task loop returned - it must not exit");
-    }
+    run_task_until_escape(task);
     TEST_ASSERT_EQUAL_INT(3, delay_calls);
 }
 
@@ -588,10 +600,7 @@ void test_lora_rx_task_loops_forever_kicking_watchdog_each_iteration(void)
     watchdog_alive_self_Stub(alive_escape_cb);
 
     alive_calls = 0;
-    if (setjmp(loop_escape) == 0) {
-        lora_rx_task(NULL);
-        TEST_FAIL_MESSAGE("RTOS task loop returned - it must not exit");
-    }
+    run_task_until_escape(lora_rx_task);
     TEST_ASSERT_EQUAL_INT(3, alive_calls);
 }
 
