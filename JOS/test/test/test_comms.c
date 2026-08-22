@@ -621,7 +621,7 @@ static int alive_calls;
 static void alive_escape_cb(int cmock_num_calls)
 {
     (void)cmock_num_calls;
-    /* MUTATED: never increments, never escapes */
+    alive_calls++;
     if (alive_calls >= TASK_LOOP_ITERS) {
         longjmp(loop_escape, 1);
     }
