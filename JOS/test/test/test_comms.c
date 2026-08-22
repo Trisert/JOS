@@ -46,6 +46,8 @@
 
 #include <string.h>
 #include <setjmp.h>
+#include <unistd.h>             /* alarm(), STDERR_FILENO, _exit()           */
+#include <signal.h>             /* SIGALRM hang ceiling for task-loop tests  */
 
 /* ---------- Frame builder ---------- */
 
@@ -542,6 +544,23 @@ static int     delay_calls;
    stub threshold can never drift from the expected count. */
 #define TASK_LOOP_ITERS 3
 
+/* Hang ceiling for the task-loop tests (seconds). The #50 failure mode was
+   an escape stub that NEVER fired, so the loop spun until CI's 6 h job
+   timeout. alarm() makes that scenario fail loudly in seconds: the SIGALRM
+   handler aborts with a diagnostic naming the likely cause. */
+#define TASK_LOOP_HANG_SECS 30
+
+static void task_loop_hang_handler(int sig)
+{
+    (void)sig;
+    const char msg[] = "\nERROR: task-loop test exceeded " /* line kept short */
+        "TASK_LOOP_HANG_SECS - escape stub never fired? "
+        "(PR #50 failure mode: stub counting a call the loop never makes)\n";
+    ssize_t ignored = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)ignored;
+    _exit(2);
+}
+
 static osStatus_t osDelay_escape_cb(uint32_t ticks, int cmock_num_calls)
 {
     (void)ticks;
@@ -554,27 +573,32 @@ static osStatus_t osDelay_escape_cb(uint32_t ticks, int cmock_num_calls)
 }
 
 /* Shared escape scaffold for the RTOS task-loop tests — owns the WHOLE
-   escape contract: the setjmp/longjmp ceremony AND reset+assert of the
-   caller's per-iteration counter. The counter pointer is `int * volatile`
-   because it is read after longjmp jumped past the loop: without the
-   qualifier, non-volatile locals of frames skipped by longjmp are
-   indeterminate (C11 7.13.2.1). A plain return from an RTOS task loop is
-   always a failure. The counted call differs by design per caller (osDelay
+   escape contract:
+     - arms a SIGALRM hang ceiling, so the #50 never-fires scenario fails
+       in seconds instead of spinning to CI's 6 h job timeout;
+     - the setjmp/longjmp ceremony ("a task loop must never return" —
+       TEST_FAIL_MESSAGE catches an early return);
+     - reset + exact-count assert of the caller's per-iteration counter.
+   The counter is a file-scope static, so it stays determinate across the
+   longjmp (C11 7.13.2.1 exempts objects of static storage duration) — no
+   volatile needed. The counted call differs by design per caller (osDelay
    for the delay-paced beacon loop, watchdog_alive_self() kick for the
-   event-driven RX loop), but a stub that never fires now fails loudly:
-   run_task_until_escape() asserts exactly TASK_LOOP_ITERS iterations and
-   TEST_FAIL_MESSAGE aborts on timeout instead of spinning forever. */
-static void run_task_until_escape(void (*task)(void *), volatile int *counter)
+   event-driven RX loop); if a stub stops firing, the alarm fires instead
+   and names the failure mode. */
+static void run_task_until_escape(void (*task)(void *), int *counter)
 {
     *counter = 0;
+    (void)signal(SIGALRM, task_loop_hang_handler);
+    alarm(TASK_LOOP_HANG_SECS);
 
     if (setjmp(loop_escape) == 0) {
         task(NULL);
         TEST_FAIL_MESSAGE("RTOS task loop returned - it must not exit");
     }
 
-    /* If the escape stub were broken (never fires / wrong threshold), the
-       count would be off here instead of hanging CI for 6 hours. */
+    alarm(0); /* escaped in time - disarm the hang ceiling */
+
+    /* If the escape stub fired late or early, the count is wrong here. */
     TEST_ASSERT_EQUAL_INT(TASK_LOOP_ITERS, *counter);
 }
 
@@ -597,7 +621,7 @@ static int alive_calls;
 static void alive_escape_cb(int cmock_num_calls)
 {
     (void)cmock_num_calls;
-    alive_calls++;
+    /* MUTATED: never increments, never escapes */
     if (alive_calls >= TASK_LOOP_ITERS) {
         longjmp(loop_escape, 1);
     }
