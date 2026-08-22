@@ -86,7 +86,12 @@ static comms_tc_result_t validate(const uint8_t *f, size_t len)
 }
 
 void setUp(void)   { memset(frame_buf, 0, sizeof(frame_buf)); }
-void tearDown(void) { }
+/* Safety net: the hang ceiling must NEVER survive past its own test case.
+   The early-return path inside run_task_until_escape() longjmps into Unity
+   before alarm(0) runs, so tearDown() disarms unconditionally — otherwise a
+   still-ticking timer could kill an innocent later test with a misleading
+   "escape stub never fired" diagnostic. */
+void tearDown(void) { alarm(0); }
 
 /* ================= CRC known-answer test ================= */
 
@@ -547,15 +552,22 @@ static int     delay_calls;
 /* Hang ceiling for the task-loop tests (seconds). The #50 failure mode was
    an escape stub that NEVER fired, so the loop spun until CI's 6 h job
    timeout. alarm() makes that scenario fail loudly in seconds: the SIGALRM
-   handler aborts with a diagnostic naming the likely cause. */
+   handler aborts with a diagnostic naming the likely cause. POSIX hosts
+   only (alarm/signal) — same portability class as the Ceedling host
+   harness itself (Linux/macOS CI + dev shells). */
 #define TASK_LOOP_HANG_SECS 30
+#define STRINGIFY_(x) #x
+#define TASK_LOOP_HANG_SECS_STR STRINGIFY_(TASK_LOOP_HANG_SECS)
 
 static void task_loop_hang_handler(int sig)
 {
     (void)sig;
-    const char msg[] = "\nERROR: task-loop test exceeded " /* line kept short */
-        "TASK_LOOP_HANG_SECS - escape stub never fired? "
-        "(PR #50 failure mode: stub counting a call the loop never makes)\n";
+    /* Stringify so the message shows the real value (30), not the macro
+       name — a diagnostic you have to resolve by hand is half a diagnostic. */
+    const char msg[] = "\nERROR: task-loop test exceeded "
+        TASK_LOOP_HANG_SECS_STR
+        " s - escape stub never fired? (PR #50 failure mode: stub counting "
+        "a call the loop never makes)\n";
     ssize_t ignored = write(STDERR_FILENO, msg, sizeof(msg) - 1);
     (void)ignored;
     _exit(2);
@@ -593,6 +605,8 @@ static void run_task_until_escape(void (*task)(void *), int *counter)
 
     if (setjmp(loop_escape) == 0) {
         task(NULL);
+        /* Early return: Unity longjmps from TEST_FAIL_MESSAGE, so the
+           disarm below would be skipped - tearDown() covers that path. */
         TEST_FAIL_MESSAGE("RTOS task loop returned - it must not exit");
     }
 
