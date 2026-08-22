@@ -561,22 +561,38 @@ static void run_task_iterations(void (*task)(void *))
     TEST_ASSERT_EQUAL_INT(3, delay_calls);
 }
 
-/* lora_rx_task() now signals liveness every iteration, mirroring the other
- * monitored tasks. The loop runs three iterations before the escape stub
- * longjmps out, so queue three expectations. lora_rx_task_create() also calls
- * osThreadGetId() once to register the RX task handle with the driver ISR
- * hook (B3), and each iteration blocks on osThreadFlagsWait() (also B3), so
- * expect those calls at the start / per iteration. */
-void test_lora_rx_task_loop_delays_at_the_registered_period(void)
+/* lora_rx_task() is EVENT-DRIVEN: every iteration blocks on
+   osThreadFlagsWait() (100 ms poll granularity) and kicks the watchdog —
+   it NEVER calls osDelay(). An escape hatch counting osDelay() calls
+   therefore never fires and the test spins forever (CI 6 h timeout, both
+   x86_64 and aarch64). Escape by counting watchdog_alive_self() calls
+   instead: exactly one kick per loop iteration. */
+static int alive_calls;
+
+static void alive_escape_cb(int cmock_num_calls)
+{
+    (void)cmock_num_calls;
+    alive_calls++;
+    if (alive_calls >= 3) {
+        longjmp(loop_escape, 1);
+    }
+}
+
+/* lora_rx_task() registers its handle, then loops forever on the DIO1
+   RX_DONE flag, kicking the watchdog once per iteration. */
+void test_lora_rx_task_loops_forever_kicking_watchdog_each_iteration(void)
 {
     osThreadGetId_ExpectAndReturn(RX_TH);
-    /* Each loop iteration blocks on osThreadFlagsWait(); ignore the exact
-       call count (driven by the escape stub's 3 osDelay iterations) and just
-       return the RX_DONE flag so the loop body executes. */
+    /* Return the RX_DONE flag every iteration so the loop body runs. */
     osThreadFlagsWait_IgnoreAndReturn(LORA_RX_FLAG);
-    osDelay_Stub(osDelay_escape_cb);
-    watchdog_alive_self_Ignore();
-    run_task_iterations(lora_rx_task);
+    watchdog_alive_self_Stub(alive_escape_cb);
+
+    alive_calls = 0;
+    if (setjmp(loop_escape) == 0) {
+        lora_rx_task(NULL);
+        TEST_FAIL_MESSAGE("RTOS task loop returned - it must not exit");
+    }
+    TEST_ASSERT_EQUAL_INT(3, alive_calls);
 }
 
 /* First iteration: the task narrows its monitored period from the bootstrap
