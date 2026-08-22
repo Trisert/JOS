@@ -46,6 +46,8 @@
 
 #include <string.h>
 #include <setjmp.h>
+#include <unistd.h>             /* alarm(), STDERR_FILENO, _exit()           */
+#include <signal.h>             /* SIGALRM hang ceiling for task-loop tests  */
 
 /* ---------- Frame builder ---------- */
 
@@ -84,7 +86,12 @@ static comms_tc_result_t validate(const uint8_t *f, size_t len)
 }
 
 void setUp(void)   { memset(frame_buf, 0, sizeof(frame_buf)); }
-void tearDown(void) { }
+/* Safety net: the hang ceiling must NEVER survive past its own test case.
+   The early-return path inside run_task_until_escape() longjmps into Unity
+   before alarm(0) runs, so tearDown() disarms unconditionally — otherwise a
+   still-ticking timer could kill an innocent later test with a misleading
+   "escape stub never fired" diagnostic. */
+void tearDown(void) { alarm(0); }
 
 /* ================= CRC known-answer test ================= */
 
@@ -537,28 +544,88 @@ void test_lora_send_chunked_stages_multi_chunk_payload(void)
 static jmp_buf loop_escape;
 static int     delay_calls;
 
+/* Iterations every task-loop test must complete before escaping. Single
+   source of truth shared by the escape stubs AND the helpers below, so a
+   stub threshold can never drift from the expected count. */
+#define TASK_LOOP_ITERS 3
+
+/* Hang ceiling for the task-loop tests (seconds). The #50 failure mode was
+   an escape stub that NEVER fired, so the loop spun until CI's 6 h job
+   timeout. alarm() makes that scenario fail loudly in seconds: the SIGALRM
+   handler aborts with a diagnostic naming the likely cause. POSIX hosts
+   only (alarm/signal) — same portability class as the Ceedling host
+   harness itself (Linux/macOS CI + dev shells). */
+#define TASK_LOOP_HANG_SECS 30
+/* Two-level indirection is REQUIRED: a single-level #x would suppress
+   expansion and print the literal macro name in the diagnostic instead
+   of 30 (verified: Kilo caught exactly that on the first attempt). */
+#define STRINGIFY_(x) #x
+#define STRINGIFY(x) STRINGIFY_(x)
+#define TASK_LOOP_HANG_SECS_STR STRINGIFY(TASK_LOOP_HANG_SECS)
+
+static void task_loop_hang_handler(int sig)
+{
+    (void)sig;
+    /* Stringify so the message shows the real value (30), not the macro
+       name — a diagnostic you have to resolve by hand is half a diagnostic. */
+    const char msg[] = "\nERROR: task-loop test exceeded "
+        TASK_LOOP_HANG_SECS_STR
+        " s - escape stub never fired? (PR #50 failure mode: stub counting "
+        "a call the loop never makes)\n";
+    ssize_t ignored = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)ignored;
+    _exit(2);
+}
+
 static osStatus_t osDelay_escape_cb(uint32_t ticks, int cmock_num_calls)
 {
     (void)ticks;
     (void)cmock_num_calls;
     delay_calls++;
-    if (delay_calls >= 3) {
+    if (delay_calls >= TASK_LOOP_ITERS) {
         longjmp(loop_escape, 1);
     }
     return osOK;
 }
 
-/* Run `task` until the third osDelay() and assert it never returned. */
-static void run_task_iterations(void (*task)(void *))
+/* Shared escape scaffold for the RTOS task-loop tests — owns the WHOLE
+   escape contract:
+     - arms a SIGALRM hang ceiling, so the #50 never-fires scenario fails
+       in seconds instead of spinning to CI's 6 h job timeout;
+     - the setjmp/longjmp ceremony ("a task loop must never return" —
+       TEST_FAIL_MESSAGE catches an early return);
+     - reset + exact-count assert of the caller's per-iteration counter.
+   The counter is a file-scope static, so it stays determinate across the
+   longjmp (C11 7.13.2.1 exempts objects of static storage duration) — no
+   volatile needed. The counted call differs by design per caller (osDelay
+   for the delay-paced beacon loop, watchdog_alive_self() kick for the
+   event-driven RX loop); if a stub stops firing, the alarm fires instead
+   and names the failure mode. */
+static void run_task_until_escape(void (*task)(void *), int *counter)
 {
-    delay_calls = 0;
-    osDelay_Stub(osDelay_escape_cb);
+    *counter = 0;
+    (void)signal(SIGALRM, task_loop_hang_handler);
+    alarm(TASK_LOOP_HANG_SECS);
 
     if (setjmp(loop_escape) == 0) {
         task(NULL);
+        /* Early return: Unity longjmps from TEST_FAIL_MESSAGE, so the
+           disarm below would be skipped - tearDown() covers that path. */
         TEST_FAIL_MESSAGE("RTOS task loop returned - it must not exit");
     }
-    TEST_ASSERT_EQUAL_INT(3, delay_calls);
+
+    alarm(0); /* escaped in time - disarm the hang ceiling */
+
+    /* If the escape stub fired late or early, the count is wrong here. */
+    TEST_ASSERT_EQUAL_INT(TASK_LOOP_ITERS, *counter);
+}
+
+/* Run the beacon task until the third osDelay(); assert it never returned. */
+static void run_task_iterations(void (*task)(void *))
+{
+    osDelay_Stub(osDelay_escape_cb);
+
+    run_task_until_escape(task, &delay_calls);
 }
 
 /* lora_rx_task() is EVENT-DRIVEN: every iteration blocks on
@@ -573,7 +640,7 @@ static void alive_escape_cb(int cmock_num_calls)
 {
     (void)cmock_num_calls;
     alive_calls++;
-    if (alive_calls >= 3) {
+    if (alive_calls >= TASK_LOOP_ITERS) {
         longjmp(loop_escape, 1);
     }
 }
@@ -587,12 +654,7 @@ void test_lora_rx_task_loops_forever_kicking_watchdog_each_iteration(void)
     osThreadFlagsWait_IgnoreAndReturn(LORA_RX_FLAG);
     watchdog_alive_self_Stub(alive_escape_cb);
 
-    alive_calls = 0;
-    if (setjmp(loop_escape) == 0) {
-        lora_rx_task(NULL);
-        TEST_FAIL_MESSAGE("RTOS task loop returned - it must not exit");
-    }
-    TEST_ASSERT_EQUAL_INT(3, alive_calls);
+    run_task_until_escape(lora_rx_task, &alive_calls);
 }
 
 /* First iteration: the task narrows its monitored period from the bootstrap
