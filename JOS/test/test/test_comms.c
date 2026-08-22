@@ -556,8 +556,12 @@ static int     delay_calls;
    only (alarm/signal) — same portability class as the Ceedling host
    harness itself (Linux/macOS CI + dev shells). */
 #define TASK_LOOP_HANG_SECS 30
+/* Two-level indirection is REQUIRED: a single-level #x would suppress
+   expansion and print the literal macro name in the diagnostic instead
+   of 30 (verified: Kilo caught exactly that on the first attempt). */
 #define STRINGIFY_(x) #x
-#define TASK_LOOP_HANG_SECS_STR STRINGIFY_(TASK_LOOP_HANG_SECS)
+#define STRINGIFY(x) STRINGIFY_(x)
+#define TASK_LOOP_HANG_SECS_STR STRINGIFY(TASK_LOOP_HANG_SECS)
 
 static void task_loop_hang_handler(int sig)
 {
