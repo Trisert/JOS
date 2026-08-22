@@ -537,40 +537,53 @@ void test_lora_send_chunked_stages_multi_chunk_payload(void)
 static jmp_buf loop_escape;
 static int     delay_calls;
 
+/* Iterations every task-loop test must complete before escaping. Single
+   source of truth shared by the escape stubs AND the helpers below, so a
+   stub threshold can never drift from the expected count. */
+#define TASK_LOOP_ITERS 3
+
 static osStatus_t osDelay_escape_cb(uint32_t ticks, int cmock_num_calls)
 {
     (void)ticks;
     (void)cmock_num_calls;
     delay_calls++;
-    if (delay_calls >= 3) {
+    if (delay_calls >= TASK_LOOP_ITERS) {
         longjmp(loop_escape, 1);
     }
     return osOK;
 }
 
-/* Shared escape scaffold for the RTOS task-loop tests: run `task`, expecting
-   the caller-installed counting stub to longjmp out via `loop_escape` once the
-   loop has completed enough iterations. A plain return from an RTOS task loop
-   is always a failure. Callers keep their own per-iteration counter and assert
-   it afterwards — the counted call differs by design (osDelay for the
-   delay-paced beacon loop, watchdog_alive_self() kick for the event-driven RX
-   loop), but the escape contract lives here and only here. */
-static void run_task_until_escape(void (*task)(void *))
+/* Shared escape scaffold for the RTOS task-loop tests — owns the WHOLE
+   escape contract: the setjmp/longjmp ceremony AND reset+assert of the
+   caller's per-iteration counter. The counter pointer is `int * volatile`
+   because it is read after longjmp jumped past the loop: without the
+   qualifier, non-volatile locals of frames skipped by longjmp are
+   indeterminate (C11 7.13.2.1). A plain return from an RTOS task loop is
+   always a failure. The counted call differs by design per caller (osDelay
+   for the delay-paced beacon loop, watchdog_alive_self() kick for the
+   event-driven RX loop), but a stub that never fires now fails loudly:
+   run_task_until_escape() asserts exactly TASK_LOOP_ITERS iterations and
+   TEST_FAIL_MESSAGE aborts on timeout instead of spinning forever. */
+static void run_task_until_escape(void (*task)(void *), volatile int *counter)
 {
+    *counter = 0;
+
     if (setjmp(loop_escape) == 0) {
         task(NULL);
         TEST_FAIL_MESSAGE("RTOS task loop returned - it must not exit");
     }
+
+    /* If the escape stub were broken (never fires / wrong threshold), the
+       count would be off here instead of hanging CI for 6 hours. */
+    TEST_ASSERT_EQUAL_INT(TASK_LOOP_ITERS, *counter);
 }
 
-/* Run `task` until the third osDelay() and assert it never returned. */
+/* Run the beacon task until the third osDelay(); assert it never returned. */
 static void run_task_iterations(void (*task)(void *))
 {
-    delay_calls = 0;
     osDelay_Stub(osDelay_escape_cb);
 
-    run_task_until_escape(task);
-    TEST_ASSERT_EQUAL_INT(3, delay_calls);
+    run_task_until_escape(task, &delay_calls);
 }
 
 /* lora_rx_task() is EVENT-DRIVEN: every iteration blocks on
@@ -585,7 +598,7 @@ static void alive_escape_cb(int cmock_num_calls)
 {
     (void)cmock_num_calls;
     alive_calls++;
-    if (alive_calls >= 3) {
+    if (alive_calls >= TASK_LOOP_ITERS) {
         longjmp(loop_escape, 1);
     }
 }
@@ -599,9 +612,7 @@ void test_lora_rx_task_loops_forever_kicking_watchdog_each_iteration(void)
     osThreadFlagsWait_IgnoreAndReturn(LORA_RX_FLAG);
     watchdog_alive_self_Stub(alive_escape_cb);
 
-    alive_calls = 0;
-    run_task_until_escape(lora_rx_task);
-    TEST_ASSERT_EQUAL_INT(3, alive_calls);
+    run_task_until_escape(lora_rx_task, &alive_calls);
 }
 
 /* First iteration: the task narrows its monitored period from the bootstrap
