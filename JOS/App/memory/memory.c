@@ -160,7 +160,7 @@ int cyclic_buffer_write(const uint8_t *data, size_t len)
     if (len == 0U) {
         return 0;
     }
-    if ((data == NULL) || (len > (size_t)FRAM_SIZE) || (cb_head >= FRAM_SIZE)) {
+    if ((data == NULL) || (len > (size_t)FRAM_SIZE)) {
         return -1;
     }
 
