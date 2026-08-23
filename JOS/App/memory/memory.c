@@ -134,20 +134,51 @@ void cyclic_buffer_init(void)
     cb_head = 0;
 }
 
+/* Write one contiguous range without handing HAL_I2C_Mem_Write() a
+ * cross-chip transfer: each FM24VN10-G owns only its 16 KB window. */
+static int cyclic_buffer_write_range(uint32_t addr, const uint8_t *data, size_t len)
+{
+    while (len > 0U) {
+        const size_t to_chip_end = (size_t)(FM24VN_CHIP_SIZE -
+                                  (addr & (FM24VN_CHIP_SIZE - 1U)));
+        const size_t chunk = (len < to_chip_end) ? len : to_chip_end;
+
+        if (fram_write(addr, data, chunk) != 0) {
+            return -1;
+        }
+        addr += (uint32_t)chunk;
+        data += chunk;
+        len  -= chunk;
+    }
+    return 0;
+}
+
 int cyclic_buffer_write(const uint8_t *data, size_t len)
 {
-    if (len == 0) return 0;
+    size_t first;
 
-    /* Handle wrap-around */
-    if (cb_head + len > FRAM_SIZE) {
-        uint32_t first = FRAM_SIZE - cb_head;
-        fram_write(cb_head, data, first);
-        fram_write(0, data + first, len - first);
-        cb_head = len - first;
-    } else {
-        fram_write(cb_head, data, len);
-        cb_head += len;
+    if (len == 0U) {
+        return 0;
     }
+    if ((data == NULL) || (len > (size_t)FRAM_SIZE) || (cb_head >= FRAM_SIZE)) {
+        return -1;
+    }
+
+    /* Split once at the ring boundary, then cyclic_buffer_write_range() splits
+     * further at every physical FRAM chip boundary. Advance cb_head only after
+     * all transfers succeed: a failed I2C write must remain visible to the
+     * caller rather than silently creating a hole in the telemetry stream. */
+    first = (len < (size_t)(FRAM_SIZE - cb_head)) ? len :
+            (size_t)(FRAM_SIZE - cb_head);
+    if (cyclic_buffer_write_range(cb_head, data, first) != 0) {
+        return -1;
+    }
+    if ((len > first) &&
+        (cyclic_buffer_write_range(0U, data + first, len - first) != 0)) {
+        return -1;
+    }
+
+    cb_head = (uint32_t)((cb_head + len) % FRAM_SIZE);
     return 0;
 }
 
