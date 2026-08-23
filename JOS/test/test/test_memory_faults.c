@@ -465,4 +465,7 @@ void test_cyclic_buffer_write_rejects_a_record_larger_than_the_ring(void)
 
     TEST_ASSERT_EQUAL_INT(-1, cyclic_buffer_write(oversized, sizeof(oversized)));
     TEST_ASSERT_EQUAL_UINT32(0u, cyclic_buffer_head());
+
+    TEST_ASSERT_EQUAL_INT(-1, cyclic_buffer_write(NULL, 1u));
+    TEST_ASSERT_EQUAL_UINT32(0u, cyclic_buffer_head());
 }
