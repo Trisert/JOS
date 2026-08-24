@@ -132,12 +132,6 @@ static int laststates_log(uint8_t from, uint8_t to, uint8_t trigger,
     return 0;
 }
 
-/* ---------- Stub: watchdog kick ---------- */
-static void watchdog_kick(void)
-{
-    /* TODO: HAL_IWDG_Refresh(&hiwdg) when IWDG is configured */
-}
-
 /* ---------- State transition logic ---------- */
 static int try_transition(obw_state_t target, uint8_t trigger)
 {
@@ -371,7 +365,6 @@ static void state_machine_task(void *arg)
 
     /* 10 Hz main loop */
     for (;;) {
-        watchdog_kick();
         watchdog_alive_self();
 
         osMutexAcquire(state_mutex, osWaitForever);
