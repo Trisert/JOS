@@ -420,3 +420,52 @@ void test_laststates_write_refuses_the_write_when_the_pool_lock_fails(void)
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&entry));
     TEST_ASSERT_EQUAL_UINT32(1u, mirror()->idx);
 }
+
+
+/* A cyclic record can cross a physical 16 KB chip boundary without crossing
+ * the 64 KB ring boundary. The cyclic layer must split it into legal FRAM
+ * transfers; exposing a single cross-chip request would make the driver reject
+ * it and silently lose ordinary telemetry records. */
+void test_cyclic_buffer_write_splits_a_record_at_a_chip_boundary(void)
+{
+    static uint8_t filler[4096];
+    const uint8_t record[8] = { 0xD0u, 0xD1u, 0xD2u, 0xD3u,
+                                0xE0u, 0xE1u, 0xE2u, 0xE3u };
+    uint8_t tail[4];
+    uint8_t head[4];
+    uint32_t i;
+
+    memset(filler, 0x55, sizeof(filler));
+    fram_init();
+    cyclic_buffer_init();
+
+    for (i = 0u; i < 3u; i++) {
+        TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(filler, sizeof(filler)));
+    }
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(filler, sizeof(filler) - 4u));
+    TEST_ASSERT_EQUAL_UINT32(FRAM_CHIP_SIZE - 4u, cyclic_buffer_head());
+
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(record, sizeof(record)));
+    TEST_ASSERT_EQUAL_UINT32(FRAM_CHIP_SIZE + 4u, cyclic_buffer_head());
+    TEST_ASSERT_EQUAL_INT(0, fram_read(FRAM_CHIP_SIZE - 4u, tail, sizeof(tail)));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(FRAM_CHIP_SIZE, head, sizeof(head)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(record, tail, sizeof(tail));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(record + 4u, head, sizeof(head));
+}
+
+/* The public cyclic API accepts at most one full ring per call. Larger writes
+ * would otherwise require overwriting a range twice and make failure recovery
+ * ambiguous, so reject them before touching FRAM or advancing the cursor. */
+void test_cyclic_buffer_write_rejects_a_record_larger_than_the_ring(void)
+{
+    static uint8_t oversized[FRAM_TOTAL_SIZE + 1u];
+
+    fram_init();
+    cyclic_buffer_init();
+
+    TEST_ASSERT_EQUAL_INT(-1, cyclic_buffer_write(oversized, sizeof(oversized)));
+    TEST_ASSERT_EQUAL_UINT32(0u, cyclic_buffer_head());
+
+    TEST_ASSERT_EQUAL_INT(-1, cyclic_buffer_write(NULL, 1u));
+    TEST_ASSERT_EQUAL_UINT32(0u, cyclic_buffer_head());
+}
