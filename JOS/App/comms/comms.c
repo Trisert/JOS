@@ -7,7 +7,8 @@
 #include "sram2_parity.h"   /* SRAM2_CRITICAL_NOINIT placement (W2-3) */
 #include <string.h>
 
-/* TODO: include RadioLib headers and implement STM32 HAL wrapper */
+/* The RadioLib SX1268 driver lives in App/comms/radiolib_driver.cpp (wired in
+   PR #47): lora_*() entry points are declared below with C linkage. */
 
 /* Packet buffer sizes now live in comms.h as COMMS_MAX_PACKET /
    COMMS_BEACON_SIZE — the parity-protected SRAM2 buffers below are sized
