@@ -173,9 +173,10 @@ APP_WFLAGS := -Wundef
 # FreeRTOS, or Core/Inc/RadioLib. Those trees emit thousands of analyser
 # notes we neither own nor want to patch.
 #
-# CI gate: see `.github/workflows/build.yml` -- the `-fanalyzer` build is
-# opt-in (`make -C JOS analyzer-build`) and is not the default build because
-# the analyser roughly doubles compile time and is purely additive.
+# CI gate: always-on for every first-party build (including the default
+# `release` target and CI). The analyser roughly doubles first-party
+# compile time but emits warnings only (no -Werror globally), so the
+# firmware build stays green while surfacing findings on every run.
 APP_ANALYZER := -fanalyzer
 CFLAGS += $(INCLUDES)
 

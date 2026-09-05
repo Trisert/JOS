@@ -11,8 +11,8 @@ name: "CodeQL"
 #
 # This matches the policy that the cppcheck gate (in build.yml) already
 # implements: vendored third-party code is treated as a read-only include
-# path, never as code we own. The separate GCC `-fanalyzer` opt-in lives
-# in `JOS/Makefile` under `APP_ANALYZER` (see review PR for batch-0).
+# path, never as code we own. The GCC `-fanalyzer` gate (always-on for
+# first-party TUs) lives in `JOS/Makefile` under `APP_ANALYZER`.
 #
 # BUILD MODE: MANUAL. CodeQL's autobuild assumes a Linux-style build that it
 # can drive by spawning compilers it can recognise as clang/LLVM; an ARM
@@ -60,7 +60,7 @@ jobs:
       - name: Install ARM GCC toolchain 14.3.Rel1
         run: |
           URL="https://developer.arm.com/-/media/Files/downloads/gnu/14.3.rel1/binrel/arm-gnu-toolchain-14.3.rel1-x86_64-arm-none-eabi.tar.xz"
-          curl -sSL "$URL" -o /tmp/arm-toolchain.tar.xz
+          curl -sSfL --connect-timeout 15 --max-time 600 "$URL" -o /tmp/arm-toolchain.tar.xz
           sudo mkdir -p /opt/arm-gnu-toolchain-14.3.rel1
           sudo tar -xJf /tmp/arm-toolchain.tar.xz -C /opt/arm-gnu-toolchain-14.3.rel1 --strip-components=1
           echo "/opt/arm-gnu-toolchain-14.3.rel1/bin" >> "$GITHUB_PATH"
