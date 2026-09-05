@@ -34,7 +34,6 @@
 #include "hw_watchdog.h"
 #include "sram2_parity.h"
 #include "seu_mitigation.h"
-#include "scrub.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -199,25 +198,15 @@ int main(void)
   lora_init();
   state_machine_init();
   watchdog_monitor_init();
-  /* Boot-time SEU repair from the FRAM golden copies (W2-5, App/obsw/scrub.c):
-     restore every region registered by state_machine_init() from its
-     CRC-verified golden record before the mission logic runs. After a
-     parity-NMI reboot (W2-3) this re-establishes the last-good obsw_state; on
-     a clean first boot there is no backup yet, which is reported, not an
-     error (SCRUB_ERR_MAGIC).
-
-     ORDER IS LOAD-BEARING: this must run BEFORE seu_mitigation_init(). That
-     call snapshots the live structures into its RAM shadows, so if the FRAM
-     restore ran afterwards the two scrubbers would disagree and the RAM-shadow
-     scrubber would immediately "repair" the restored content back to the boot
-     defaults. */
-  (void)scrub_init();
-
   /* SEU mitigation (W2-5): snapshot the critical structures once their
-     owners are initialised (and once scrub_init() above has restored them),
-     so the periodic scrub has a trustworthy reference to vote against. Must
-     run after sram2_parity_init(), laststates_init(), lora_init() and
-     state_machine_init(). */
+     owners are initialised, so the periodic scrub has a trustworthy reference
+     to vote against. Must run after sram2_parity_init(), laststates_init(),
+     lora_init() and state_machine_init().
+
+     (T1.6 scrub-unify) The App/obsw/scrub.c boot-time FRAM restore that used
+     to live here is gone: seu_mitigation_init() takes the first snapshot of
+     the live RAM directly, so there is no separate "restore then re-snapshot"
+     dance and no risk of the two scrubbers racing over the live struct. */
   seu_mitigation_init();
   /* Last kick before the scheduler takes over: from here on
      watchdog_monitor_task() owns the refresh (App/obsw/watchdog.c). */
@@ -254,9 +243,12 @@ int main(void)
   }
   state_machine_task_create();
   watchdog_task_create();
-  scrub_task_create();
   lora_beacon_task_create();
   lora_rx_task_create();
+  /* (T1.6 scrub-unify) The parallel App/obsw/scrub.c FRAM-golden task is
+   * gone: only the seu_mitigation scrubber remains. It runs every 5 minutes
+   * (seu_mitigation.h SEU_SCRUB_INTERVAL_MS), is NMI-safe (PRIMASK lock),
+   * and repairs from the SRAM2 shadow - no I2C traffic, no FRAM round-trip. */
   seu_scrub_task_create();   /* low-priority RAM scrubber (W2-5) */
   /* USER CODE END RTOS_THREADS */
 
