@@ -1,0 +1,126 @@
+name: "CodeQL"
+
+# CodeQL static analysis for C/C++.
+#
+# SCOPE: first-party code ONLY -- `JOS/App` and the hand-written CubeMX
+# `JOS/Core/Src` sources. The vendored trees (STM32 HAL + CMSIS in
+# `JOS/Drivers`, FreeRTOS in `JOS/Middlewares`, vendored RadioLib headers in
+# `JOS/Core/Inc/RadioLib`) are NOT analysed; they are only on the include path
+# so first-party headers resolve, and CodeQL's path-scoped `paths-ignore`
+# excludes every TU under those trees from the analysis database.
+#
+# This matches the policy that the cppcheck gate (in build.yml) already
+# implements: vendored third-party code is treated as a read-only include
+# path, never as code we own. The GCC `-fanalyzer` gate (always-on for
+# first-party TUs) lives in `JOS/Makefile` under `APP_ANALYZER`.
+#
+# BUILD MODE: MANUAL. CodeQL's autobuild assumes a Linux-style build that it
+# can drive by spawning compilers it can recognise as clang/LLVM; an ARM
+# Cortex-M4 firmware tree cross-compiled with `arm-none-eabi-gcc` is outside
+# that model, and the include paths / defines live in JOS/Makefile. We
+# therefore build with `make -C JOS` and let CodeQL observe the resulting
+# command invocations through `CODEQL_EXTRACTOR_C_BUILD_MODE=manual` plus the
+# `actions/codeql-action/analyze` step.
+
+on:
+  push:
+    branches: [main]
+  # No base-branch filter: every pull request is gated, including ones that
+  # are stacked on another feature branch rather than targeting main directly.
+  pull_request:
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    # Pinned runner, matching build.yml: a runner-image refresh that bumps
+    # the CodeQL CLI / extractor must not silently change the gate result.
+    runs-on: ubuntu-24.04
+
+    permissions:
+      # The default `GITHUB_TOKEN` has read-only access; CodeQL needs write
+      # to upload the SARIF results to the security tab.
+      security-events: write
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c-cpp
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Install the same ARM toolchain build.yml installs. Identical URL,
+      # identical /opt path; the `echo ... >> $GITHUB_PATH` line is what
+      # the manual-build step below relies on. We do NOT set a PATH
+      # override at the step level: that would shadow this one and would
+      # silently break if the toolchain version is bumped.
+      - name: Install ARM GCC toolchain 14.3.Rel1
+        run: |
+          URL="https://developer.arm.com/-/media/Files/downloads/gnu/14.3.rel1/binrel/arm-gnu-toolchain-14.3.rel1-x86_64-arm-none-eabi.tar.xz"
+          curl -sSfL --connect-timeout 15 --max-time 600 "$URL" -o /tmp/arm-toolchain.tar.xz
+          sudo mkdir -p /opt/arm-gnu-toolchain-14.3.rel1
+          sudo tar -xJf /tmp/arm-toolchain.tar.xz -C /opt/arm-gnu-toolchain-14.3.rel1 --strip-components=1
+          echo "/opt/arm-gnu-toolchain-14.3.rel1/bin" >> "$GITHUB_PATH"
+
+      # Initialise CodeQL. `languages` matches matrix.language; `queries:
+      # security-and-quality` is the default extended pack -- the same pack
+      # CodeQL ships with `codeql init` without flags, so we are not silently
+      # narrowing the gate to a subset of checks.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+          # Vendored trees are on the include path but NEVER on the source
+          # path: never analyse STM32 HAL/CMSIS, FreeRTOS, or vendored
+          # RadioLib headers as code we own. Path-scoped `paths-ignore` is the
+          # CodeQL-native equivalent of cppcheck's
+          # `--suppress=*:$(CPPCHECK_PREFIX)Drivers/*` style exclusion:
+          # no query-pack id is ever switched off repo-wide.
+          paths-ignore:
+            - JOS/Drivers/**
+            - JOS/Middlewares/**
+            - JOS/Core/Inc/RadioLib/**
+
+      # MANUAL BUILD MODE.
+      #
+      # Why not autobuild: the C/C++ extractor in autobuild looks for an
+      # LLVM-style build it can re-invoke under its tracer. JOS/Makefile uses
+      # `arm-none-eabi-gcc`, which is a plain GCC binary that the extractor
+      # recognises but then tries to drive against the host include paths;
+      # the resulting compilation database has no useful translation units
+      # (the autobuild either invents x86 flags or produces zero records).
+      # `make -C JOS` from a single host with the pinned ARM toolchain on
+      # PATH produces the only compile-command set the extractor actually
+      # needs. We then hand those commands to the extractor by running
+      # `make` with the env vars below.
+      #
+      # The build is `release` because the default debug build emits large
+      # amounts of metadata that the analyser does not need and which slows
+      # analysis; the actual flag delta is `-O0 -g3` vs `-Os -g3`, neither of
+      # which changes the source-code view the extractor sees.
+      - name: Manual build (make -C JOS)
+        env:
+          CODEQL_EXTRACTOR_C_BUILD_MODE: manual
+          # Match build.yml:139 — the toolchain is installed into
+          # /opt/... and appended to $GITHUB_PATH so every subsequent
+          # step inherits it. We rely on that prior step, not a duplicate
+          # PATH override here: re-asserting a hardcoded path would break
+          # the moment the toolchain version is bumped.
+        run: |
+          set -euo pipefail
+          if ! command -v arm-none-eabi-gcc >/dev/null 2>&1; then
+            echo "ERROR: arm-none-eabi-gcc not on PATH; the upstream install"
+            echo "       step (matching build.yml) must have appended the"
+            echo "       toolchain to \$GITHUB_PATH before this step ran."
+            exit 1
+          fi
+          make -C JOS release
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
