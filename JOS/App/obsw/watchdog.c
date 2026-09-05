@@ -13,9 +13,9 @@
  * the *test* file includes, so App/memory/memory.c - and therefore
  * laststates_write() - is not on the link line of test_watchdog.out.
  *
- * Same opt-out idiom as scrub.h's SCRUB_NO_RTOS: derive the switch from
- * HOST_UNIT_TEST (defined for every test executable in test/project.yml)
- * instead of requiring a second -D. The *policy* below - which task is
+ * Same opt-out idiom as seu_mitigation.h's HOST_UNIT_TEST switch: derive the
+ * switch from HOST_UNIT_TEST (defined for every test executable in
+ * test/project.yml) instead of requiring a second -D. The *policy* below - which task is
  * flagged, when, and once only - is compiled and exercised on the host; only
  * the two platform back ends (Flash-backed log, scheduler suspend) become
  * no-ops there. Wiring them into the host suite needs test-side scaffolding

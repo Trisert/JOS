@@ -55,12 +55,12 @@
 
 /* FRAM layout (64 KB total):
  *   [0 .. cyclic_buffer_head)   : cyclic science-data buffer (wraps the device)
- *   [top - scrub_pool .. top)   : SEU scrub golden records (W2-5), reserved at
- *                                 the TOP and grown downward; see scrub.h
- *                                 SCRUB_FRAM_BASE. The scrub records are
- *                                 CRC-protected and reject any payload they do
- *                                 not own, so the two regions never corrupt
- *                                 each other even on a head-pointer collision.
+ *
+ * (T1.6 scrub-unify) The SEU scrub golden-record pool at the TOP of FRAM is
+ * gone with App/obsw/scrub.c: seu_mitigation stores its redundant copy in
+ * the parity-protected SRAM2 shadow pool instead, so the whole FRAM is
+ * available to the cyclic buffer. The cyclic head pointer no longer has to
+ * avoid a downward-growing scrub pool at the top.
  *
  * Compile-time guards: a zero (or non-power-of-two) chip size would make the
  * shift/mask decode below wrong and is the divide-by-zero class M1 guards

@@ -157,6 +157,11 @@ seu_scrub_task_create();
 the shadows would capture pre-init content. Commits issued before it are
 no-ops by design.
 
+(T1.6) Before T1.6 this init order also had to coordinate with a parallel
+`App/obsw/scrub.c` FRAM-golden restore (`scrub_init()`); that module was
+removed in T1.6 as redundant and the load-bearing ordering comment in
+`main.c` was deleted with it.
+
 ## 9. Verification status
 
 - `make all` builds clean with `arm-none-eabi-gcc` (no new warnings);

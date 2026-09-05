@@ -65,12 +65,10 @@ enum {
        ground (Kilo #26, comment id 3741110986). Next free value; the wire
        values above are never renumbered. */
     TRIGGER_CLOCK_FAULT     = 16,  /* RCC CSS: HSE/oscillator failure  */
-    /* SEU scrub (W2-5, App/obsw/scrub.c): the CRC-protected golden copy of a
-       critical struct in FRAM is unusable (never synced, transport failure or
-       FRAM bit flip), so the scrubber cannot repair that region. Distinct from
-       TRIGGER_SEU_SCRUB (13), which reports the RAM-shadow scrubber of
-       seu_mitigation.c. Next free value: the codes above are already on main
-       and are a ground telemetry contract, so they are never renumbered. */
+    /* (T1.6 scrub-unify) The App/obsw/scrub.c golden-FRAM scrubber is gone; this
+       trigger is therefore currently unreachable on the flight code path. It
+       stays in the wire contract because the codes above are ground telemetry
+       and are never renumbered. */
     TRIGGER_SCRUB_FAULT     = 17,  /* SEU scrub: golden FRAM record unusable */
 };
 
