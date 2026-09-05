@@ -63,7 +63,12 @@
 #define CMSIS_device_header "stm32l4xx.h"
 #endif /* CMSIS_device_header */
 
-#define configENABLE_FPU                         0
+/* M4F is present and the toolchain passes -mfpu=fpv4-sp-d16 -mfloat-abi=hard
+ * (see JOS/Makefile MCU flags), so enable lazy FPU stacking. The hardware
+ * automatically saves FPU regs only on the first FP instruction after a
+ * context switch (LSPEN, lazy stacking), keeping baseline stack frames
+ * small while still preserving FP context for sensor / math tasks. */
+#define configENABLE_FPU                         1
 #define configENABLE_MPU                         0
 
 #define configUSE_PREEMPTION                     1

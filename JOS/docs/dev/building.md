@@ -29,6 +29,32 @@ for the STM32L496VGTx target.
 HAL, FreeRTOS, RadioLib) emit warnings we do not own, and hard-failing on them
 would block the build for reasons unrelated to flight-software quality.
 
+### FPU configuration (`configENABLE_FPU = 1`)
+
+The MCU flags in `JOS/Makefile` pass `-mfpu=fpv4-sp-d16 -mfloat-abi=hard`
+because the target (STM32L496VGTx, Cortex-M4F) has a single-precision FPU and
+several first-party translation units rely on it — IMU / magnetometer / Sun
+sensor drivers in `App/aocs/`, attitude / orbit math in `App/obsw/`, and the
+payload pipelines in `App/payloads/` all use `float` intrinsics that would
+otherwise emit soft-float library calls on every multiply. Stripping `-mfpu`
+would force those calls back into software and burn Flash + cycles on every
+sample.
+
+The matching runtime switch is `configENABLE_FPU = 1` in
+`JOS/Core/Inc/FreeRTOSConfig.h`. FreeRTOS uses it to enable **lazy FPU
+stacking** (the `LSPEN` bit in the FPCCR): an interrupted task's FP registers
+are saved only on the *first* FP instruction the new task executes, not on
+every context switch. The baseline exception frame stays the 72 B Cortex-M4
+size and grows by up to ~32 B only when the running task actually touches the
+FPU — which is exactly the sensor / math tasks listed above, not the idle
+loop. The watchdog task's 1 KiB stack comment in `App/obsw/watchdog.c`
+accounts for the worst-case exception frame with FPU state on top.
+
+Do **not** remove `-mfpu` / `-mfloat-abi` from the Makefile or set
+`configENABLE_FPU` back to 0 without auditing every first-party TU for FP
+usage: a silent regression here is a build that links but produces wrong
+sensor data at runtime.
+
 ## Static analysis (cppcheck)
 
 ### Running it
