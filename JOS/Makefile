@@ -165,6 +165,18 @@ CFLAGS += $(C_WARNFLAGS) -ffunction-sections -fdata-sections
 # below); the vendored HAL/CMSIS/FreeRTOS trees rely on undefined macros in
 # #if by design and would drown the build in warnings.
 APP_WFLAGS := -Wundef
+
+# GCC static analyser (-fanalyzer). Scoped to first-party translation units
+# (App/ and the hand-written Core/Src) ONLY: applied via APP_ANALYZER +
+# per-target CFLAGS override below, never inherited by the vendored trees
+# in Drivers/STM32L4xx_HAL_Driver, Drivers/CMSIS, Middlewares/Third_Party/
+# FreeRTOS, or Core/Inc/RadioLib. Those trees emit thousands of analyser
+# notes we neither own nor want to patch.
+#
+# CI gate: see `.github/workflows/build.yml` -- the `-fanalyzer` build is
+# opt-in (`make -C JOS analyzer-build`) and is not the default build because
+# the analyser roughly doubles compile time and is purely additive.
+APP_ANALYZER := -fanalyzer
 CFLAGS += $(INCLUDES)
 
 ##############################################################################
@@ -712,6 +724,20 @@ $(BUILD_DIR)/%.o: %.c
 # the vendored HAL/CMSIS/FreeRTOS headers pulled in by Core/Src, Drivers/ and
 # Middlewares/ use undefined macros in #if by design.
 $(filter $(BUILD_DIR)/App/%,$(C_OBJECTS)): CFLAGS += $(APP_WFLAGS)
+
+# GCC -fanalyzer is scoped to the first-party translation units ONLY. We
+# extend it to App/ AND the hand-written CubeMX Core/Src sources — anything
+# under Core/Src is project-owned code (HAL callbacks, the FreeRTOS hooks,
+# the syscalls/errno shim). The filter is exact: vendored trees
+# (Drivers/STM32L4xx_HAL_Driver, Drivers/CMSIS, Middlewares/Third_Party/,
+# Core/Inc/RadioLib) live under different prefixes and are never matched,
+# so the analyser never runs on them.
+#
+# Scope: $(C_OBJECTS) is the C-translation-unit list, which is a flat set
+# of $(BUILD_DIR)/<src-path>.o entries. The two filters below cover
+# `$(BUILD_DIR)/App/%.o` and `$(BUILD_DIR)/Core/Src/%.o`; nothing else.
+$(filter $(BUILD_DIR)/App/%,$(C_OBJECTS)): CFLAGS += $(APP_ANALYZER)
+$(filter $(BUILD_DIR)/Core/Src/%,$(C_OBJECTS)): CFLAGS += $(APP_ANALYZER)
 
 ##############################################################################
 # Compile C++ files
