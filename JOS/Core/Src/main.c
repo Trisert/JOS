@@ -728,7 +728,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull  = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(LoRa_NRST_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /* DEPLOY_CMD (PC6): output PP, idle LOW (burn driver off; T1.7 owns firing). */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
@@ -756,6 +756,11 @@ static void MX_GPIO_Init(void)
      5-15 which share handlers. SYSCFG clock is enabled manually: CubeMX does
      not know about this line yet (JOS.ioc resync pending, see ICD doc). */
   __HAL_RCC_SYSCFG_CLK_ENABLE();
+  /* Route EXTI0 to PORT B (reset default is PORT A): without this, DIO1 on
+     PB0 would never fire. Direct register write: CubeMX does not know this
+     line (see ICD doc), and HAL offers no GPIO_Init-level port selector. */
+  SYSCFG->EXTICR[0] = (SYSCFG->EXTICR[0] & ~SYSCFG_EXTICR1_EXTI0)
+                     | SYSCFG_EXTICR1_EXTI0_PB;
   GPIO_InitStruct.Pin  = GPIO_PIN_0;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
