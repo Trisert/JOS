@@ -33,7 +33,7 @@ nel load path; workaround usato solo per il lancio, non cambia l'esito.
 
 Risultato (estratto di `/tmp/ceedling_run.log`):
 
-```
+```text
 👟 Building Test Executables
 ----------------------------
 Linking test_bad_region.out...       Linking test_boot_crc.out...
@@ -132,7 +132,7 @@ ripetere 3 run e riportare media ± deviazione.
 | `.data` (inizializzate, RAM) | — | — | idem |
 | `.bss` (zero-init, RAM) | — | — | idem |
 | Flash totale occupata | — | — | idem |
-| Stack riservato (`_estack - _Min_Stack_Size`) | — | — | da `STM32L496VGTX_FLASH.ld` |
+| Stack riservato (`_Min_Stack_Size` = 0x400, 1 KiB) | — | — | da `STM32L496VGTX_FLASH.ld:47` (`_estack` = top RAM, lo stack cresce verso il basso per `_Min_Stack_Size` byte) |
 
 Procedura: scaricare l'artefatto `firmware-build` (ELF) dall'ultima run
 GitHub Actions su `main`, eseguire localmente `arm-none-eabi-size
@@ -186,14 +186,18 @@ Versioni **pinnate** del job `build.yml` (riferimento autorevole:
 ## Comandi di verifica (riproducibili)
 
 ```sh
-# 1) Suite Ceedling
-cd JOS/test && ceedling clobber && ceedling test:all   # exit 0, 144/144 PASS
+set -o pipefail  # mantiene l'exit code di ceedling attraverso il tee
+# 1) Suite Ceedling (se la ceedling di sistema lamenta
+#    "uninitialized constant Thor", prefissa ogni invocazione con
+#    ruby -I<gemdir>/gems/thor-1.5.0/lib -- vedi nota operativa in §2)
+cd JOS/test && ceedling clobber && ceedling test:all 2>&1 | tee /tmp/ceedling_run.log   # exit 0, 144/144 PASS
 
 # 2) Conteggio warning/errore build host
 grep -cE "warning:|error:" /tmp/ceedling_run.log        # 0
 
-# 3) Size firmware (richiede artifact CI; NON eseguibile qui)
-arm-none-eabi-size --format=sysv build/JOS.elf
+# 3) Size firmware (richiede artifact CI; NON eseguibile qui;
+#    si torna alla root: il path è relativo al repo, NON a JOS/test)
+cd ../.. && arm-none-eabi-size --format=sysv JOS/build/JOS.elf
 
 # 4) Versioni CI: leggere .github/workflows/build.yml, sezioni
 #    "Install pinned cppcheck" / "Install ARM GCC toolchain 14.3.Rel1"
