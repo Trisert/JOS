@@ -135,8 +135,9 @@ long STM32Hal::pulseIn(uint32_t pin, uint32_t state, RadioLibTime_t timeout)
     return -1L;   /* not used for SX1268 */
 }
 
-/* ----------------- Multiplexed reset/deploy pin ---------------- */
-/* SPF pag 95: LoRa_NRST shares one OBC GPIO with DEPLOY_SENSE.     */
+/* ----------------- Dedicated reset pin (ICD) ---------------- */
+/* ICD: LoRa_NRST is a dedicated OBC GPIO (COMMS conn pin 5). DEPLOY_SENSE  */
+/* lives on its own pin (COMMS conn pin 4); no multiplexing.               */
 
 void STM32Hal::configureResetPin(void)
 {
@@ -161,7 +162,7 @@ void STM32Hal::pulseReset(void)
 
 void STM32Hal::releaseResetPin(void)
 {
-    /* Leave as output HIGH so the line is never floating. DEPLOY_SENSE read
-       must temporarily reconfigure this pin as input (see comms side). */
+    /* Dedicated NRST line: leave as output HIGH so it is never floating.
+       DEPLOY_SENSE is a separate pin and needs no reconfiguration here. */
     HAL_GPIO_WritePin(LoRa_NRST_GPIO_Port, LoRa_NRST_Pin, GPIO_PIN_SET);
 }

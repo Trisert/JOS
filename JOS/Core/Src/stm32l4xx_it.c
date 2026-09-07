@@ -241,16 +241,19 @@ void SysTick_Handler(void)
 
 /* SX1268 DIO1 (GPIO_INT) ISR hook. The radio raises DIO1 on TX_DONE / RX_DONE;
    we forward it to the RadioLib driver, which signals the waiting TX or RX task
-   via osThreadFlagsSet (ISR-safe). The pin/EXTI line is a placeholder until the
-   OBC schematic maps GPIO_INT to a real EXTI-capable GPIO (see B0). */
+   via osThreadFlagsSet (ISR-safe). ICD: GPIO_INT = PB0 / EXTI0
+   (see docs/ICD_OBC_COMMS.md and radiolib_hal.h — keep in sync; literals are
+   used here to avoid pulling the C++ RadioLib HAL into this ISR TU). */
 extern void lora_on_dio1_irq(void);
+
+void EXTI0_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0);
+}
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    /* GPIO_INT_Pin is defined in radiolib_hal.h (placeholder until B0 closes).
-       Mirror its current value here to avoid pulling the RadioLib HAL into this
-       ISR translation unit. Keep the two in sync. */
-    if (GPIO_Pin == GPIO_PIN_13) {
+    if (GPIO_Pin == GPIO_PIN_0) {
         lora_on_dio1_irq();
     }
 }

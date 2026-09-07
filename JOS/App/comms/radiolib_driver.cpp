@@ -42,7 +42,8 @@ extern "C" void lora_rx_task_register(osThreadId_t handle)
 
 extern "C" int lora_init(void)
 {
-    /* Bind virtual pins to real CubeMX GPIO (placeholders until OBC schematic). */
+    /* Bind virtual pins to the ICD GPIO (docs/ICD_OBC_COMMS.md). DEPLOY_CMD /
+       DEPLOY_SENSE init levels live in MX_GPIO_Init(); their sequence is T1.7. */
     radioHal.addPin(RLIB_NSS,   CS_TTC_GPIO_Port,     CS_TTC_Pin);
     radioHal.addPin(RLIB_RESET, LoRa_NRST_GPIO_Port,  LoRa_NRST_Pin);
     radioHal.addPin(RLIB_DIO1,  GPIO_INT_GPIO_Port,   GPIO_INT_Pin);

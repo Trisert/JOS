@@ -714,7 +714,57 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* OBC<->COMMS ICD pin init (software-defined, see docs/ICD_OBC_COMMS.md and
+     App/comms/radiolib_hal.h — keep the two in sync; literals are used here
+     because radiolib_hal.h is C++ and this is a C TU).
+     CubeMX-generated code above already enables GPIOA/B/C clocks and parks PA4
+     LOW; CS_TTC is active-low so it is de-asserted FIRST thing here. */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);   /* CS_TTC idle HIGH */
 
+  /* LoRa_NRST (PC5, = LoRa_NRST_GPIO_Port/LoRa_NRST_Pin in radiolib_hal.h):
+     output PP, idle HIGH (SX1268 reset is active-low). */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5, GPIO_PIN_SET);
+  GPIO_InitStruct.Pin   = GPIO_PIN_5;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(LoRa_NRST_GPIO_Port, &GPIO_InitStruct);
+
+  /* DEPLOY_CMD (PC6): output PP, idle LOW (burn driver off; T1.7 owns firing). */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
+  GPIO_InitStruct.Pin   = GPIO_PIN_6;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* LoRa_Busy (PC4): plain input, SX1268 drives push-pull, NOPULL. */
+  GPIO_InitStruct.Pin  = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* DEPLOY_SENSE (PC7): input + PULLUP. Antenna switch is Norm_Open to GND:
+     stowed = LOW, deployed = floating -> HIGH. */
+  GPIO_InitStruct.Pin  = GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* GPIO_INT/DIO1 (PB0): EXTI0 rising edge. EXTI line 0 is free (no EXTI in
+     JOS.ioc) and has a DEDICATED vector (EXTI0_IRQHandler), unlike lines
+     5-15 which share handlers. SYSCFG clock is enabled manually: CubeMX does
+     not know about this line yet (JOS.ioc resync pending, see ICD doc). */
+  __HAL_RCC_SYSCFG_CLK_ENABLE();
+  GPIO_InitStruct.Pin  = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  /* EXTI priority 5 == configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY: the DIO1
+     ISR calls osThreadFlagsSet (ISR-safe FreeRTOS API), which requires a
+     priority at or below the syscall ceiling (numerically >= 5). */
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
