@@ -476,10 +476,12 @@ int state_machine_set_beacon_interval(uint32_t interval_ms)
     obsw_state.beacon_interval_override = interval_ms;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
+    osMutexRelease(state_mutex);
     /* Write-through to the FRAM golden copy (W2-5): without it a reboot
      * would re-snapshot the previous cadence and the scrubber would repair
-     * this commanded change away. Outside the SEU lock (blocking I2C). */
+     * this commanded change away. Outside the SEU lock AND outside
+     * state_mutex: blocking I2C (up to 1 s timeout) must never wedge the
+     * OBSW main thread. Best effort, never rolls back. */
     (void)seu_mitigation_sync(SEU_REGION_OBSW_STATE);
-    osMutexRelease(state_mutex);
     return 0;
 }
