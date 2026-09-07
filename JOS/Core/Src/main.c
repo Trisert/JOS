@@ -765,10 +765,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-  /* EXTI priority 5 == configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY: the DIO1
-     ISR calls osThreadFlagsSet (ISR-safe FreeRTOS API), which requires a
-     priority at or below the syscall ceiling (numerically >= 5). */
-  HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
+  /* EXTI prio 80 (NVIC value) == configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY (5)
+     shifted by (8 - configPRIO_BITS) = 5 << 4: HAL_NVIC_SetPriority takes the
+     NVIC encoding, NOT the library number. The DIO1 ISR calls osThreadFlagsSet
+     (ISR-safe FreeRTOS API), which requires a priority at or below the syscall
+     ceiling (numerically >= 80); 5 here would misconfigure it into the
+     kernel-critical zone and assert on first interrupt. */
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 80, 0);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
   /* USER CODE END MX_GPIO_Init_2 */
 }

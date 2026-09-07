@@ -16,7 +16,7 @@ sotto sono **software-defined** su package LQFP100 (STM32L496VGTx).
 |---|---|---|---|---|---|
 | CS_TTC | PA4 | 14 | NSS | OUT PP | HIGH (idle, active-low) |
 | LoRa_Busy | PC4 | 13 | BUSY | IN, NOPULL | — |
-| GPIO_INT | PB0 / **EXTI0** | 15 | DIO1/IRQ | IN, EXTI rising | NVIC prio 5, enabled |
+| GPIO_INT | PB0 / **EXTI0** | 15 | DIO1/IRQ | IN, EXTI rising | NVIC prio 80 (= lib 5 << 4), enabled |
 | LoRa_NRST | PC5 | 5 | NRESET | OUT PP | HIGH (idle, active-low) |
 | DEPLOY_CMD | PC6 | 3 | — (burn driver) | OUT PP | LOW (driver off) |
 | DEPLOY_SENSE | PC7 | 4 | — (switch) | IN, **PULLUP** | — |
@@ -58,13 +58,14 @@ HW/T1.7) + pull-up interno OBC:
 ## EXTI / NVIC / FreeRTOS
 
 - `GPIO_MODE_IT_RISING` su PB0, `__HAL_RCC_SYSCFG_CLK_ENABLE()` manuale,
-  `HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0)` + `EnableIRQ`, handler
+  `HAL_NVIC_SetPriority(EXTI0_IRQn, 80, 0)` + `EnableIRQ`, handler
   `EXTI0_IRQHandler()` → `HAL_GPIO_EXTI_IRQHandler()` → `HAL_GPIO_EXTI_Callback()`
   → `lora_on_dio1_irq()` (in `Core/Src/stm32l4xx_it.c`, sezione USER CODE).
-- Priorità **5** = `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY` (4 bit, gruppo 4 —
-  grouping fissato in codice da `HAL_MspInit()`, non generato da CubeMX):
-  a livello del syscall ceiling (numericamente ≥ 5), quindi la ISR può chiamare
-  API FreeRTOS ISR-safe (`osThreadFlagsSet`).
+- Priorità **80** (valore NVIC) = `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY` (5)
+  shiftato di (8 − `configPRIO_BITS`) = 5 << 4 (gruppo 4, già fissato da `HAL_Init()`):
+  al syscall ceiling (numericamente ≥ 80), quindi la ISR può chiamare
+  API FreeRTOS ISR-safe (`osThreadFlagsSet`). Mai scrivere qui il numero library 5:
+  `HAL_NVIC_SetPriority` vuole l'encoding NVIC.
 - **Assunzione DIO1/BUSY sempre pilotati**: SX1268 pilota DIO1 e BUSY in push-pull,
   quindi NOPULL lato OBC è valido (nessun floating in esercizio normale).
 
