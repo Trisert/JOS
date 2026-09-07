@@ -726,13 +726,19 @@ $(BUILD_DIR)/%.o: %.c
 # Middlewares/ use undefined macros in #if by design.
 $(filter $(BUILD_DIR)/App/%,$(C_OBJECTS)): CFLAGS += $(APP_WFLAGS)
 
-# GCC -fanalyzer is scoped to the first-party translation units ONLY. We
-# extend it to App/ AND the hand-written CubeMX Core/Src sources — anything
-# under Core/Src is project-owned code (HAL callbacks, the FreeRTOS hooks,
-# the syscalls/errno shim). The filter is exact: vendored trees
+# GCC -fanalyzer is scoped to the first-party C translation units ONLY. We
+# extend it to App/ AND the CubeMX Core/Src sources — mostly project-owned
+# code (HAL callbacks, the FreeRTOS hooks, the syscalls/errno shim), though
+# a few files there are ST/CubeMX-generated (system_stm32l4xx.c,
+# stm32l4xx_it/msp.c, freertos.c): the analyser runs over them too, which
+# is harmless (warnings-only) but disclosed here so nobody mistakes the
+# gate for a pure first-party signal. The filter is exact: vendored trees
 # (Drivers/STM32L4xx_HAL_Driver, Drivers/CMSIS, Middlewares/Third_Party/,
 # Core/Inc/RadioLib) live under different prefixes and are never matched,
 # so the analyser never runs on them.
+#
+# C only: the two C++ TUs (App/comms radiolib_driver/hal) are NOT covered
+# by APP_ANALYZER — extending the filter to CXX_OBJECTS is future work.
 #
 # Scope: $(C_OBJECTS) is the C-translation-unit list, which is a flat set
 # of $(BUILD_DIR)/<src-path>.o entries. The two filters below cover
