@@ -377,10 +377,11 @@ osThreadId_t watchdog_task_create(void)
         .name       = "watchdog",
         /* 1 KB, not 512 B: this task calls dual_bank_boot_complete() ->
            ls_append(), whose Flash-programming path stacks HAL frames and can
-           take an exception frame (up to 104 B with FPU, +32 B on top of the
-           72 B Cortex-M4 baseline frame because lazy stacking saves the FP
-           regs only on first FP use; see configENABLE_FPU=1 in
-           FreeRTOSConfig.h) on top (W2-2 review). The 128-byte LastStates
+           take an exception frame on top (W2-2 review): 32 B baseline
+           Cortex-M frame, 104 B extended frame with FP state (+72 B, saved
+           via lazy stacking; see FreeRTOSConfig.h). No task uses the FPU
+           today, so the extended frame is not currently reachable — the
+           1 KiB margin stays conservative regardless. The 128-byte LastStates
            entry itself is no longer a local (see dual_bank.c), but the margin
            is still needed. */
         .stack_size = 256 * 4,

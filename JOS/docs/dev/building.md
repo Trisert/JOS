@@ -32,28 +32,21 @@ would block the build for reasons unrelated to flight-software quality.
 ### FPU configuration (`configENABLE_FPU = 1`)
 
 The MCU flags in `JOS/Makefile` pass `-mfpu=fpv4-sp-d16 -mfloat-abi=hard`
-because the target (STM32L496VGTx, Cortex-M4F) has a single-precision FPU and
-several first-party translation units rely on it — IMU / magnetometer / Sun
-sensor drivers in `App/aocs/`, attitude / orbit math in `App/obsw/`, and the
-payload pipelines in `App/payloads/` all use `float` intrinsics that would
-otherwise emit soft-float library calls on every multiply. Stripping `-mfpu`
-would force those calls back into software and burn Flash + cycles on every
-sample.
+because the target (STM32L496VGTx, Cortex-M4F) has a single-precision FPU.
+No first-party translation unit uses `float`/`double` today (`aocs.c` is a
+no-op placeholder), so nothing currently emits FP instructions.
 
-The matching runtime switch is `configENABLE_FPU = 1` in
-`JOS/Core/Inc/FreeRTOSConfig.h`. FreeRTOS uses it to enable **lazy FPU
-stacking** (the `LSPEN` bit in the FPCCR): an interrupted task's FP registers
-are saved only on the *first* FP instruction the new task executes, not on
-every context switch. The baseline exception frame stays the 72 B Cortex-M4
-size and grows by up to ~32 B only when the running task actually touches the
-FPU — which is exactly the sensor / math tasks listed above, not the idle
-loop. The watchdog task's 1 KiB stack comment in `App/obsw/watchdog.c`
-accounts for the worst-case exception frame with FPU state on top.
+The matching `configENABLE_FPU = 1` in `JOS/Core/Inc/FreeRTOSConfig.h` is
+inert on this port: the ARM_CM4F port enables VFP / lazy stacking
+(`ASPEN`/`LSPEN`) unconditionally in `port.c`, and the config flag is only
+honored by the ARMv8-M ports. It is kept at 1 (= upstream default) for
+upstream alignment / future-proofing. Should FP code land one day, its
+context is already preserved via lazy stacking (baseline 32 B exception
+frame, 104 B extended with FP state). The watchdog task's 1 KiB stack
+comment in `App/obsw/watchdog.c` accounts for the worst-case frame on top.
 
-Do **not** remove `-mfpu` / `-mfloat-abi` from the Makefile or set
-`configENABLE_FPU` back to 0 without auditing every first-party TU for FP
-usage: a silent regression here is a build that links but produces wrong
-sensor data at runtime.
+Do **not** remove `-mfpu` / `-mfloat-abi` from the Makefile without reason:
+they match the silicon and cost nothing while no FP code exists.
 
 ## Static analysis (cppcheck)
 

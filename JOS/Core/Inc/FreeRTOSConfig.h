@@ -63,11 +63,11 @@
 #define CMSIS_device_header "stm32l4xx.h"
 #endif /* CMSIS_device_header */
 
-/* M4F is present and the toolchain passes -mfpu=fpv4-sp-d16 -mfloat-abi=hard
- * (see JOS/Makefile MCU flags), so enable lazy FPU stacking. The hardware
- * automatically saves FPU regs only on the first FP instruction after a
- * context switch (LSPEN, lazy stacking), keeping baseline stack frames
- * small while still preserving FP context for sensor / math tasks. */
+/* NOTE: on this ARM_CM4F port, configENABLE_FPU is inert: vPortEnableVFP()
+ * (ASPEN/LSPEN) runs unconditionally in port.c, and the config flag is only
+ * honored by the ARMv8-M ports. It is kept at 1 (= upstream default) for
+ * upstream alignment / future-proofing. No first-party TU in the tree uses
+ * float/double today, so no task currently touches the FPU. */
 #define configENABLE_FPU                         1
 #define configENABLE_MPU                         0
 
