@@ -96,10 +96,11 @@ void bms_set_soc_stub(uint8_t soc)
     obsw_state.bms.soc = soc;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
-    /* (T1.6 scrub-unify) The FRAM write-through that used to live in the
-     * parallel App/obsw/scrub.c is gone: seu_mitigation_commit() already
-     * re-snapshots the RAM shadow, and the periodic seu_scrub_task repairs
-     * from the shadow without any extra golden copy in FRAM. */
+    /* Write-through to the FRAM golden copy (W2-5): the SRAM2 shadow alone
+     * does not survive a reboot, so without this the next boot would
+     * re-snapshot the post-reset RAM instead of the truth committed here.
+     * Outside the SEU lock: blocking I2C, task context only. */
+    (void)seu_mitigation_sync(SEU_REGION_OBSW_STATE);
 }
 
 void *state_machine_critical_region(size_t *len)
@@ -212,11 +213,14 @@ static int try_transition(obw_state_t target, uint8_t trigger)
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
 
-    /* (T1.6 scrub-unify) No FRAM write-through here any more: the parallel
-     * App/obsw/scrub.c was removed in favour of seu_mitigation, whose shadow
-     * copy in SRAM2 is what feeds the repair. The CRC-protected FRAM golden
-     * copy is therefore optional, and the blocking I2C transaction that
-     * scrub_sync() used to perform is gone too. */
+    /* Write-through the committed transition to the FRAM golden copy (W2-5),
+     * so the backup never lags the truth and the state survives a
+     * parity-NMI reboot (the SRAM2 shadow alone would not). Deliberately
+     * OUTSIDE the SEU lock: the sync runs a blocking I2C transaction and
+     * must not hold off the scrub task. A FRAM failure is counted in
+     * seu_stats_t.fram_errors but does not roll back the committed
+     * transition. */
+    (void)seu_mitigation_sync(SEU_REGION_OBSW_STATE);
     return 0;
 }
 
@@ -253,10 +257,13 @@ static int enter_safe_state(uint8_t trigger)
     obsw_state.current_state = STATE_CRIT;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
-    /* (T1.6 scrub-unify) scrub_sync() (FRAM golden write-through) is gone:
-     * seu_mitigation_commit() already refreshed the SRAM2 shadow that the
-     * periodic scrubber repairs from, so containment survives the reboot
-     * without any extra FRAM transaction. */
+    /* Containment must survive a reboot, and the SRAM2 shadow provably does
+     * not (sram2_parity_init() erases it at every boot): persist the forced
+     * CRIT through to the FRAM golden copy, so seu_mitigation_init()
+     * restores CRIT - not the pre-fault state - after a parity-NMI reset.
+     * Best effort: a FRAM failure is counted, never rolled back; the
+     * containment in RAM stands either way. */
+    (void)seu_mitigation_sync(SEU_REGION_OBSW_STATE);
 
     /* Containment is in force either way - only the evidence is missing. */
     return SAFE_STATE_FORCED;
@@ -392,9 +399,9 @@ void state_machine_init(void)
     obsw_state.current_state            = STATE_OFF;
     obsw_state.beacon_interval_override = 0U;
 
-    /* (T1.6 scrub-unify) The parallel App/obsw/scrub.c was removed in favour
+    /* (T1.6 scrub-unify) The retired parallel scrubber was removed in favour
      * of seu_mitigation, which auto-registers obsw_state in its own init via
-     * state_machine_critical_region(). No manual scrub_register() call is
+     * state_machine_critical_region(). No manual region registration is
      * needed here any more. */
 
     /* seu_mitigation_init() runs after this function and takes the first
@@ -469,11 +476,10 @@ int state_machine_set_beacon_interval(uint32_t interval_ms)
     obsw_state.beacon_interval_override = interval_ms;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
-    /* (T1.6 scrub-unify) scrub_sync() (FRAM write-through) is gone: the
-     * RAM shadow was already refreshed inside the commit above, and the
-     * periodic seu_scrub_task repairs from that shadow without any extra
-     * FRAM round-trip. A commanded cadence change is therefore committed
-     * with a single in-RAM memcpy. */
+    /* Write-through to the FRAM golden copy (W2-5): without it a reboot
+     * would re-snapshot the previous cadence and the scrubber would repair
+     * this commanded change away. Outside the SEU lock (blocking I2C). */
+    (void)seu_mitigation_sync(SEU_REGION_OBSW_STATE);
     osMutexRelease(state_mutex);
     return 0;
 }

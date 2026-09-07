@@ -203,10 +203,11 @@ int main(void)
      to vote against. Must run after sram2_parity_init(), laststates_init(),
      lora_init() and state_machine_init().
 
-     (T1.6 scrub-unify) The App/obsw/scrub.c boot-time FRAM restore that used
-     to live here is gone: seu_mitigation_init() takes the first snapshot of
-     the live RAM directly, so there is no separate "restore then re-snapshot"
-     dance and no risk of the two scrubbers racing over the live struct. */
+     (T1.6 scrub-unify, persistence restored) The retired App/obsw/scrub.c
+     boot-time FRAM restore now lives inside seu_mitigation_init(): after
+     the first snapshot of the live RAM, CRC-valid FRAM golden records are
+     restored over the golden regions (never garbage), so a single
+     scrubber owns the live struct with no race. */
   seu_mitigation_init();
   /* Last kick before the scheduler takes over: from here on
      watchdog_monitor_task() owns the refresh (App/obsw/watchdog.c). */
@@ -245,10 +246,12 @@ int main(void)
   watchdog_task_create();
   lora_beacon_task_create();
   lora_rx_task_create();
-  /* (T1.6 scrub-unify) The parallel App/obsw/scrub.c FRAM-golden task is
-   * gone: only the seu_mitigation scrubber remains. It runs every 5 minutes
-   * (seu_mitigation.h SEU_SCRUB_INTERVAL_MS), is NMI-safe (PRIMASK lock),
-   * and repairs from the SRAM2 shadow - no I2C traffic, no FRAM round-trip. */
+  /* (T1.6 scrub-unify, persistence restored) The retired App/obsw/scrub.c
+   * FRAM-golden task is folded into seu_mitigation: the scrub task still
+   * runs every 5 minutes (seu_mitigation.h SEU_SCRUB_INTERVAL_MS) and
+   * repairs from the SRAM2 shadow, while commit write-through
+   * (seu_mitigation_sync, task context) and the boot-time FRAM restore in
+   * seu_mitigation_init() carry the last-good image across a reboot. */
   seu_scrub_task_create();   /* low-priority RAM scrubber (W2-5) */
   /* USER CODE END RTOS_THREADS */
 

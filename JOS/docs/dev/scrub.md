@@ -6,6 +6,16 @@ la protezione SEU del W2-5 ora è fornita interamente da
 `Core/Src/seu_mitigation.c`. Vedi [`seu_mitigation.md`](seu_mitigation.md)
 per il design canonico.
 
+> **Correzione persistenza (review PR #58)**: la golden-copy in FRAM non era
+> ridondante — era l'unica gamba a sopravvivere al reboot (lo shadow SRAM2
+> è `NOINIT` e viene azzerato a ogni boot). Il write-through
+> (`seu_mitigation_sync()`, dopo ogni commit in task context) e il restore
+> al boot (`seu_fram_restore_all()` in `seu_mitigation_init()`, solo record
+> con magic/lunghezza/CRC validi, mai garbage) sono stati ripristinati
+> **dentro** `seu_mitigation` — stesso formato wire e stessa geometria slot
+> del pool rimosso — senza resuscitare `scrub.c`. Il commento in
+> `state_machine.c` che sosteneva il contrario è stato corretto.
+
 ## Cosa c'era qui
 
 Il modulo rimosso implementava un *write-through* verso una copia "golden"
@@ -37,9 +47,10 @@ Tre task in volo coprivano la stessa protezione sullo stesso oggetto
 (3-way vote + escalation policy + lock PRIMASK NMI-safe + RTC backup
 register counter), copre più regioni (OBSW_STATE + LastStates + 3 comms
 TOUCH) ed è già ampiamente coperto da test (`test_laststates.c`,
-`test_memory_faults.c`, `test_boot_policy.c`). Il golden-copy in FRAM
-era ridondante: la shadow SRAM2 è già la copia trusted che la task
-periodica usa per riparare, e la parity hardware copre la shadow stessa.
+`test_memory_faults.c`, `test_boot_policy.c`). La golden-copy in FRAM è
+stata reintegrata dentro `seu_mitigation` (vedi nota di stato in cima):
+la shadow SRAM2 da sola non sopravvive al reboot, quindi senza
+write-through + restore al boot lo stato CRIT pre-reboot andrebbe perso.
 
 In più, `main.c` riportava un commento *load-bearing* che documentava
 l'ordine obbligatorio `scrub_init()` → `seu_mitigation_init()` per
@@ -68,5 +79,6 @@ boot-init/FRAM-CRC-reject/transport-failure/invalid-args) è stato rimosso
 perché testava un modulo che non esiste più. La logica equivalente
 (copy-in-shadow, vote, repair) è già coperta da `test_laststates.c`,
 `test_memory_faults.c` e `test_boot_policy.c` sotto il nome canonico.
-Suite Ceedling post-refactor: 144 → 9 test eseguibili (test_scrub.out
-rimosso); tutti i restanti passano, exit code 0.
+Suite Ceedling post-refactor: 144 → 135 test eseguibili (`test_scrub.out`
+rimosso con i suoi 9 test); tutti i restanti passano, exit code 0
+(`ceedling test:all`: TESTED 135, PASSED 135, FAILED 0).

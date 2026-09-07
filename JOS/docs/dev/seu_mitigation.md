@@ -20,14 +20,19 @@ init).
 
 ## 1. Redundancy layout
 
-For every region scrubbed with the *golden* policy there are three copies of
-the truth, in three different places, so a single upset can never outvote the
-other two:
+For every region scrubbed with the *golden* policy there are three RAM copies
+of the truth voting every pass, plus one non-volatile leg that carries the
+last committed truth across a reboot (the SRAM2 shadow alone cannot: it is
+`NOLOAD` and `sram2_parity_init()` erases it at every boot):
 
 ```
 live object        SRAM2 (.sram2) or SRAM1, owned by the application
 shadow copy        SRAM2 shadow pool (.sram2_noinit), a different address
 reference CRC-32   SRAM1, inside the module's region table
+golden record      FRAM (FeRAM, non-volatile): CRC-32-protected copy per
+                   region id at the top of FRAM (see `seu_mitigation.h`
+                   `SEU_FRAM_*`), written through by `seu_mitigation_sync()`
+                   after every task-context commit, restored at init
 ```
 
 The shadow pool is `NOLOAD`: the SRAM2 hardware erase performed by
@@ -63,7 +68,7 @@ cannot look like a double corruption), then decides with interrupts enabled:
 | match | differ | the shadow was hit | shadow rebuilt from live |
 | differ | match | the live object was hit | **live rewritten from the shadow** |
 | differ | differ, live == shadow | the CRC word was hit | reference CRC recomputed |
-| differ | differ, live != shadow | unrecoverable | `.sram2` objects restored from the Flash load image via `sram2_restore_from_image()`; otherwise recorded and left alone |
+| differ | differ, live != shadow | unrecoverable | recorded, live left alone; containment (recorded reset up to the reset budget, then forced `STATE_CRIT`) for `SEU_ESCALATE_SAFE_STATE` regions — the Flash load image is deliberately NOT written back (it holds compile-time defaults that would mask the fault) |
 
 Before any rewrite the module re-checks, under the lock, that the live object
 still matches the snapshot it voted on. A legitimate update that raced the
@@ -86,10 +91,19 @@ seu_mitigation_lock();                              /* PRIMASK, NMI-safe */
 obsw_state.current_state = target;
 (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
 seu_mitigation_unlock();
+(void)seu_mitigation_sync(SEU_REGION_OBSW_STATE);   /* FRAM write-through */
 ```
 
-Call sites today: `state_machine.c` (transition, beacon override, BMS stub)
-and `memory.c` (`laststates_write()` index advance). The lock is PRIMASK based
+`commit()` is SRAM-only (safe under the lock and on the NMI / fault path);
+`sync()` performs the blocking FRAM write-through, so it runs in task
+context **outside** the lock. Without the sync the next boot re-snapshots
+the post-reset RAM instead of this truth.
+
+Call sites today: `state_machine.c` (transition + sync, beacon override +
+sync, BMS stub + sync, forced containment + sync) and `memory.c`
+(`laststates_write()` index advance — commit only, because that path also
+runs on the parity NMI where I2C is forbidden; the LastStates mirror is
+re-scanned from Flash at every boot anyway). The lock is PRIMASK based
 rather than `taskENTER_CRITICAL()` because `laststates_write()` is also called
 from the parity NMI, where the FreeRTOS critical-section assertion would spin
 forever.
@@ -126,11 +140,12 @@ Build-time knobs (`seu_mitigation.h`): `SEU_SCRUB_INTERVAL_MS`,
 ## 7. API
 
 ```c
-void         seu_mitigation_init(void);            /* snapshot + arm         */
+void         seu_mitigation_init(void);            /* snapshot + FRAM restore */
 osThreadId_t seu_scrub_task_create(void);          /* periodic scrub task    */
 int          seu_mitigation_register_region(seu_region_id_t id, void *addr,
                                             size_t len, seu_policy_t policy);
-int          seu_mitigation_commit(seu_region_id_t id);   /* after a write   */
+int          seu_mitigation_commit(seu_region_id_t id);   /* SRAM snap, NMI-safe */
+int          seu_mitigation_sync(seu_region_id_t id);     /* FRAM write-through  */
 int          seu_mitigation_scrub_once(void);      /* forced pass (TC/test)  */
 void         seu_mitigation_get_stats(seu_stats_t *out);  /* telemetry       */
 uint32_t     seu_mitigation_event_count(void);
@@ -148,19 +163,25 @@ laststates_init();
 lora_init();
 state_machine_init();
 watchdog_monitor_init();
-seu_mitigation_init();    /* snapshots what the calls above produced  (W2-5) */
+seu_mitigation_init();    /* snapshot, then FRAM-golden restore      (W2-5) */
 ...
 seu_scrub_task_create();
 ```
 
 `seu_mitigation_init()` must run after the owners are initialised, otherwise
-the shadows would capture pre-init content. Commits issued before it are
-no-ops by design.
+the shadows would capture pre-init content — and after `fram_init()`, because
+the restore reads the golden records over I2C. Commits issued before it are
+no-ops by design. A golden record that fails magic / length / CRC is never
+restored (first boot, FRAM upset, wrapped cyclic write): the registration
+snapshot stands, and the triple-disagreement rule (§3) still refuses to
+invent a truth when no two legs agree.
 
 (T1.6) Before T1.6 this init order also had to coordinate with a parallel
 `App/obsw/scrub.c` FRAM-golden restore (`scrub_init()`); that module was
-removed in T1.6 as redundant and the load-bearing ordering comment in
-`main.c` was deleted with it.
+removed in T1.6 and its write-through (`scrub_sync`) plus boot restore
+(`scrub_init`) were folded into `seu_mitigation_sync()` /
+`seu_fram_restore_all()` (same wire format, same slot geometry), so one
+scrubber owns the live struct with no race.
 
 ## 9. Verification status
 
@@ -182,3 +203,8 @@ removed in T1.6 as redundant and the load-bearing ordering comment in
 - A missing `seu_mitigation_commit()` at a new write site would make the
   scrubber revert that write. New mutators of a golden region must follow the
   contract in §4.
+- The FRAM write-through is best effort: a failed `sync()` is counted in
+  `seu_stats_t.fram_errors` but never rolls back the SRAM commit, so a
+  reboot before the next successful sync still loses the update. A
+  `commit()` without a `sync()` (the NMI path in `memory.c`) is invisible
+  across a reboot by design.
