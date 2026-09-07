@@ -77,7 +77,10 @@ void HAL_MspInit(void)
   HAL_NVIC_SetPriority(PendSV_IRQn, 15, 0);
 
   /* USER CODE BEGIN MspInit 1 */
-
+  /* NVIC priority grouping 4 (4-bit preemption, 0-bit subpriority): fixes the
+     grouping assumed by EXTI0 prio 5 == configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY
+     (JOS.ioc declares PRIORITYGROUP_4 but emits no call, so set it in code). */
+  HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
   /* USER CODE END MspInit 1 */
 }
 
