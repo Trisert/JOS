@@ -86,7 +86,7 @@ Ceedling operations completed in 4.71 seconds
 
 L'opzione `-Werror` promuove ogni warning diagnostico a errore di
 compilazione; la build `ceedling test:all` sarebbe quindi **fallita
-all'atto del linking** se anche un solo warning fosse stato emesso.
+in compilazione** se anche un solo warning fosse stato emesso.
 Il rebuild pulito (`ceedling clobber && ceedling test:all`) ha
 completato senza errori e con exit 0.
 
@@ -136,9 +136,9 @@ ripetere 3 run e riportare media ± deviazione.
 
 Procedura: scaricare l'artefatto `firmware-build` (ELF) dall'ultima run
 GitHub Actions su `main`, eseguire localmente `arm-none-eabi-size
---format=sysv build/JOS.elf` (sysv per avere tutte le sezioni, berserk
-per il solo riepilogo); budget come da `docs/dev/hardening.md`
-(512 KiB riservati al firmware su 1 MiB totali).
+--format=sysv build/JOS.elf` (sysv per avere tutte le sezioni, berkeley
+per il solo riepilogo); budget 512 KiB riservati al firmware su 1 MiB
+totali (`JOS/STM32L496VGTX_FLASH.ld:54`, `JOS/docs/arch/README.md:63`).
 
 ### 3.3 High-water stack per task
 
@@ -151,6 +151,9 @@ per il solo riepilogo); budget come da `docs/dev/hardening.md`
 | `cloud` | — | — | — | idem |
 | `aocs` | — | — | — | idem |
 | `rx` (LoRa) | — | — | — | idem |
+| `lora_beacon` | — | — | — | idem |
+| `watchdog_monitor` | — | — | — | idem |
+| `seu_scrub` (cfr. `seu_mitigation.c`) | — | — | — | idem |
 
 Procedura: aggiungere in una build di qualifica (NON flight) il log
 periodico di `uxTaskGetStackHighWaterMark(NULL)` su ciascun task
