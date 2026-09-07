@@ -765,13 +765,14 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-  /* EXTI prio 80 (NVIC value) == configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY (5)
-     shifted by (8 - configPRIO_BITS) = 5 << 4: HAL_NVIC_SetPriority takes the
-     NVIC encoding, NOT the library number. The DIO1 ISR calls osThreadFlagsSet
-     (ISR-safe FreeRTOS API), which requires a priority at or below the syscall
-     ceiling (numerically >= 80); 5 here would misconfigure it into the
-     kernel-critical zone and assert on first interrupt. */
-  HAL_NVIC_SetPriority(EXTI0_IRQn, 80, 0);
+  /* EXTI prio 5 == configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY: HAL_NVIC_SetPriority
+     takes the LOGICAL preemption priority (0-15) and encodes it internally
+     (NVIC_EncodePriority + NVIC_SetPriority shift << 4 with GROUP_4), so the
+     register ends up 0x50 = 80 = exactly the syscall ceiling. Do NOT pass 80
+     here: it would be masked to 0 = highest priority = FreeRTOS assert on the
+     first DIO1 interrupt. The DIO1 ISR calls osThreadFlagsSet (ISR-safe API),
+     legal at ceiling level. */
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
   /* USER CODE END MX_GPIO_Init_2 */
 }
