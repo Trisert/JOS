@@ -21,6 +21,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 /* USER CODE BEGIN Includes */
+#include "stm32l4xx_hal_dma.h"
 
 /* USER CODE END Includes */
 
@@ -41,6 +42,11 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
+/* SPI2 DMA handles (SPF v3 3.6.4.2: FRAM on SPI2). DMA1 Ch4 = RX / Ch5 = TX
+ * is the STM32L4 CSELR mapping for SPI2; it does not collide with the SPI1
+ * radio DMA (DMA1 Ch2/Ch3, feat/dma-spi1-sx1268). */
+DMA_HandleTypeDef hdma_spi2_tx;
+DMA_HandleTypeDef hdma_spi2_rx;
 
 /* USER CODE END PV */
 
@@ -328,7 +334,54 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef* hspi)
   else if(hspi->Instance==SPI2)
   {
     /* USER CODE BEGIN SPI2_MspInit 0 */
-
+    /* DMA for SPI2 (SPF v3 3.6.4.2: FRAM DMA). STM32L496 uses channel-based
+     * DMA (not F-series streams): DMA1 Channel4 = SPI2_RX, Channel5 = SPI2_TX.
+     * Request IDs: DMA_REQUEST_SPI2_RX = 13 / TX = 14 exist in
+     * stm32l4xx_hal_dma.h but sit inside `#if defined(DMAMUX1)` *and*
+     * `#if defined(STM32L4P5xx) || defined(STM32L4Q5xx)` - verified: this
+     * build defines STM32L496xx and the L496 device header provides no DMAMUX1,
+     * so the macros are unavailable and the numeric IDs are used, with the
+     * macro preferred automatically if a future CMSIS exposes it. Without
+     * DMAMUX1, HAL_DMA_Init programs the value into DMA1_CSELR.
+     * Transfers currently use polling (see memory.c); the DMA path is
+     * configured and linked here, IRQs left disabled like the SPI1 radio DMA. */
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    hdma_spi2_tx.Instance = DMA1_Channel5;
+#ifdef DMA_REQUEST_SPI2_TX
+    hdma_spi2_tx.Init.Request = DMA_REQUEST_SPI2_TX;
+#else
+    hdma_spi2_tx.Init.Request = 14U;   /* DMA_REQUEST_SPI2_TX */
+#endif
+    hdma_spi2_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    hdma_spi2_tx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_spi2_tx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_spi2_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_spi2_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_spi2_tx.Init.Mode = DMA_NORMAL;
+    hdma_spi2_tx.Init.Priority = DMA_PRIORITY_VERY_HIGH;
+    if (HAL_DMA_Init(&hdma_spi2_tx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    __HAL_LINKDMA(hspi, hdmatx, hdma_spi2_tx);
+    hdma_spi2_rx.Instance = DMA1_Channel4;
+#ifdef DMA_REQUEST_SPI2_RX
+    hdma_spi2_rx.Init.Request = DMA_REQUEST_SPI2_RX;
+#else
+    hdma_spi2_rx.Init.Request = 13U;   /* DMA_REQUEST_SPI2_RX */
+#endif
+    hdma_spi2_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_spi2_rx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_spi2_rx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_spi2_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_spi2_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_spi2_rx.Init.Mode = DMA_NORMAL;
+    hdma_spi2_rx.Init.Priority = DMA_PRIORITY_VERY_HIGH;
+    if (HAL_DMA_Init(&hdma_spi2_rx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    __HAL_LINKDMA(hspi, hdmarx, hdma_spi2_rx);
     /* USER CODE END SPI2_MspInit 0 */
     /* Peripheral clock enable */
     __HAL_RCC_SPI2_CLK_ENABLE();

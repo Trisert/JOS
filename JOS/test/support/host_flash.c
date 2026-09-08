@@ -1,6 +1,6 @@
 /* ---------------------------------------------------------------------------
  * host_flash.c - host emulation of the STM32L4 internal Flash LastStates pool
- *                and of the FM24VN10-G FRAM bank behind hi2c2.
+ *                and of the FM24VN10-G FRAM bank behind hspi2 (SPI2).
  *
  * Why a memory mapping and not a plain array:
  *
@@ -55,8 +55,13 @@ uintptr_t flash_base = HOST_FLASH_LASTSTATES_BASE;
 
 /* ---------- emulated devices ---------- */
 
-/* memory.c declares `extern I2C_HandleTypeDef hi2c2;`; provide the object. */
-I2C_HandleTypeDef hi2c2;
+/* memory.c declares `extern SPI_HandleTypeDef hspi2;`; provide the object. */
+SPI_HandleTypeDef hspi2;
+
+/* Port objects for the FRAM chip-selects (fakes/main.h declares them). */
+GPIO_TypeDef gpioa_obj = { 0 };
+GPIO_TypeDef gpiob_obj = { 1 };
+GPIO_TypeDef gpioc_obj = { 2 };
 
 static uint8_t *pool;                       /* mapped at POOL_BASE */
 static uint8_t  fram[4 * 16 * 1024];        /* 4 x FM24VN10-G = 64 KB */
@@ -66,7 +71,20 @@ static uint32_t erase_count;
 static uint32_t program_count;
 static uint32_t unlock_count;
 static uint32_t lock_count;
-static uint16_t last_i2c_dev_addr;
+static uint32_t last_spi_chip;
+
+/* Per-CS-assertion SPI transaction state (see the FRAM double below). */
+#define FRAM_SPI_OP_WREN   0x06u
+#define FRAM_SPI_OP_WRITE  0x02u
+#define FRAM_SPI_OP_READ   0x03u
+#define FRAM_CHIP_SIZE     (16U * 1024U)
+#define FRAM_NO_CHIP       0xFFu
+static uint8_t  spi_selected = FRAM_NO_CHIP;   /* chip under CS, or FRAM_NO_CHIP */
+static uint8_t  spi_op;
+static uint16_t spi_addr;
+static uint16_t spi_data_len;
+static int      spi_hdr_done;
+static int      spi_wel[4];
 
 /* Injected program failure (see host_flash_fail_program_after). */
 static int      fail_program_armed;
@@ -148,7 +166,15 @@ void host_flash_reset(void)
     fail_program_armed     = 0;
     fail_program_countdown = 0u;
 
-    last_i2c_dev_addr = 0xFFFFu;
+    last_spi_chip = 0xFFFFFFFFu;
+
+    /* No transaction may span a reset: park every CS and clear the latches. */
+    spi_selected = FRAM_NO_CHIP;
+    spi_op       = 0u;
+    spi_addr     = 0u;
+    spi_data_len = 0u;
+    spi_hdr_done = 0;
+    spi_wel[0] = spi_wel[1] = spi_wel[2] = spi_wel[3] = 0;
 }
 
 const uint8_t *host_flash_pool(void)      { return pool; }
@@ -158,7 +184,7 @@ uint32_t host_flash_program_count(void)   { return program_count; }
 uint32_t host_flash_unlock_count(void)    { return unlock_count; }
 uint32_t host_flash_lock_count(void)      { return lock_count; }
 int      host_flash_is_unlocked(void)     { return flash_unlocked; }
-uint16_t host_flash_last_i2c_addr(void)   { return last_i2c_dev_addr; }
+uint32_t host_flash_last_spi_chip(void)  { return last_spi_chip; }
 
 void host_flash_fail_program_after(uint32_t successes)
 {
@@ -266,80 +292,166 @@ HAL_StatusTypeDef HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *pEraseInit, uint32_t
     return HAL_OK;
 }
 
-/* ---------- HAL I2C (FRAM) ---------- */
+/* ---------- GPIO + HAL SPI (FRAM) ---------- */
 
 /* ---------------------------------------------------------------------------
- * FM24VN10-G device addressing.
+ * FM24VN10-G SPI framing.
  *
- * The device select byte is 1 0 1 0 A2 A1 A0 R/W, i.e. 7-bit addresses
- * 0x50..0x53 for the four chips on the OBC. Every STM32 HAL I2C entry point
- * takes the address *already shifted left by one* (the 8-bit form), so the
- * legal values arriving here are 0xA0, 0xA2, 0xA4 and 0xA6 with the R/W bit
- * clear.
+ * One GPIO chip-select per die (see fakes/main.h FRAM_CSx_*): CS0 = PA4,
+ * CS1 = PB0, CS2 = PB1, CS3 = PC13. A transaction is everything between CS
+ * fall and CS rise:
  *
- * The unshifted 7-bit values are rejected on purpose: passing 0x50 to the real
- * HAL puts 0x28 on the bus and talks to nothing (or to the wrong device).
- * Accepting both forms here would hide exactly that class of defect.
+ *   WREN : 0x06 alone                                           -> latches WEL
+ *   WRITE: 0x02 + addr_hi + addr_lo + data bytes                -> needs WEL,
+ *            which the part clears when CS rises again
+ *   READ : 0x03 + addr_hi + addr_lo, then HAL_SPI_Receive clocks data out
+ *
+ * Strictness is deliberate, mirroring the old I2C double (which rejected raw
+ * 7-bit addresses so a shifted-address defect could not hide):
+ *   - a transfer with no CS asserted fails;
+ *   - a WRITE without a preceding WREN fails (the part ignores it);
+ *   - a single transaction addressing past the end of its 16 KB die fails
+ *     (each FM24VN10-G owns only its 16 KB window; the flight driver must
+ *     split at chip boundaries, exactly as the cyclic layer does).
  * ------------------------------------------------------------------------- */
-#define FRAM_I2C_ADDR_FIRST  0xA0u          /* 7-bit 0x50 << 1 */
-#define FRAM_I2C_ADDR_LAST   0xA6u          /* 7-bit 0x53 << 1 */
-#define FRAM_CHIP_SIZE       (16U * 1024U)
 
-static int fram_index(uint16_t dev_addr, uint16_t mem_addr, uint16_t size, size_t *out)
+static int fram_cs_decode(GPIO_TypeDef *port, uint16_t pin, uint8_t *chip)
 {
-    size_t chip;
+    if (port == FRAM_CS0_GPIO_Port && pin == FRAM_CS0_Pin)      { *chip = 0u; return 0; }
+    if (port == FRAM_CS1_GPIO_Port && pin == FRAM_CS1_Pin)      { *chip = 1u; return 0; }
+    if (port == FRAM_CS2_GPIO_Port && pin == FRAM_CS2_Pin)      { *chip = 2u; return 0; }
+    if (port == FRAM_CS3_GPIO_Port && pin == FRAM_CS3_Pin)      { *chip = 3u; return 0; }
+    return -1;
+}
 
-    last_i2c_dev_addr = dev_addr;
+void HAL_GPIO_WritePin(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin, GPIO_PinState PinState)
+{
+    uint8_t chip;
 
-    if ((dev_addr & 0x01u) != 0u) {
-        return -1;                            /* R/W bit must be clear */
+    if (fram_cs_decode(GPIOx, GPIO_Pin, &chip) != 0) {
+        return;   /* not a FRAM CS line: nothing emulated behind it */
     }
-    if (dev_addr < FRAM_I2C_ADDR_FIRST || dev_addr > FRAM_I2C_ADDR_LAST) {
+    if (PinState == GPIO_PIN_RESET) {
+        /* CS fall opens a transaction. */
+        spi_selected = chip;
+        spi_op       = 0u;
+        spi_addr     = 0u;
+        spi_data_len = 0u;
+        spi_hdr_done = 0;
+        last_spi_chip = chip;
+    } else {
+        /* CS rise closes it; a completed WRITE consumes the WEL. */
+        if (spi_selected == chip && spi_hdr_done && spi_op == FRAM_SPI_OP_WRITE) {
+            spi_wel[chip] = 0;
+        }
+        if (spi_selected == chip) {
+            spi_selected = FRAM_NO_CHIP;
+        }
+    }
+}
+
+GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin)
+{
+    (void)GPIOx;
+    (void)GPIO_Pin;
+    return GPIO_PIN_SET;   /* CS lines idle high; nothing else is modelled */
+}
+
+/* Parse the 3-byte header (opcode + 16-bit address) of a READ/WRITE
+ * transaction. Returns 0 on success, -1 when the frame is not one. */
+static int spi_parse_header(const uint8_t *pData, uint16_t size)
+{
+    if (size < 3u) {
         return -1;
     }
-
-    chip = (size_t)((dev_addr - FRAM_I2C_ADDR_FIRST) >> 1);
-
-    if (((size_t)mem_addr + size) > FRAM_CHIP_SIZE) {
-        return -1;                            /* would cross a chip boundary */
+    if (pData[0] != FRAM_SPI_OP_READ && pData[0] != FRAM_SPI_OP_WRITE) {
+        return -1;
     }
-
-    *out = (chip * FRAM_CHIP_SIZE) + mem_addr;
+    spi_op       = pData[0];
+    spi_addr     = (uint16_t)(((uint16_t)pData[1] << 8) | pData[2]);
+    spi_data_len = 0u;
+    spi_hdr_done = 1;
     return 0;
 }
 
-HAL_StatusTypeDef HAL_I2C_Mem_Read(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
-                                   uint16_t MemAddress, uint16_t MemAddSize,
-                                   uint8_t *pData, uint16_t Size, uint32_t Timeout)
+/* Payload bounds of the open transaction against its 16 KB die. */
+static int spi_payload_fits(uint16_t extra)
 {
-    size_t index;
+    return ((uint32_t)spi_addr + spi_data_len + extra) <= FRAM_CHIP_SIZE;
+}
 
+HAL_StatusTypeDef HAL_SPI_Transmit(SPI_HandleTypeDef *hspi, const uint8_t *pData,
+                                   uint16_t Size, uint32_t Timeout)
+{
     (void)Timeout;
-    if (hi2c == NULL || pData == NULL || MemAddSize != I2C_MEMADD_SIZE_16BIT) {
+
+    if (hspi == NULL || (Size != 0u && pData == NULL)) {
         return HAL_ERROR;
     }
-    if (fram_index(DevAddress, MemAddress, Size, &index) != 0) {
-        return HAL_ERROR;
+    if (spi_selected == FRAM_NO_CHIP) {
+        return HAL_ERROR;                     /* clocking with no CS asserted */
+    }
+    if (Size == 0u) {
+        return HAL_OK;
+    }
+    if (!spi_hdr_done) {
+        /* First frame of the transaction: standalone WREN or READ/WRITE
+         * header (the header may arrive with the first payload bytes in one
+         * frame, so fall through to the payload path below). */
+        if (Size == 1u && pData[0] == FRAM_SPI_OP_WREN) {
+            spi_wel[spi_selected] = 1;
+            spi_op       = FRAM_SPI_OP_WREN;
+            spi_hdr_done = 1;
+            return HAL_OK;
+        }
+        if (spi_parse_header(pData, Size) != 0) {
+            return HAL_ERROR;
+        }
+        if (spi_op == FRAM_SPI_OP_WRITE && !spi_wel[spi_selected]) {
+            return HAL_ERROR;                 /* WRITE without WREN */
+        }
+        pData += 3u;
+        Size  -= 3u;
+    } else if (spi_op != FRAM_SPI_OP_WRITE) {
+        return HAL_ERROR;                     /* data phase of a READ/WREN */
+    }
+    if (Size == 0u) {
+        return HAL_OK;
+    }
+    if (spi_op != FRAM_SPI_OP_WRITE || !spi_payload_fits(Size)) {
+        return HAL_ERROR;                     /* would cross a chip boundary */
     }
 
-    memcpy(pData, &fram[index], Size);
+    memcpy(&fram[(size_t)spi_selected * FRAM_CHIP_SIZE + spi_addr + spi_data_len],
+           pData, Size);
+    spi_data_len += Size;
     return HAL_OK;
 }
 
-HAL_StatusTypeDef HAL_I2C_Mem_Write(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
-                                    uint16_t MemAddress, uint16_t MemAddSize,
-                                    uint8_t *pData, uint16_t Size, uint32_t Timeout)
+HAL_StatusTypeDef HAL_SPI_Receive(SPI_HandleTypeDef *hspi, uint8_t *pData,
+                                  uint16_t Size, uint32_t Timeout)
 {
-    size_t index;
-
     (void)Timeout;
-    if (hi2c == NULL || pData == NULL || MemAddSize != I2C_MEMADD_SIZE_16BIT) {
+
+    if (hspi == NULL || (Size != 0u && pData == NULL)) {
         return HAL_ERROR;
     }
-    if (fram_index(DevAddress, MemAddress, Size, &index) != 0) {
-        return HAL_ERROR;
+    if (spi_selected == FRAM_NO_CHIP) {
+        return HAL_ERROR;                     /* clocking with no CS asserted */
+    }
+    if (Size == 0u) {
+        return HAL_OK;
+    }
+    if (!spi_hdr_done || spi_op != FRAM_SPI_OP_READ) {
+        return HAL_ERROR;                     /* read with no READ header */
+    }
+    if (!spi_payload_fits(Size)) {
+        return HAL_ERROR;                     /* would cross a chip boundary */
     }
 
-    memcpy(&fram[index], pData, Size);
+    memcpy(pData,
+           &fram[(size_t)spi_selected * FRAM_CHIP_SIZE + spi_addr + spi_data_len],
+           Size);
+    spi_data_len += Size;
     return HAL_OK;
 }

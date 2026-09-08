@@ -7,7 +7,7 @@
  *      symbols that App/obsw/boot_crc.c references.
  *   2. Flash / FRAM doubles (host_flash.c) - emulate the STM32L4 internal
  *      Flash pool that App/memory/memory.c writes LastStates entries into,
- *      plus the FM24VN10 FRAM behind HAL_I2C_Mem_*.
+ *      plus the FM24VN10 FRAM behind HAL_SPI_Transmit/Receive (SPI2).
  *
  * Only the test files and the support files include this header; no flight
  * source is aware of it.
@@ -119,9 +119,10 @@ int host_flash_is_unlocked(void);
  * erased). Reset by host_flash_reset(). */
 void host_flash_fail_program_after(uint32_t successes);
 
-/* Last I2C device address the code under test handed to HAL_I2C_Mem_Read/Write
- * (0xFFFF after host_flash_reset()). The HAL takes the 8-bit, already shifted
- * address, so a correct FM24VN10-G access is 0xA0/0xA2/0xA4/0xA6. */
-uint16_t host_flash_last_i2c_addr(void);
+/* Last FRAM die the code under test selected via its chip-select line
+ * (0..3, 0xFFFFFFFF after host_flash_reset()). One CS per die replaces the
+ * old I2C device-select byte: a correct access asserts exactly one CS for
+ * exactly one transaction. */
+uint32_t host_flash_last_spi_chip(void);
 
 #endif /* HOST_SUPPORT_H */

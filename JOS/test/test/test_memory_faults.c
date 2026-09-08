@@ -5,7 +5,7 @@
  * FRAM round trips). This file covers what happens when something goes
  * wrong, which is the half that matters in flight:
  *
- *   - an I2C transfer the FM24VN10-G cannot serve (a chip-boundary crossing)
+ *   - an SPI transfer the FM24VN10-G cannot serve (a chip-boundary crossing)
  *     must be reported, not silently truncated;
  *   - the 64 KB FRAM cyclic buffer must wrap correctly, splitting the record
  *     across the end of the bank;
@@ -129,7 +129,7 @@ void test_fram_write_reports_a_transfer_crossing_a_chip_boundary(void)
     fram_init();
 
     TEST_ASSERT_EQUAL_INT(-1, fram_write(FRAM_CHIP_SIZE - 4u, payload, sizeof(payload)));
-    TEST_ASSERT_EQUAL_HEX16(0xA0u, host_flash_last_i2c_addr());  /* chip 0, shifted */
+    TEST_ASSERT_EQUAL_UINT32(0u, host_flash_last_spi_chip());  /* chip 0 selected */
 }
 
 void test_fram_read_reports_a_transfer_crossing_a_chip_boundary(void)
@@ -140,7 +140,7 @@ void test_fram_read_reports_a_transfer_crossing_a_chip_boundary(void)
     memset(buf, 0xC3, sizeof(buf));
 
     TEST_ASSERT_EQUAL_INT(-1, fram_read(FRAM_CHIP_SIZE - 4u, buf, sizeof(buf)));
-    TEST_ASSERT_EQUAL_HEX16(0xA0u, host_flash_last_i2c_addr());
+    TEST_ASSERT_EQUAL_UINT32(0u, host_flash_last_spi_chip());
     TEST_ASSERT_EQUAL_HEX8(0xC3u, buf[0]);   /* nothing was handed back */
 }
 

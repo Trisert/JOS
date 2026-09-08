@@ -6,8 +6,9 @@
  * only the handful of HAL types, constants and prototypes that the modules
  * under test actually reference:
  *
- *     App/memory/memory.c -> HAL_I2C_Mem_Read/Write, HAL_FLASH_Program,
- *                            HAL_FLASHEx_Erase, HAL_FLASH_Unlock/Lock
+ *     App/memory/memory.c -> HAL_SPI_Transmit/Receive, HAL_GPIO_WritePin,
+ *                            HAL_FLASH_Program, HAL_FLASHEx_Erase,
+ *                            HAL_FLASH_Unlock/Lock
  *     App/comms/comms.c   -> SPI_HandleTypeDef hspi1, NVIC_SystemReset()
  *     App/obsw/watchdog.c -> (nothing beyond the types below)
  *
@@ -38,32 +39,63 @@ typedef enum {
     HAL_TIMEOUT = 0x03
 } HAL_StatusTypeDef;
 
-/* ---------- I2C (FM24VN10-G FRAM behind hi2c2) ---------- */
+/* ---------- SPI (FM24VN10-G FRAM behind hspi2, SPF v3 3.6.4.2) ---------- */
 typedef struct {
     uint32_t instance;   /* opaque on the host */
-} I2C_HandleTypeDef;
+} SPI_HandleTypeDef;
 
-#define I2C_MEMADD_SIZE_8BIT   0x00000001U
-#define I2C_MEMADD_SIZE_16BIT  0x00000010U
+HAL_StatusTypeDef HAL_SPI_Transmit(SPI_HandleTypeDef *hspi, const uint8_t *pData,
+                                   uint16_t Size, uint32_t Timeout);
+HAL_StatusTypeDef HAL_SPI_Receive(SPI_HandleTypeDef *hspi, uint8_t *pData,
+                                  uint16_t Size, uint32_t Timeout);
 
-HAL_StatusTypeDef HAL_I2C_Mem_Read(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
-                                   uint16_t MemAddress, uint16_t MemAddSize,
-                                   uint8_t *pData, uint16_t Size, uint32_t Timeout);
+/* ---------- GPIO (FRAM software chip-selects) ----------
+ * Opaque port objects: the code under test only passes them through to
+ * HAL_GPIO_WritePin, whose double decodes (port, pin) into a chip index. */
+typedef struct {
+    uint32_t id;         /* opaque on the host */
+} GPIO_TypeDef;
 
-HAL_StatusTypeDef HAL_I2C_Mem_Write(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
-                                    uint16_t MemAddress, uint16_t MemAddSize,
-                                    uint8_t *pData, uint16_t Size, uint32_t Timeout);
+extern GPIO_TypeDef gpioa_obj;
+extern GPIO_TypeDef gpiob_obj;
+extern GPIO_TypeDef gpioc_obj;
+#define GPIOA (&gpioa_obj)
+#define GPIOB (&gpiob_obj)
+#define GPIOC (&gpioc_obj)
 
-/* ---------- Peripheral handle types (W2-6) ----------
+#define GPIO_PIN_0   0x0001U
+#define GPIO_PIN_1   0x0002U
+#define GPIO_PIN_4   0x0010U
+#define GPIO_PIN_13  0x2000U
+
+typedef enum {
+    GPIO_PIN_RESET = 0,
+    GPIO_PIN_SET   = 1
+} GPIO_PinState;
+
+void HAL_GPIO_WritePin(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin, GPIO_PinState PinState);
+GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin);
+
+/* FRAM chip-select mapping, mirrored from Core/Inc/main.h (single source of
+ * truth for the flight build; duplicated here because the flight main.h drags
+ * in the HAL and cannot compile on the host). */
+#define FRAM_CS0_Pin         GPIO_PIN_4
+#define FRAM_CS0_GPIO_Port   GPIOA
+#define FRAM_CS1_Pin         GPIO_PIN_0
+#define FRAM_CS1_GPIO_Port   GPIOB
+#define FRAM_CS2_Pin         GPIO_PIN_1
+#define FRAM_CS2_GPIO_Port   GPIOB
+#define FRAM_CS3_Pin         GPIO_PIN_13
+#define FRAM_CS3_GPIO_Port   GPIOC
+
+/* ---------- Other peripheral handle types (W2-6) ----------
  * App/comms/comms.c declares `extern SPI_HandleTypeDef hspi1;` and other
  * App modules reference the ADC/IWDG handles. Only the handle *objects* are
  * needed on the host: every HAL entry point that would consume them is either
  * a support-file double or is never reached by a host test, so the structs
  * are deliberately opaque one-word placeholders rather than a copy of the
- * CubeMX layout (which would be a second, silently-diverging definition). */
-typedef struct {
-    uint32_t instance;
-} SPI_HandleTypeDef;
+ * CubeMX layout (which would be a second, silently-diverging definition).
+ * (SPI_HandleTypeDef itself is declared in the SPI section above.) */
 
 typedef struct {
     uint32_t instance;
@@ -73,8 +105,9 @@ typedef struct {
     uint32_t instance;
 } IWDG_HandleTypeDef;
 
-/* CubeMX peripheral handles - defined in support/stubs.c. */
-extern I2C_HandleTypeDef  hi2c2;   /* FM24VN10-G FRAM bus      */
+/* CubeMX peripheral handles - defined in support/stubs.c, except hspi2 which
+ * lives in support/host_flash.c next to the FRAM double that observes it. */
+extern SPI_HandleTypeDef  hspi2;   /* FM24VN10-G FRAM bus (SPI2) */
 extern SPI_HandleTypeDef  hspi1;   /* SX1268 LoRa transceiver  */
 extern ADC_HandleTypeDef  hadc1;   /* BMS measurements         */
 extern IWDG_HandleTypeDef hiwdg;   /* independent watchdog     */

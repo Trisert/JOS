@@ -106,11 +106,13 @@ Three things normally only exist after linking for the STM32L496VGTx:
    — PG and PER/STRT are both in the write-protected FLASH_CR). That is what
    makes the erase-before-wrap path in `laststates_write()` genuinely testable.
 
-4. **The FM24VN10-G FRAM behind `hi2c2`** — the doubles accept only the *8-bit*
-   (already left-shifted) device addresses the STM32 HAL expects: `0xA0`,
-   `0xA2`, `0xA4`, `0xA6`. The raw 7-bit values `0x50..0x53` are rejected, so a
-   driver that forgets the shift fails the tests instead of silently addressing
-   the wrong device on the real bus.
+4. **The FM24VN10-G FRAM behind `hspi2` (SPI2)** — the doubles model one
+   GPIO chip-select per die (`FRAM_CS0..CS3`) plus the SPI framing
+   (`WREN`/`WRITE`/`READ` + 16-bit address). A `WRITE` without a preceding
+   `WREN`, a transfer with no CS asserted, or a single transaction crossing a
+   16 KB die boundary is rejected, so a driver that skips the write-enable,
+   selects the wrong die, or forgets the chip split fails the tests instead
+   of silently corrupting the wrong device on the real bus.
 
 ## References
 

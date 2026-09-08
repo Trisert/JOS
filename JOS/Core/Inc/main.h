@@ -62,6 +62,18 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN Private defines */
 
+/* FRAM chip-selects (SPF v3 3.6.4.2: 4x FM24VN10-G on SPI2, software CS).
+ * PB4 excluded (NJTRST debug). NOTE: PA4 is also claimed by the radio CS_TTC
+ * placeholder in App/comms/radiolib_hal.h (TODO) - schematic must resolve. */
+#define FRAM_CS0_Pin         GPIO_PIN_4
+#define FRAM_CS0_GPIO_Port   GPIOA
+#define FRAM_CS1_Pin         GPIO_PIN_0
+#define FRAM_CS1_GPIO_Port   GPIOB
+#define FRAM_CS2_Pin         GPIO_PIN_1
+#define FRAM_CS2_GPIO_Port   GPIOB
+#define FRAM_CS3_Pin         GPIO_PIN_13
+#define FRAM_CS3_GPIO_Port   GPIOC
+
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

@@ -20,13 +20,41 @@
 #include <string.h>
 #include <stdint.h>
 
-/* ========== FRAM driver (I2C) ==========
- * Per RED_DES_ElectronicArchitecture_V1:
- *   4x FM24VN10-G on the OBC PCB, on I2C2.
+/* ========== FRAM driver (SPI2) ==========
+ * Per SPF v3 3.6.4.2 (Nicola approved): 4x FM24VN10-G on the OBC PCB, on the
+ * SPI2 dedicated bus (PB13/SCK, PB14/MISO, PB15/MOSI), software chip-select.
+ * Ported from the I2C2 transport (PR #62); the 64 KB geometry, the public API
+ * and the cyclic/laststates layers above are unchanged.
  *
- * Device-select (7-bit) addresses: 0x50, 0x51, 0x52, 0x53 (A0/A1 pins).
- * The driver addresses ONE 16 KB window per device select, using the 16-bit
- * memory-address transfer of HAL_I2C_Mem_Read/Write:
+ * One GPIO chip-select per die, asserted LOW for exactly one transaction:
+ *
+ *   FRAM_CS0 = PA4    FRAM_CS1 = PB0    FRAM_CS2 = PB1    FRAM_CS3 = PC13
+ *
+ * (see main.h Private defines and JOS.ioc). PB4 was excluded: it is NJTRST.
+ * NOTE: PA4 is also claimed by the radio CS_TTC *placeholder* binding in
+ * App/comms/radiolib_hal.h (marked TODO: real OBC-schematic pin). The two
+ * assignments cannot both be true on the flight board; the schematic must
+ * give the SX1268 NSS its confirmed pin. Tracked in the PR description.
+ *
+ * SPI frame (standard SPI FRAM, mode 0, MSB first, 8-bit):
+ *   write: CS low -> WREN (0x06) -> CS high -> CS low -> WRITE (0x02) +
+ *          16-bit address + data -> CS high
+ *   read : CS low -> READ (0x03) + 16-bit address, clock data out -> CS high
+ * No status polling: FRAM is ferroelectric, the write lands on the bus
+ * transaction itself (no Flash-style program delay, no WIP bit to wait on).
+ * The WREN latch is still honoured - a WRITE without a preceding WREN is
+ * refused by the part, and the host double reproduces that.
+ *
+ * Bus sharing: SPI2 also carries the BMS/EPS link (App/bms/bms.c), which runs
+ * /32 while FRAM runs /8. fram_spi_acquire() therefore re-applies the FRAM
+ * register configuration before every transaction (HAL_SPI_Init() only runs
+ * MspInit while the handle is in RESET, so this never disturbs the clocks or
+ * the pin mux - same pattern as bms_spi_init()). The DMA path is configured
+ * and linked in HAL_SPI_MspInit (stm32l4xx_hal_msp.c, SPF 3.6.4.2); transfers
+ * here use polling HAL_SPI_Transmit/Receive, as does the SPI1 radio HAL -
+ * migration to DMA transfers is a separate work package.
+ *
+ * Geometry (unchanged from the I2C driver):
  *
  *   FM24VN_CHIP_SIZE = 16 * 1024 B  = 16 KB  per device select
  *   FRAM_SIZE        = 4 * 16 KB    = 64 KB  usable, and 64 KB is the number
@@ -46,7 +74,11 @@
  * memory module and therefore the divide-by-zero class entirely (review M1).
  */
 
-#define FM24VN_I2C_ADDR_BASE  0x50
+#define FM24VN_SPI_OP_WREN        0x06U
+#define FM24VN_SPI_OP_WRITE       0x02U
+#define FM24VN_SPI_OP_READ        0x03U
+#define FM24VN_SPI_ADDR_BYTES     2U
+#define FM24VN_SPI_TIMEOUT        1000U
 #define FM24VN_PAGE_SIZE      16
 #define FM24VN_CHIP_SIZE      (16UL * 1024UL)
 #define FM24VN_CHIP_SIZE_LOG2 14U    /* 16 KB = 2^14 */
@@ -74,17 +106,65 @@ _Static_assert(FM24VN_CHIP_SIZE == (1UL << FM24VN_CHIP_SIZE_LOG2),
 _Static_assert(FRAM_SIZE == (64UL * 1024UL),
                "FRAM_SIZE must be 64 KB (4 x 16 KB) per RED_DES_ElectronicArchitecture_V1");
 
-extern I2C_HandleTypeDef hi2c2;
+extern SPI_HandleTypeDef hspi2;
 
-/* The STM32 HAL I2C entry points take the device address ALREADY shifted left
- * by one (the 8-bit device-select byte, R/W bit clear). The FM24VN10-G parts
- * are 7-bit 0x50..0x53, so the bytes that must reach HAL_I2C_Mem_Read/Write
- * are 0xA0/0xA2/0xA4/0xA6. Passing the raw 7-bit value puts 0x28 on the bus
- * and addresses nothing. */
-static uint16_t fram_addr_to_chip(uint32_t addr)
+/* Chip-select table, indexed by chip number (addr >> FM24VN_CHIP_SIZE_LOG2).
+ * Ports/pins live in Core/Inc/main.h so CubeMX, MX_GPIO_Init() and this
+ * driver share one definition. CS is active LOW, parked HIGH by MX_GPIO_Init()
+ * before it becomes an output so no glancing low pulse selects a die at boot
+ * (same pattern as bms_eps_cs_init()). */
+static GPIO_TypeDef *const fram_cs_port[FM24VN_NUM_CHIPS] = {
+    FRAM_CS0_GPIO_Port, FRAM_CS1_GPIO_Port,
+    FRAM_CS2_GPIO_Port, FRAM_CS3_GPIO_Port,
+};
+static const uint16_t fram_cs_pin[FM24VN_NUM_CHIPS] = {
+    FRAM_CS0_Pin, FRAM_CS1_Pin, FRAM_CS2_Pin, FRAM_CS3_Pin,
+};
+
+static inline void fram_cs_select(uint32_t chip)
 {
-    uint16_t addr7 = (uint16_t)((addr >> FM24VN_CHIP_SIZE_LOG2) + FM24VN_I2C_ADDR_BASE);
-    return (uint16_t)(addr7 << 1);
+    HAL_GPIO_WritePin(fram_cs_port[chip], fram_cs_pin[chip], GPIO_PIN_RESET);
+}
+
+static inline void fram_cs_deselect(uint32_t chip)
+{
+    HAL_GPIO_WritePin(fram_cs_port[chip], fram_cs_pin[chip], GPIO_PIN_SET);
+}
+
+#ifndef HOST_UNIT_TEST
+/* Re-apply the FRAM register configuration ahead of every transaction: SPI2
+ * is shared with the BMS/EPS link, which runs a different prescaler (/32 vs
+ * the FRAM /8). Target-only: the host double has no peripheral registers to
+ * program, and the fake SPI handle is an opaque word with no Init member. */
+static void fram_spi_acquire(void)
+{
+    hspi2.Instance               = SPI2;
+    hspi2.Init.Mode              = SPI_MODE_MASTER;
+    hspi2.Init.Direction         = SPI_DIRECTION_2LINES;
+    hspi2.Init.DataSize          = SPI_DATASIZE_8BIT;
+    hspi2.Init.CLKPolarity       = SPI_POLARITY_LOW;    /* SPI mode 0 */
+    hspi2.Init.CLKPhase          = SPI_PHASE_1EDGE;
+    hspi2.Init.NSS               = SPI_NSS_SOFT;
+    hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;  /* 10 MHz @ 80 MHz PCLK1 */
+    hspi2.Init.FirstBit          = SPI_FIRSTBIT_MSB;
+    hspi2.Init.TIMode            = SPI_TIMODE_DISABLE;
+    hspi2.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
+    hspi2.Init.CRCPolynomial     = 7;
+    hspi2.Init.CRCLength         = SPI_CRC_LENGTH_DATASIZE;
+    hspi2.Init.NSSPMode          = SPI_NSS_PULSE_DISABLE; /* software CS */
+
+    (void)HAL_SPI_Init(&hspi2);
+}
+#else
+static void fram_spi_acquire(void)
+{
+    /* No registers on the host; the double observes CS + SPI frames. */
+}
+#endif
+
+static uint32_t fram_addr_to_chip(uint32_t addr)
+{
+    return addr >> FM24VN_CHIP_SIZE_LOG2;
 }
 
 static uint16_t fram_addr_to_offset(uint32_t addr)
@@ -94,32 +174,96 @@ static uint16_t fram_addr_to_offset(uint32_t addr)
 
 void fram_init(void)
 {
-    /* TODO: verify each chip responds at its I2C address */
+    uint32_t chip;
+
+    /* TODO: verify each chip responds (READ device ID / RDSR) */
+    for (chip = 0U; chip < FM24VN_NUM_CHIPS; chip++) {
+        fram_cs_deselect(chip);   /* park every CS idle high */
+    }
+}
+
+/* Latch the write enable ahead of a WRITE transaction: CS low -> WREN ->
+ * CS high, exactly as the datasheet requires (WREN is a standalone command,
+ * it must NOT share the CS assertion with the WRITE that follows). */
+static int fram_write_enable(uint32_t chip)
+{
+    uint8_t op = FM24VN_SPI_OP_WREN;
+
+    fram_cs_select(chip);
+    if (HAL_SPI_Transmit(&hspi2, &op, 1U, FM24VN_SPI_TIMEOUT) != HAL_OK) {
+        fram_cs_deselect(chip);
+        return -1;
+    }
+    fram_cs_deselect(chip);
+    return 0;
 }
 
 int fram_read(uint32_t addr, uint8_t *buf, size_t len)
 {
+    uint32_t chip;
+    uint16_t offset;
+    uint8_t  hdr[1U + FM24VN_SPI_ADDR_BYTES];
+
     if (addr + len > FRAM_SIZE) return -1;
+    if ((len != 0U) && (buf == NULL)) return -1;
 
-    uint16_t dev_addr = fram_addr_to_chip(addr);
-    uint16_t offset = fram_addr_to_offset(addr);
+    chip   = fram_addr_to_chip(addr);
+    offset = fram_addr_to_offset(addr);
 
-    if (HAL_I2C_Mem_Read(&hi2c2, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
-                         buf, (uint16_t)len, 1000) != HAL_OK)
+    hdr[0] = FM24VN_SPI_OP_READ;
+    hdr[1] = (uint8_t)(offset >> 8U);
+    hdr[2] = (uint8_t)(offset & 0xFFU);
+
+    fram_spi_acquire();
+
+    fram_cs_select(chip);
+    if (HAL_SPI_Transmit(&hspi2, hdr, sizeof(hdr), FM24VN_SPI_TIMEOUT) != HAL_OK) {
+        fram_cs_deselect(chip);
         return -1;
+    }
+    if ((len != 0U) &&
+        (HAL_SPI_Receive(&hspi2, buf, (uint16_t)len, FM24VN_SPI_TIMEOUT) != HAL_OK)) {
+        fram_cs_deselect(chip);
+        return -1;
+    }
+    fram_cs_deselect(chip);
     return 0;
 }
 
 int fram_write(uint32_t addr, const uint8_t *buf, size_t len)
 {
+    uint32_t chip;
+    uint16_t offset;
+    uint8_t  hdr[1U + FM24VN_SPI_ADDR_BYTES];
+
     if (addr + len > FRAM_SIZE) return -1;
+    if ((len != 0U) && (buf == NULL)) return -1;
 
-    uint16_t dev_addr = fram_addr_to_chip(addr);
-    uint16_t offset = fram_addr_to_offset(addr);
+    chip   = fram_addr_to_chip(addr);
+    offset = fram_addr_to_offset(addr);
 
-    if (HAL_I2C_Mem_Write(&hi2c2, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
-                          (uint8_t *)buf, (uint16_t)len, 1000) != HAL_OK)
+    fram_spi_acquire();
+
+    if (fram_write_enable(chip) != 0) {
         return -1;
+    }
+
+    hdr[0] = FM24VN_SPI_OP_WRITE;
+    hdr[1] = (uint8_t)(offset >> 8U);
+    hdr[2] = (uint8_t)(offset & 0xFFU);
+
+    fram_cs_select(chip);
+    if (HAL_SPI_Transmit(&hspi2, hdr, sizeof(hdr), FM24VN_SPI_TIMEOUT) != HAL_OK) {
+        fram_cs_deselect(chip);
+        return -1;
+    }
+    if ((len != 0U) &&
+        (HAL_SPI_Transmit(&hspi2, (uint8_t *)buf, (uint16_t)len,
+                          FM24VN_SPI_TIMEOUT) != HAL_OK)) {
+        fram_cs_deselect(chip);
+        return -1;
+    }
+    fram_cs_deselect(chip);
     return 0;
 }
 
@@ -134,8 +278,8 @@ void cyclic_buffer_init(void)
     cb_head = 0;
 }
 
-/* Write one contiguous range without handing HAL_I2C_Mem_Write() a
- * cross-chip transfer: each FM24VN10-G owns only its 16 KB window. */
+/* Write one contiguous range without handing the FRAM a cross-chip transfer:
+ * each FM24VN10-G owns only its 16 KB window. */
 static int cyclic_buffer_write_range(uint32_t addr, const uint8_t *data, size_t len)
 {
     while (len > 0U) {
@@ -166,7 +310,7 @@ int cyclic_buffer_write(const uint8_t *data, size_t len)
 
     /* Split once at the ring boundary, then cyclic_buffer_write_range() splits
      * further at every physical FRAM chip boundary. Advance cb_head only after
-     * all transfers succeed: a failed I2C write must remain visible to the
+     * all transfers succeed: a failed FRAM write must remain visible to the
      * caller rather than silently creating a hole in the telemetry stream. */
     first = (len < (size_t)(FRAM_SIZE - cb_head)) ? len :
             (size_t)(FRAM_SIZE - cb_head);

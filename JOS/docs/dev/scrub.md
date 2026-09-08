@@ -28,7 +28,7 @@ data, which is worse than no backup.
 |-------|------|------|
 | Golden copy | `App/obsw/scrub.c` / `scrub.h` | CRC-32 records in FRAM, periodic refresh + repair |
 | Detection | `Core/Src/sram2_parity.c` (W2-3) | parity NMI → recorded reboot |
-| Transport | `App/memory/memory.c` `fram_read`/`fram_write` (I2C FM24VN10) | real FRAM driver |
+| Transport | `App/memory/memory.c` `fram_read`/`fram_write` (SPI2 FM24VN10) | real FRAM driver |
 | Boot repair | `state_machine_init()` → `scrub_init()` | restore last-good struct after reboot |
 | Write-through | `try_transition()` → `scrub_sync()` | golden copy never lags the live truth |
 

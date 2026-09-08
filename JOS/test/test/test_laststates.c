@@ -415,7 +415,7 @@ void test_laststates_wrap_erases_pool_before_reuse(void)
 }
 
 /* =====================================================================
- * FRAM / cyclic buffer (same HAL doubles, I2C side)
+ * FRAM / cyclic buffer (same HAL doubles, SPI side)
  * ===================================================================== */
 
 void test_fram_write_read_round_trip(void)
@@ -440,16 +440,13 @@ void test_fram_rejects_out_of_range_access(void)
     TEST_ASSERT_EQUAL_INT(-1, fram_read(64u * 1024u, buf, sizeof(buf)));
 }
 
-/* The STM32 HAL I2C API takes the device address already shifted left by one.
- * The four FM24VN10-G parts are 7-bit 0x50..0x53, so the bytes that must reach
- * HAL_I2C_Mem_Read/Write are 0xA0, 0xA2, 0xA4, 0xA6. Handing the HAL the raw
- * 7-bit value would address 0x28 on the real bus, and no host double is
- * allowed to paper over that. */
-void test_fram_uses_shifted_i2c_device_addresses(void)
+/* Each die has its own chip-select line (FRAM_CS0..CS3): the address decode
+ * must assert exactly the CS of the die that owns the address. Selecting the
+ * wrong die would silently write telemetry into the wrong 16 KB window. */
+void test_fram_selects_one_cs_per_chip(void)
 {
-    const uint16_t expected[4] = { 0xA0u, 0xA2u, 0xA4u, 0xA6u };
-    uint8_t        byte        = 0x5Au;
-    uint32_t       chip;
+    uint8_t byte = 0x5Au;
+    uint32_t chip;
 
     fram_init();
 
@@ -457,10 +454,10 @@ void test_fram_uses_shifted_i2c_device_addresses(void)
         uint32_t addr = chip * 16u * 1024u;
 
         TEST_ASSERT_EQUAL_INT(0, fram_write(addr, &byte, 1u));
-        TEST_ASSERT_EQUAL_HEX16(expected[chip], host_flash_last_i2c_addr());
+        TEST_ASSERT_EQUAL_UINT32(chip, host_flash_last_spi_chip());
 
         TEST_ASSERT_EQUAL_INT(0, fram_read(addr, &byte, 1u));
-        TEST_ASSERT_EQUAL_HEX16(expected[chip], host_flash_last_i2c_addr());
+        TEST_ASSERT_EQUAL_UINT32(chip, host_flash_last_spi_chip());
     }
 }
 
