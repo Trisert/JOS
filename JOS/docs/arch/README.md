@@ -10,7 +10,7 @@ STM32L496VGTx target.
 | MCU | STM32L496VGTx — ARM Cortex-M4 @ 80 MHz |
 | Internal Flash | 1024 KB (firmware reserves 512 KB; LastStates pool 8 KB @ `0x08080000`) |
 | Internal SRAM | 320 KB (256 KB SRAM1 + 64 KB SRAM2) |
-| External memory | 4 MB FRAM (SPI2) |
+| External memory | 64 KB FRAM (I2C1, 4× FM24VN10-G) |
 | IMU | ASM330LHHXTR (gyro + accel) |
 | Radio | Semtech SX1268 (LoRa, SPI1) |
 | Watchdog | Independent IWDG (~32 s) |
@@ -27,7 +27,7 @@ STM32L496VGTx target.
 
 - **RTOS:** FreeRTOS (CMSIS-V2, `heap_4`), pre-emptive scheduling.
 - **Watchdog task:** monitors all tasks via tick counters; terminates anomalous tasks.
-- **Communication:** interrupt-driven SPI (no polling). SPI1 = LoRa + CLOUD; SPI2 = FRAM; I2C1 = magnetometer.
+- **Communication:** interrupt-driven SPI (no polling). SPI1 = LoRa + CLOUD; SPI2 = payload; I2C1 = FRAM (4× FM24VN10-G); I2C2 = CAM.
 - **Storage:** cyclic buffers. FRAM (4 MB) = primary payload sink; internal Flash = OBSW binary + LastStates pool (8 KB @ `0x08080000`) + beacon/ACK buffers.
 - **Chunking:** LoRa max packet 64 B; large objects fragmented on-board, reassembled at GS.
 

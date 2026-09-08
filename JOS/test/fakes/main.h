@@ -38,7 +38,7 @@ typedef enum {
     HAL_TIMEOUT = 0x03
 } HAL_StatusTypeDef;
 
-/* ---------- I2C (FM24VN10-G FRAM behind hi2c2) ---------- */
+/* ---------- I2C (FM24VN10-G FRAM behind hi2c1) ---------- */
 typedef struct {
     uint32_t instance;   /* opaque on the host */
 } I2C_HandleTypeDef;
@@ -74,7 +74,7 @@ typedef struct {
 } IWDG_HandleTypeDef;
 
 /* CubeMX peripheral handles - defined in support/stubs.c. */
-extern I2C_HandleTypeDef  hi2c2;   /* FM24VN10-G FRAM bus      */
+extern I2C_HandleTypeDef  hi2c1;   /* FM24VN10-G FRAM bus      */
 extern SPI_HandleTypeDef  hspi1;   /* SX1268 LoRa transceiver  */
 extern ADC_HandleTypeDef  hadc1;   /* BMS measurements         */
 extern IWDG_HandleTypeDef hiwdg;   /* independent watchdog     */

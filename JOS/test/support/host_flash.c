@@ -1,6 +1,6 @@
 /* ---------------------------------------------------------------------------
  * host_flash.c - host emulation of the STM32L4 internal Flash LastStates pool
- *                and of the FM24VN10-G FRAM bank behind hi2c2.
+ *                and of the FM24VN10-G FRAM bank behind hi2c1.
  *
  * Why a memory mapping and not a plain array:
  *
@@ -55,8 +55,8 @@ uintptr_t flash_base = HOST_FLASH_LASTSTATES_BASE;
 
 /* ---------- emulated devices ---------- */
 
-/* memory.c declares `extern I2C_HandleTypeDef hi2c2;`; provide the object. */
-I2C_HandleTypeDef hi2c2;
+/* memory.c declares `extern I2C_HandleTypeDef hi2c1;`; provide the object. */
+I2C_HandleTypeDef hi2c1;
 
 static uint8_t *pool;                       /* mapped at POOL_BASE */
 static uint8_t  fram[4 * 16 * 1024];        /* 4 x FM24VN10-G = 64 KB */
