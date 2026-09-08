@@ -240,6 +240,9 @@ void TIM6_DAC_IRQHandler(void)
   HAL_TIM_IRQHandler(&htim6);
 }
 
+/* Signature must match HAL weak HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *);
+   const would break the override. */
+// cppcheck-suppress constParameterPointer
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM6)
