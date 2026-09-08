@@ -59,6 +59,10 @@
     - ../App/memory
     - ../App/comms
     - ../App/aocs
+    # NOTE: App/payloads as a directory must never go on :source: — the rest
+    # of it (cloud/clear/crystals) is NOT host-compilable (pulls
+    # stm32l4xx_hal.h), so it would link into EVERY test binary. temp.c is
+    # the only host-compilable file there; see :files: below.
   :include:
     # fakes/ first: it shadows main.h, cmsis_os.h, cmsis_os2.h, FreeRTOS.h,
     # task.h and the Core/Inc headers the App modules pull in (sram2_parity.h,
@@ -67,6 +71,7 @@
     # HAL/CMSIS/FreeRTOS tree.
     - fakes
     - ../App
+    - ../App/payloads
     - ../App/obsw
     - ../App/memory
     - ../App/comms
@@ -74,6 +79,13 @@
     - support
   :support:
     - support
+
+# temp.c is the only host-compilable file in App/payloads (the rest pulls
+# stm32l4xx_hal.h), so it is listed as a single file here — the directory
+# itself must never go on :paths: :source:.
+:files:
+  :source:
+    - ../App/payloads/temp.c
 
 :defines:
   :test:

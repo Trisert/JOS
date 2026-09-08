@@ -42,7 +42,8 @@ extern "C" void lora_rx_task_register(osThreadId_t handle)
 
 extern "C" int lora_init(void)
 {
-    /* Bind virtual pins to real CubeMX GPIO (placeholders until OBC schematic). */
+    /* Bind virtual pins to real CubeMX GPIO. CS_TTC/Busy/DIO1 are still OBC-
+       schematic placeholders; RESET is the resolved PB1 mux pin (main.h). */
     radioHal.addPin(RLIB_NSS,   CS_TTC_GPIO_Port,     CS_TTC_Pin);
     radioHal.addPin(RLIB_RESET, LoRa_NRST_GPIO_Port,  LoRa_NRST_Pin);
     radioHal.addPin(RLIB_DIO1,  GPIO_INT_GPIO_Port,   GPIO_INT_Pin);
