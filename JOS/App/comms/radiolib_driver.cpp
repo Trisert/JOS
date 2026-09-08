@@ -7,8 +7,9 @@
  * Ported/adapted from Marco-42/RedPill-T (satellite/stm32_lora/Core/Src/COMMS.cpp).
  * See radiohal.h for licensing + pin-mapping notes.
  *
- * LoRa params match SPF pag 90 + RedPill-T: 436 MHz, BW125, SF10, CR4/5
- * (codingRate=5), sync 0x12, 22 dBm, preamble 8, no TCXO, DCDC regulator.
+ * LoRa params match SPF v3 Table 3.28 + RedPill-T: 436 MHz, BW125, SF10, CR4/8
+ * (RadioLib cr=8 is the direct denominator: SX1268.h:36, codingRate reg=cr-4),
+ * sync 0x12, 22 dBm, preamble 8, no TCXO, DCDC regulator.
  *
  * TX is ASYNC (startTransmit completes on DIO1 TX_DONE). lora_tx() fires and
  * returns; callers that send multiple chunks MUST lora_tx_wait_done() between
@@ -56,8 +57,10 @@ extern "C" int lora_init(void)
     radioHal.pulseReset();
 
     /* begin(freq, bw, sf, cr, syncWord, power, preamble, tcxo, useLDO).
-       Signature matches JOS-vendored RadioLib SX1268::begin(). */
-    int16_t s = radio.begin(436.0f, 125.0f, 10, 5, 0x12, 22, 8, 0.0f, false);
+       Signature matches JOS-vendored RadioLib SX1268::begin().
+       cr=8 -> coding rate 4/8 per SPF v3 Table 3.28 (RadioLib cr is the direct
+       denominator, SX1268.h:36; SX126x_config.cpp: codingRate reg = cr-4). */
+    int16_t s = radio.begin(436.0f, 125.0f, 10, 8, 0x12, 22, 8, 0.0f, false);
     if (s != RADIOLIB_ERR_NONE) {
         return -1;
     }
