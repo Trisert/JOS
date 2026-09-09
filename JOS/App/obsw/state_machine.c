@@ -171,11 +171,15 @@ static int try_transition(obw_state_t target, uint8_t trigger)
     case STATE_READY:
         /* s1→s3: after boot + antenna deploy success */
         /* s2→s3: battery recovers to b_opok */
+        /* s4→s3: scheduled task / payload ops complete (SPF Table 3.21,
+           TRIGGER_TASK_COMPLETE) */
         if (obsw_state.current_state == STATE_INIT) {
             ok = 1;  /* assume antenna deploy + self-test passed */
         } else if (obsw_state.current_state == STATE_CRIT) {
             bms = bms_get_status();
             ok = (bms.soc >= default_thresholds.b_opok);
+        } else if (obsw_state.current_state == STATE_ACTIVE) {
+            ok = (trigger == TRIGGER_TASK_COMPLETE);
         }
         break;
 
