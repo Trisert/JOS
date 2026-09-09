@@ -105,6 +105,13 @@ void vApplicationMallocFailedHook(void)
    FreeRTOSConfig.h, and the xPortGetFreeHeapSize() API function can be used
    to query the size of free heap space that remains (although it does not
    provide information on how the remaining heap might be fragmented). */
+
+   /* Fault containment (NASA-STD-8739.8), same pattern as
+      vApplicationStackOverflowHook() above: a heap exhaustion is never
+      silent. fault_log_malloc_failed() records the heap watermarks in the
+      LastStates pool and reboots into a known-good state - this call does
+      not return. */
+   fault_log_malloc_failed();
 }
 /* USER CODE END 5 */
 

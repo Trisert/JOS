@@ -12,6 +12,7 @@
 /* CMSIS-RTOS2 mutex for the LastStates pool lock (W2-2 review, CRITICAL).
  * The host build is single-threaded and stubs the lock out entirely. */
 #include "cmsis_os2.h"
+#include "queue.h"   /* xQueueGetMutexHolder() for laststates_pool_holder() */
 #endif
 /* bookkeeping mirror scrubbing (W2-5). Core/Inc/seu_mitigation.h on the
  * target; test/fakes/seu_mitigation.h (same signatures, no RTOS) on the host,
@@ -799,6 +800,18 @@ void laststates_pool_unlock(int held)
     if (held == LASTSTATES_LOCK_HELD) {
         (void)osMutexRelease(ls_pool_mutex);
     }
+}
+
+/* Which task holds the pool mutex right now (watchdog FDIR seam, see
+ * memory.h). In the CMSIS-RTOS2 FreeRTOS wrapper an osMutexId_t IS the
+ * underlying queue/mutex handle, so xQueueGetMutexHolder() reads it directly.
+ * Non-blocking: safe from the monitor scan while holding wdg_mutex. */
+TaskHandle_t laststates_pool_holder(void)
+{
+    if (ls_pool_mutex == NULL) {
+        return NULL;
+    }
+    return xQueueGetMutexHolder((QueueHandle_t)ls_pool_mutex);
 }
 
 #else  /* host unit-test build: single-threaded, no RTOS */

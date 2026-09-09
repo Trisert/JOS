@@ -208,6 +208,36 @@ static int try_transition(obw_state_t target, uint8_t trigger)
         return -1;
     }
 
+    /* TEMPORAL BOUND of the Flash write above, which runs while holding
+       state_mutex (documented here instead of moved out: the log-then-commit
+       order is load-bearing - a record must never describe a transition that
+       did not commit, and a commit must never land without its record - so
+       the write cannot leave this critical section without changing the
+       failure semantics every caller above relies on).
+       Worst-case hold, all terms bounded:
+         - own write (laststates_write): Flash reads for the slot scan, one
+           optional page erase (cycle-bounded, FLASH_PAGE_TIMEOUT_CYCLES =
+           0x400000 ~= 52 ms @ 80 MHz) and 16 double-words x cycle-bounded
+           dword wait (FLASH_DWORD_TIMEOUT_CYCLES = 0x20000 ~= 1.6 ms):
+           ~= 80 ms worst case. No blocking RTOS call under the pool lock.
+         - pool-lock wait (osWaitForever): at most one in-progress writer.
+           laststates_write() holds it across the same bounded sequence as
+           above; dual_bank.c:ls_append() across 16x HAL_FLASH_Program
+           (HAL tick timeout, nominal < 1 ms). The wait terminates because
+           every holder runs to release: in particular the watchdog monitor
+           NEVER suspends the pool-mutex holder (watchdog_suspend_allowed()),
+           which is what used to turn this wait into a wedge.
+         - lock ordering is state_mutex -> ls_pool_mutex everywhere and never
+           the reverse (no pool-locked path takes state_mutex), and state_mutex
+           carries osMutexPrioInherit, so priority inversion across this
+           section is bounded by the hold above, not by a medium-priority
+           task.
+       Net: nominal ~= 160 ms, pathological (wedged Flash controller hitting
+       a HAL tick timeout) up to tens of seconds, always terminating. Readers
+       blocked on state_mutex for that long (beacon cadence, comms ground
+       commands) miss a cycle; the IWDG backstop and the watchdog monitor
+       never take state_mutex and are unaffected. */
+
     seu_mitigation_lock();
     obsw_state.current_state = target;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);

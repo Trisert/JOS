@@ -40,6 +40,11 @@ typedef enum {
        least specific label. Never encoded in an entry stub - fault_capture()
        derives it from HFSR/CFSR. */
     FAULT_ID_HARDFAULT_STACKING = 5,
+    /* pvPortMalloc() failed and vApplicationMallocFailedHook() ran. The heap
+       cannot grow at runtime, so this is a sizing finding, not a transient:
+       record the free/min-ever-free watermarks and reset into a known-good
+       state (fault_log_malloc_failed()). Never encoded in an entry stub. */
+    FAULT_ID_MALLOC_FAILED      = 6,
 } fault_id_t;
 
 typedef struct {
@@ -106,6 +111,10 @@ void fault_capture(const uint32_t *frame, uint32_t fault_id, uint32_t exc_return
 /* Record a FreeRTOS stack overflow (task name may be NULL) and reset the MCU.
    Called from vApplicationStackOverflowHook(). Does not return. */
 void fault_log_stack_overflow(const char *task_name);
+
+/* Record a FreeRTOS heap exhaustion (pvPortMalloc() failure) and reset the
+   MCU. Called from vApplicationMallocFailedHook(). Does not return. */
+void fault_log_malloc_failed(void);
 
 #ifdef __cplusplus
 }

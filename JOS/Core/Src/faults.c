@@ -31,6 +31,9 @@
 #include "mpu.h"            /* mpu_memmanage_fault(): MemManage entry (W2-1) */
 #include "dual_bank.h"      /* dual_bank_mark_boot_fault() (W2-2)            */
 
+#include "FreeRTOS.h"       /* xPortGetFreeHeapSize(), xTaskGetSchedulerState */
+#include "task.h"
+
 #include <stddef.h>
 #include <string.h>
 
@@ -304,6 +307,43 @@ void fault_log_stack_overflow(const char *task_name)
 
     fault_fill_scb(&rec);
     fault_persist(&rec, TRIGGER_STACK_OVERFLOW);
+
+    fault_reset_now();
+}
+
+void fault_log_malloc_failed(void)
+{
+    fault_record_t rec;
+
+    /* Same latch as fault_capture(): a second failure while handling the
+       first resets instead of recursing into the Flash path. */
+    if (s_fault_nesting != 0U) {
+        fault_reset_now();
+    }
+    s_fault_nesting = 1U;
+
+    /* A suspended scheduler cannot block: laststates_write() takes the pool
+       mutex with osWaitForever, and with the scheduler suspended the holder
+       can never run to release it. The reset below is the containment either
+       way; only the forensic record is best effort. */
+    if (xTaskGetSchedulerState() == taskSCHEDULER_SUSPENDED) {
+        fault_reset_now();
+    }
+
+    memset(&rec, 0, sizeof(rec));
+    rec.magic    = FAULT_RECORD_MAGIC;
+    rec.fault_id = (uint32_t)FAULT_ID_MALLOC_FAILED;
+    rec.lr       = (uint32_t)__builtin_return_address(0);
+    /* Heap watermarks: the sizing evidence ground needs. The heap cannot grow
+       at runtime, so a malloc failure is a sizing finding, not a transient -
+       these two words say by how much. r0/r1 carry no register meaning here
+       (no exception frame was stacked); the layout is fixed, so the ground
+       decoder reads them positionally. */
+    rec.r0 = (uint32_t)xPortGetFreeHeapSize();
+    rec.r1 = (uint32_t)xPortGetMinimumEverFreeHeapSize();
+
+    fault_fill_scb(&rec);
+    fault_persist(&rec, TRIGGER_MALLOC_FAILED);
 
     fault_reset_now();
 }

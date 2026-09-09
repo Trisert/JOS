@@ -33,6 +33,15 @@
 #include <string.h>
 #endif
 
+#ifdef HOST_UNIT_TEST
+/* Host double for the pool-holder seam (test/support/rtos_stubs.c): the pool
+   lock is stubbed out on the host, so the holder query behind the
+   suspend/defer policy is driven by the test instead of by memory.c. Same
+   signature as the flight version in memory.h (TaskHandle_t via task.h
+   above). */
+TaskHandle_t laststates_pool_holder(void);
+#endif
+
 /* ---------- Monitored task entry ---------- */
 typedef struct {
     osThreadId_t handle;
@@ -51,12 +60,26 @@ typedef struct {
        suspended one does by construction - must be reported once, not on
        every 500 ms scan until the LastStates pool is full. Cleared by
        watchdog_alive(), so a task ground puts back with osThreadResume() is
-       monitored again from its next liveness report. */
+       monitored again from its next liveness report. NOT set when the
+       escalation is deferred (suspect holds the pool mutex): the next scan
+       retries instead, so a transient holder still gets escalated. */
     uint8_t      stalled;
+    /* Last stack high-water mark sampled by the monitor scan, in words
+       (uxTaskGetStackHighWaterMark() units), not bytes. 0 until the first
+       scan has sampled this entry. Read out through
+       watchdog_task_stack_hwm() for beacon/housekeeping telemetry. */
+    UBaseType_t  stack_hwm_words;
 } wdg_entry_t;
 
 static wdg_entry_t wdg_tasks[WDG_MAX_TASKS];
 static osMutexId_t wdg_mutex;
+
+/* Escalations deferred because the suspect held the LastStates pool mutex
+   (see watchdog_escalate_stalled()). Saturating-free 32-bit counter, zero
+   after reset / watchdog_monitor_init(): the deferral leaves no Flash record
+   by construction (writing one would wedge on the held mutex), so this
+   counter is what makes it visible to ground instead of silent. */
+static uint32_t wdg_holder_deferral_count;
 
 /* Deadline helper: 3x the declared period, saturating instead of wrapping.
    WDG_PERIOD_CLOUD_MS is already 5 400 000 ms, so the multiplication is worth
@@ -89,7 +112,9 @@ void watchdog_monitor_init(void)
         wdg_tasks[i].armed      = 0;
         wdg_tasks[i].seeded     = 0;
         wdg_tasks[i].stalled    = 0;
+        wdg_tasks[i].stack_hwm_words = (UBaseType_t)0;
     }
+    wdg_holder_deferral_count = 0u;
 }
 
 int watchdog_register_task(osThreadId_t handle, uint32_t expected_period_ms)
@@ -209,6 +234,63 @@ static void watchdog_declare_boot_ok_if_due(uint32_t uptime_ms)
     }
 }
 
+/* ---------- Suspend/defer policy ---------- */
+
+/* Whether the monitor may suspend `suspect` given the current pool holder.
+ *
+ * NEVER suspend the task that holds the LastStates pool mutex: suspending a
+ * mutex holder wedges every later laststates_write() - including the
+ * monitor's own escalation record - on an osWaitForever acquire its holder
+ * can no longer release. Skipping the suspend alone is not enough either: the
+ * escalation record is written AFTER the suspend, so it would wedge the
+ * monitor on the same held mutex. The only safe action is to defer the whole
+ * escalation (no suspend, no Flash write) and retry on the next scan, when
+ * the holder has normally released the mutex long ago.
+ *
+ * In the CMSIS-RTOS2 FreeRTOS wrapper an osThreadId_t and a TaskHandle_t are
+ * the same TCB pointer, so the suspect is compared directly against the
+ * holder read by laststates_pool_holder() (xQueueGetMutexHolder(),
+ * INCLUDE_xQueueGetMutexHolder = 1 in FreeRTOSConfig.h).
+ *
+ * Returns 1 when the suspect may be suspended now, 0 when the escalation
+ * must be deferred. Compiled in both builds so the host suite exercises the
+ * exact flight decision (see watchdog.h). */
+int watchdog_suspend_allowed(osThreadId_t suspect, osThreadId_t pool_holder)
+{
+    if (suspect == NULL) {
+        return 0;
+    }
+    if (pool_holder == NULL) {
+        return 1;
+    }
+    return ((TaskHandle_t)suspect != (TaskHandle_t)pool_holder) ? 1 : 0;
+}
+
+uint32_t watchdog_holder_deferrals(void)
+{
+    return wdg_holder_deferral_count;
+}
+
+int watchdog_task_stack_hwm(osThreadId_t handle, UBaseType_t *hwm_words)
+{
+    int rc = -1;
+
+    if ((handle == NULL) || (hwm_words == NULL)) {
+        return -1;
+    }
+
+    osMutexAcquire(wdg_mutex, osWaitForever);
+    for (int i = 0; i < WDG_MAX_TASKS; i++) {
+        if (wdg_tasks[i].registered && wdg_tasks[i].handle == handle) {
+            *hwm_words = wdg_tasks[i].stack_hwm_words;
+            rc = 0;
+            break;
+        }
+    }
+    osMutexRelease(wdg_mutex);
+    return rc;
+}
+
 /* Reaction to a task that missed its liveness deadline (#36 — closes the
  * "log anomaly, optionally suspend/delete task" TODO).
  *
@@ -247,17 +329,40 @@ static void watchdog_declare_boot_ok_if_due(uint32_t uptime_ms)
  * Called with wdg_mutex RELEASED. Holding the monitor mutex across a Flash
  * program and a scheduler call would block every watchdog_alive() caller for
  * the duration and could manufacture the very silence this function reports.
+ *
+ * Returns WDG_ESCALATE_HANDLED after the suspend+record ran (or on the host,
+ * where both back ends are compiled out and only the policy above is
+ * exercised), WDG_ESCALATE_DEFERRED when the suspect currently holds the
+ * pool mutex: nothing was suspended and nothing was written, the caller
+ * clears the stall latch so the next scan retries, and the deferral is
+ * counted in wdg_holder_deferral_count so it stays visible to ground.
  */
-static void watchdog_escalate_stalled(osThreadId_t handle,
-                                      uint32_t     elapsed_ms,
-                                      uint32_t     limit_ms,
-                                      uint32_t     period_ms)
+#define WDG_ESCALATE_HANDLED   0
+#define WDG_ESCALATE_DEFERRED  1
+
+static int watchdog_escalate_stalled(osThreadId_t handle,
+                                     uint32_t     elapsed_ms,
+                                     uint32_t     limit_ms,
+                                     uint32_t     period_ms)
 {
+    /* Holder check FIRST, in both builds: laststates_pool_holder() is a
+       non-blocking xQueueGetMutexHolder() read (flight) or the host double
+       (test). When the suspect holds the pool mutex, suspending it would
+       wedge every later laststates_write() on an osWaitForever acquire -
+       and writing the record first would wedge this very call on the same
+       mutex. Defer instead: no suspend, no Flash, retry next scan. */
+    if (!watchdog_suspend_allowed(handle,
+                                  (osThreadId_t)laststates_pool_holder())) {
+        wdg_holder_deferral_count++;
+        return WDG_ESCALATE_DEFERRED;
+    }
+
 #ifdef WDG_NO_ESCALATION_BACKEND
     (void)handle;
     (void)elapsed_ms;
     (void)limit_ms;
     (void)period_ms;
+    return WDG_ESCALATE_HANDLED;
 #else
     laststates_entry_t entry;
     uint32_t           ctx[6];
@@ -285,6 +390,7 @@ static void watchdog_escalate_stalled(osThreadId_t handle,
        (laststates_dropped_records()). */
     (void)laststates_write(&entry);
 #endif
+    return WDG_ESCALATE_HANDLED;
 }
 
 static void watchdog_monitor_task(void *arg)
@@ -296,6 +402,7 @@ static void watchdog_monitor_task(void *arg)
         /* Filled in by the scan below when it flags a task; acted on after
            the mutex is released (see watchdog_escalate_stalled()). */
         osThreadId_t stalled_handle  = NULL;
+        int          stalled_idx     = -1;
         uint32_t     stalled_elapsed = 0u;
         uint32_t     stalled_limit   = 0u;
         uint32_t     stalled_period  = 0u;
@@ -320,6 +427,15 @@ static void watchdog_monitor_task(void *arg)
         osMutexAcquire(wdg_mutex, osWaitForever);
         for (int i = 0; i < WDG_MAX_TASKS; i++) {
             if (!wdg_tasks[i].registered) continue;
+
+            /* Stack high-water mark telemetry (INCLUDE_uxTaskGetStackHighWaterMark
+               = 1 in FreeRTOSConfig.h). Sampled for every registered entry on
+               every scan: the call only reads the watermark pattern down from
+               the stack top, never blocks, and at 12 x <=1 KB per 500 ms scan
+               its cost is negligible. In the CMSIS-RTOS2 FreeRTOS wrapper an
+               osThreadId_t IS the task handle, hence the cast. */
+            wdg_tasks[i].stack_hwm_words =
+                uxTaskGetStackHighWaterMark((TaskHandle_t)wdg_tasks[i].handle);
 
             /* Registered before osKernelStart(): last_tick is not a real
                tick. Stamp it with the first tick the monitor actually
@@ -353,6 +469,7 @@ static void watchdog_monitor_task(void *arg)
                 if ((!wdg_tasks[i].stalled) && (stalled_handle == NULL)) {
                     wdg_tasks[i].stalled = 1u;
                     stalled_handle  = wdg_tasks[i].handle;
+                    stalled_idx     = i;
                     stalled_elapsed = elapsed;
                     stalled_limit   = limit;
                     stalled_period  = wdg_tasks[i].expected_period_ms;
@@ -362,8 +479,19 @@ static void watchdog_monitor_task(void *arg)
         osMutexRelease(wdg_mutex);
 
         if (stalled_handle != NULL) {
-            watchdog_escalate_stalled(stalled_handle, stalled_elapsed,
-                                      stalled_limit, stalled_period);
+            if (watchdog_escalate_stalled(stalled_handle, stalled_elapsed,
+                                          stalled_limit, stalled_period)
+                == WDG_ESCALATE_DEFERRED) {
+                /* The suspect holds the LastStates pool mutex: nothing was
+                   suspended and nothing was written. Clear the latch so the
+                   next scan retries (a transient Flash-write holder releases
+                   the mutex in bounded time) instead of swallowing a still-
+                   stalled task forever. The deferral itself is counted inside
+                   watchdog_escalate_stalled(). */
+                osMutexAcquire(wdg_mutex, osWaitForever);
+                wdg_tasks[stalled_idx].stalled = 0u;
+                osMutexRelease(wdg_mutex);
+            }
         }
 
         /* Check every WDG_MONITOR_PERIOD_MS */
