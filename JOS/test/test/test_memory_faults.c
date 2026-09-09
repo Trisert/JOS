@@ -229,6 +229,35 @@ void test_fram_init_reports_all_selects_present(void)
     TEST_ASSERT_EQUAL_HEX8(0x00u, fram_missing_selects());
 }
 
+/* A silent select is latched into the bitmap and consumed at boot: the
+ * report persists a TRIGGER_FRAM_MISSING record (no reset). */
+void test_fram_missing_select_is_reported_at_boot(void)
+{
+    static uint8_t out[2 * LASTSTATES_ENTRY_SIZE];
+    size_t         len = sizeof(out);
+    laststates_entry_t e;
+
+    laststates_init();
+    host_i2c_set_silent(0xA6u);   /* chip 1 page 0, shifted slave byte */
+    fram_init();
+    TEST_ASSERT_EQUAL_HEX8(0x08u, fram_missing_selects());
+    TEST_ASSERT_EQUAL_INT(0, fram_report_boot());
+
+    /* The record made it into the pool with the bitmap in context[0]. */
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    TEST_ASSERT_EQUAL_size_t((size_t)LASTSTATES_ENTRY_SIZE, len);
+    memcpy(&e, out, sizeof(e));
+    TEST_ASSERT_EQUAL_UINT8(TRIGGER_FRAM_MISSING, e.trigger);
+    TEST_ASSERT_EQUAL_HEX8(0x08u, e.context[0]);
+}
+
+/* Healthy bank: the boot report is a no-op returning success. */
+void test_fram_report_boot_is_silent_on_healthy_bank(void)
+{
+    fram_init();
+    TEST_ASSERT_EQUAL_INT(0, fram_report_boot());
+}
+
 /* addr + len must not wrap in 32-bit arithmetic: 0xFFFFFFF0 + 32 is 0x10,
  * which would pass a naive `addr + len > FRAM_SIZE` bound check and hand the
  * HAL a wild range. The driver must reject it before touching the bus. */

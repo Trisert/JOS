@@ -74,6 +74,11 @@ enum {
        fault_log_malloc_failed, see faults.h). Next free value; the wire
        values above are never renumbered. */
     TRIGGER_MALLOC_FAILED     = 18,  /* pvPortMalloc() failure, then reset   */
+    /* FRAM bank incomplete at boot (fram_init() probe, see memory.h): one or
+       more of the 8 device selects did not answer. Non-fatal: the record
+       carries the missing-select bitmap in context[0] so ground can map the
+       hole. Next free value; the wire values above are never renumbered. */
+    TRIGGER_FRAM_MISSING      = 19,  /* FRAM select(s) missing at boot       */
 };
 
 /* ---------- BMS interface (stub for now) ---------- */

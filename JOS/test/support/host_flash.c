@@ -68,6 +68,11 @@ static uint32_t unlock_count;
 static uint32_t lock_count;
 static uint16_t last_i2c_dev_addr;
 
+/* Bitmask of forced-silent selects (host fault injection for the fram_init()
+ * probe): bit i silences 7-bit select 0x50+i. 0 = whole bank answers.
+ * Reset by host_flash_reset(). */
+static uint8_t i2c_silent_bits = 0U;
+
 /* Injected program failure (see host_flash_fail_program_after). */
 static int      fail_program_armed;
 static uint32_t fail_program_countdown;
@@ -138,6 +143,7 @@ void host_flash_reset(void)
 
     memset(pool, 0xFF, POOL_SIZE);   /* erased Flash */
     memset(fram, 0x00, sizeof(fram));
+    i2c_silent_bits = 0U;
 
     flash_unlocked = 0;
     erase_count    = 0u;
@@ -358,6 +364,15 @@ HAL_StatusTypeDef HAL_I2C_Mem_Write(I2C_HandleTypeDef *hi2c, uint16_t DevAddress
     return HAL_OK;
 }
 
+/* Host fault injection: force one shifted slave address silent. */
+void host_i2c_set_silent(uint16_t dev_addr_shifted)
+{
+    if ((dev_addr_shifted >= FRAM_I2C_ADDR_FIRST) &&
+        (dev_addr_shifted <= FRAM_I2C_ADDR_LAST)) {
+        i2c_silent_bits |= (uint8_t)(1U << ((dev_addr_shifted - FRAM_I2C_ADDR_FIRST) >> 1));
+    }
+}
+
 HAL_StatusTypeDef HAL_I2C_IsDeviceReady(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
                                         uint32_t Trials, uint32_t Timeout)
 {
@@ -365,8 +380,12 @@ HAL_StatusTypeDef HAL_I2C_IsDeviceReady(I2C_HandleTypeDef *hi2c, uint16_t DevAdd
     if (hi2c == NULL) {
         return HAL_ERROR;
     }
-    /* All 8 selects (0xA0..0xAE shifted) are present on the host. */
+    /* All 8 selects (0xA0..0xAE shifted) are present on the host unless
+     * forced silent above. */
     if (DevAddress < FRAM_I2C_ADDR_FIRST || DevAddress > FRAM_I2C_ADDR_LAST) {
+        return HAL_ERROR;
+    }
+    if ((i2c_silent_bits & (uint8_t)(1U << ((DevAddress - FRAM_I2C_ADDR_FIRST) >> 1))) != 0U) {
         return HAL_ERROR;
     }
     return HAL_OK;

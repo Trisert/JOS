@@ -57,6 +57,9 @@ HAL_StatusTypeDef HAL_I2C_Mem_Write(I2C_HandleTypeDef *hi2c, uint16_t DevAddress
 HAL_StatusTypeDef HAL_I2C_IsDeviceReady(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
                                         uint32_t Trials, uint32_t Timeout);
 
+/* Host fault injection: force one shifted slave address silent. */
+void host_i2c_set_silent(uint16_t dev_addr_shifted);
+
 /* ---------- Peripheral handle types (W2-6) ----------
  * App/comms/comms.c declares `extern SPI_HandleTypeDef hspi1;` and other
  * App modules reference the ADC/IWDG handles. Only the handle *objects* are

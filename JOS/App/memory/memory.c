@@ -161,6 +161,26 @@ uint8_t fram_missing_selects(void)
     return s_fram_missing;
 }
 
+/* Consume the boot probe: persist a TRIGGER_FRAM_MISSING record so a dead
+ * select is visible to ground instead of silently holey. Called once at
+ * task-level boot (after laststates_init()); a no-op on a healthy bank. */
+int fram_report_boot(void)
+{
+    laststates_entry_t e;
+
+    if (s_fram_missing == 0U) {
+        return 0;
+    }
+    memset(&e, 0, sizeof(e));
+    e.timestamp    = HAL_GetTick();
+    e.state_from   = 0U;
+    e.state_to     = 0U;
+    e.trigger      = (uint8_t)TRIGGER_FRAM_MISSING;
+    e.context[0]   = s_fram_missing;
+    e.context[1]   = 8U;   /* selects probed */
+    return laststates_write(&e);
+}
+
 /* One HAL transfer with bounded bus retry (see FRAM_I2C_TRIES). */
 static int fram_xfer(int is_write, uint16_t dev_addr, uint16_t offset,
                      uint8_t *buf, uint16_t size)
