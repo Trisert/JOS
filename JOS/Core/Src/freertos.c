@@ -119,25 +119,28 @@ void vApplicationMallocFailedHook(void)
    {
       /* Re-entry while handling the first failure: reset, do not recurse. */
       NVIC_SystemReset();
-      for (;;) {}
    }
-   s_malloc_hook_active = 1U;
-   if (__get_IPSR() != 0U)
+   else
    {
-      /* ISR context: pvPortMalloc() never runs in handler mode, so the
-         heap watermarks may be mid-update and no hook contract holds. */
-      NVIC_SystemReset();
-      for (;;) {}
+      s_malloc_hook_active = 1U;
+      if (__get_IPSR() != 0U)
+      {
+         /* ISR context: pvPortMalloc() never runs in handler mode, so the
+            heap watermarks may be mid-update and no hook contract holds. */
+         NVIC_SystemReset();
+      }
+      else if (xTaskGetSchedulerState() == taskSCHEDULER_SUSPENDED)
+      {
+         /* Suspended scheduler: a mutex holder could never run to release
+            its lock, so even the deferred path is skipped - the reset is
+            the containment either way. */
+         NVIC_SystemReset();
+      }
+      else
+      {
+         fault_log_malloc_failed();
+      }
    }
-   if (xTaskGetSchedulerState() == taskSCHEDULER_SUSPENDED)
-   {
-      /* Suspended scheduler: a mutex holder could never run to release
-         its lock, so even the deferred path is skipped - the reset is
-         the containment either way. */
-      NVIC_SystemReset();
-      for (;;) {}
-   }
-   fault_log_malloc_failed();
 }
 /* USER CODE END 5 */
 
