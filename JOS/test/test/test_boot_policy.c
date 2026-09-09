@@ -10,9 +10,9 @@
  *                                reset up to BOOT_CRC_MAX_RESET_ATTEMPTS
  *                                times to recover from a transient (SEU)
  *                                corruption, then keep booting *untrusted*
- *                                so ground can re-upload (RedPill has no
- *                                golden image and no IWDG: halting would be
- *                                an unrecoverable brick).
+ *                                so ground can re-upload (halting would
+ *                                strand the boot until the IWDG backstop
+ *                                fires instead of recovering promptly).
  *
  * Why its own executable: the retry counter and its magic word live in
  * .noinit, i.e. they are process-global static state that survives a warm

@@ -222,8 +222,8 @@ void boot_crc_apply_policy(void)
        booting, but the image stays untrusted. boot_crc_image_trusted() now
        returns 0, which confines the state machine to STATE_CRIT — beacon
        only, payloads inhibited — so ground can re-upload. Deliberately no
-       __disable_irq(); while(1): with no IWDG configured that would be an
-       unrecoverable brick. */
+       __disable_irq(); while(1): halting the boot here would strand the OBC
+       until the IWDG backstop fires instead of recovering promptly. */
 }
 
 boot_crc_status_t boot_crc_get_status(void)         { return crc_status; }

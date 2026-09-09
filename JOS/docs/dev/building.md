@@ -247,6 +247,12 @@ the Debug configuration. The command-line equivalent (if CubeIDE generated a
 > all` / CI) does not require it. Keep CubeIDE only if you prefer the IDE
 > workflow or need the RTOS Viewer debugger panel.
 
+> **After Generate Code, discard the USART1 init.** `JOS.ioc` keeps the
+> USART1 IP enabled to document PB6/PB7 + clocks, but the firmware drives
+> USART1 register-level via `usart1_dbg_init()` (the HAL UART driver is not
+> vendored). Do not merge generated `MX_USART1_UART_Init()` / `huart1` /
+> USART1 MSP code — see the `CUBEMX REGEN NOTE` in `Core/Src/main.c`.
+
 ## Flashing
 
 ```bash

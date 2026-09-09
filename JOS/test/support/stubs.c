@@ -191,7 +191,7 @@ uint32_t host_fw_crc_stamped_value(void)
  * handle is a support-file double which ignores it, so these are address-only
  * placeholders.
  *
- * hi2c2 is deliberately NOT here: support/host_flash.c already defines it
+ * hi2c1 is deliberately NOT here: support/host_flash.c already defines it
  * next to the FRAM emulation that consumes it, and both files are linked into
  * every test executable, so a second definition is a duplicate symbol.
  * ------------------------------------------------------------------------- */

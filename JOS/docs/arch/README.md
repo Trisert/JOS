@@ -76,8 +76,9 @@ its boot CRC32 or has taken three consecutive boot-phase faults
 Golden image descriptor (written by ground tooling), last 16 bytes of bank 2:
 `magic 'GLDN'` + `length` + `crc32` + `~crc32`.
 
-**Boot-fault path (no IWDG in this build).** `HAL_IWDG_MODULE_ENABLED` is off,
-so nothing external can reset a spinning fault handler. `NMI`, `HardFault`,
+**Boot-fault path.** The IWDG (~31 s, `Core/Src/hw_watchdog.c`) and the external
+STWD100 (PC15/WD_IN, WDO -> NRST) bound a spinning fault handler on their own,
+but the handlers reset promptly instead of waiting out the backstop. `NMI`, `HardFault`,
 `MemManage`, `BusFault` and `UsageFault` therefore call
 `dual_bank_handle_boot_fault()`, which records the fault in the warm-reset RAM
 scratch (`.boot_fault`, NOLOAD, SRAM1 — survives a system reset) and issues
