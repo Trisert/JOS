@@ -5,8 +5,9 @@
  * FRAM round trips). This file covers what happens when something goes
  * wrong, which is the half that matters in flight:
  *
- *   - an I2C transfer the FM24VN10-G cannot serve (a chip-boundary crossing)
- *     must be reported, not silently truncated;
+ *   - a transfer crossing a 128 KB chip boundary must be split by the driver
+ *     into one I2C transfer per chip, never handed to HAL as a single
+ *     cross-chip range (on HW it would wrap in-chip and corrupt data);
  *   - the 512 KB FRAM cyclic buffer must wrap correctly, splitting the record
  *     across the end of the bank;
  *   - a reboot must rebuild the ring cursor and the entry count from Flash;
@@ -114,34 +115,61 @@ void tearDown(void)
  * FRAM error propagation
  * ===================================================================== */
 
-/* Each FM24VN10-G is its own 16 KB address space: the device does not roll
- * over into the next chip, so a transfer that starts in chip 0 and runs past
- * its last byte is rejected by the part. The driver must return the failure
- * instead of reporting a partial write as success - a silently truncated
- * write is how a telemetry record ends up half-written in FRAM.
+/* Each FM24VN10-G latches the slave byte (chip + A16 page) at the START of a
+ * transfer: one I2C transfer cannot span two chips, and on real hardware a
+ * range past the end of the chip wraps to offset 0 of the SAME chip instead
+ * of reaching the next one. The driver must therefore split a
+ * boundary-crossing range into one HAL call per chip - a single cross-chip
+ * HAL transfer would corrupt the start of the chip while reporting success.
  *
- * The chip that was addressed is asserted too, so the failure is the
- * boundary crossing and not a mis-computed device address. */
-void test_fram_write_reports_a_transfer_crossing_a_chip_boundary(void)
+ * The last slave seen on the bus is asserted too, proving the tail of the
+ * range really went to the next chip and not back into the first one. */
+void test_fram_write_splits_a_transfer_crossing_a_chip_boundary(void)
 {
     const uint8_t payload[8] = { 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u };
+    uint8_t       readback[8];
 
     fram_init();
 
-    TEST_ASSERT_EQUAL_INT(-1, fram_write(FRAM_CHIP_SIZE - 4u, payload, sizeof(payload)));
-    TEST_ASSERT_EQUAL_HEX16(0xA2u, host_flash_last_i2c_addr());  /* chip 0 page 1, shifted */
+    TEST_ASSERT_EQUAL_INT(0, fram_write(FRAM_CHIP_SIZE - 4u, payload, sizeof(payload)));
+    TEST_ASSERT_EQUAL_HEX16(0xA4u, host_flash_last_i2c_addr());  /* tail went to chip 1 page 0, shifted */
+
+    memset(readback, 0, sizeof(readback));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(FRAM_CHIP_SIZE - 4u, readback, sizeof(readback)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, readback, sizeof(payload));
 }
 
-void test_fram_read_reports_a_transfer_crossing_a_chip_boundary(void)
+void test_fram_read_splits_a_transfer_crossing_a_chip_boundary(void)
 {
-    uint8_t buf[8];
+    const uint8_t payload[8] = { 0xA1u, 0xA2u, 0xA3u, 0xA4u, 0xB1u, 0xB2u, 0xB3u, 0xB4u };
+    uint8_t       buf[8];
 
     fram_init();
-    memset(buf, 0xC3, sizeof(buf));
 
-    TEST_ASSERT_EQUAL_INT(-1, fram_read(FRAM_CHIP_SIZE - 4u, buf, sizeof(buf)));
-    TEST_ASSERT_EQUAL_HEX16(0xA2u, host_flash_last_i2c_addr());
-    TEST_ASSERT_EQUAL_HEX8(0xC3u, buf[0]);   /* nothing was handed back */
+    /* Seed both sides with single-chip writes, then read back across. */
+    TEST_ASSERT_EQUAL_INT(0, fram_write(FRAM_CHIP_SIZE - 4u, payload, 4u));
+    TEST_ASSERT_EQUAL_INT(0, fram_write(FRAM_CHIP_SIZE, payload + 4u, 4u));
+
+    memset(buf, 0xC3, sizeof(buf));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(FRAM_CHIP_SIZE - 4u, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_HEX16(0xA4u, host_flash_last_i2c_addr());  /* tail came from chip 1 page 0, shifted */
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, buf, sizeof(buf));
+}
+
+/* addr + len must not wrap in 32-bit arithmetic: 0xFFFFFFF0 + 32 is 0x10,
+ * which would pass a naive `addr + len > FRAM_SIZE` bound check and hand the
+ * HAL a wild range. The driver must reject it before touching the bus. */
+void test_fram_rejects_an_address_length_combination_that_wraps(void)
+{
+    uint8_t buf[32];
+
+    fram_init();
+    memset(buf, 0x5Au, sizeof(buf));
+
+    TEST_ASSERT_EQUAL_INT(-1, fram_write(0xFFFFFFF0u, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, fram_read(0xFFFFFFF0u, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, cyclic_buffer_read(0xFFFFFFF0u, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_HEX16(0xFFFFu, host_flash_last_i2c_addr());  /* rejected: bus untouched */
 }
 
 /* =====================================================================

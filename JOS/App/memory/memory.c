@@ -106,9 +106,10 @@ extern I2C_HandleTypeDef hi2c1;
 
 /* The STM32 HAL I2C entry points take the device address ALREADY shifted left
  * by one (the 8-bit device-select byte, R/W bit clear). The FM24VN10-G bank
- * answers on 7-bit 0x50..0x57 (chip in bits 3..2, A16 page select in bit 1),
+ * answers on 7-bit 0x50..0x57 (chip in bits 2..1, A16 page select in bit 0),
  * so the bytes that must reach HAL_I2C_Mem_Read/Write are
- * 0xA0/0xA2/0xA4/0xA6/0xA8/0xAA/0xAC/0xAE. Passing a raw 7-bit value puts
+ * 0xA0/0xA2/0xA4/0xA6/0xA8/0xAA/0xAC/0xAE (chip in bits 3..2, page select in
+ * bit 1 of the shifted byte). Passing a raw 7-bit value puts
  * 0x28 on the bus and addresses nothing. */
 static uint16_t fram_addr_to_dev(uint32_t addr)
 {
@@ -128,29 +129,74 @@ void fram_init(void)
     /* TODO: verify each chip responds at its I2C address */
 }
 
+/* Total-size bound check, safe against uint32 wrap: addr and len arrive in
+ * different widths (uint32_t vs size_t, 64 bit wide on the host), so testing
+ * `addr + len > FRAM_SIZE` in 32-bit arithmetic can wrap past zero and pass
+ * an out-of-bank range (e.g. addr = 0xFFFFFFF0, len = 32 sums to 0x10). The
+ * 64-bit sum cannot wrap, so a range past the end of the bank - wrapped or
+ * not - is always rejected. */
+static int fram_range_valid(uint32_t addr, size_t len)
+{
+    return ((uint64_t)addr + (uint64_t)len) <= (uint64_t)FRAM_SIZE;
+}
+
+/* One HAL transfer serves a single chip: the FM24VN10-G latches the slave
+ * byte (chip + A16 page) at START, and a transfer past the end of the chip
+ * wraps to offset 0 of the SAME chip on real hardware (rollover only at
+ * 1FFFFh -> 00000h), silently corrupting it. fram_read()/fram_write()
+ * therefore split at every 128 KB chip boundary - one HAL call per chip,
+ * chunked further to 0xFFFF B, the widest the HAL uint16_t size takes - so
+ * no caller can hand HAL a cross-chip range. The A16 page boundary inside a
+ * chip needs no split: the part streams across it. */
 int fram_read(uint32_t addr, uint8_t *buf, size_t len)
 {
-    if (addr + len > FRAM_SIZE) return -1;
+    if (!fram_range_valid(addr, len)) return -1;
+    if ((len > 0U) && (buf == NULL)) return -1;
 
-    uint16_t dev_addr = fram_addr_to_dev(addr);
-    uint16_t offset = fram_addr_to_offset(addr);
+    while (len > 0U) {
+        size_t   to_chip_end = (size_t)(FM24VN_CHIP_SIZE -
+                                (addr & (uint32_t)(FM24VN_CHIP_SIZE - 1U)));
+        size_t   chunk = (len < to_chip_end) ? len : to_chip_end;
+        uint16_t dev_addr;
+        uint16_t offset;
 
-    if (HAL_I2C_Mem_Read(&hi2c1, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
-                         buf, (uint16_t)len, 1000) != HAL_OK)
-        return -1;
+        if (chunk > 0xFFFFU) chunk = 0xFFFFU;
+        dev_addr = fram_addr_to_dev(addr);
+        offset   = fram_addr_to_offset(addr);
+
+        if (HAL_I2C_Mem_Read(&hi2c1, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
+                             buf, (uint16_t)chunk, 1000) != HAL_OK)
+            return -1;
+        addr += (uint32_t)chunk;
+        buf  += chunk;
+        len  -= chunk;
+    }
     return 0;
 }
 
 int fram_write(uint32_t addr, const uint8_t *buf, size_t len)
 {
-    if (addr + len > FRAM_SIZE) return -1;
+    if (!fram_range_valid(addr, len)) return -1;
+    if ((len > 0U) && (buf == NULL)) return -1;
 
-    uint16_t dev_addr = fram_addr_to_dev(addr);
-    uint16_t offset = fram_addr_to_offset(addr);
+    while (len > 0U) {
+        size_t   to_chip_end = (size_t)(FM24VN_CHIP_SIZE -
+                                (addr & (uint32_t)(FM24VN_CHIP_SIZE - 1U)));
+        size_t   chunk = (len < to_chip_end) ? len : to_chip_end;
+        uint16_t dev_addr;
+        uint16_t offset;
 
-    if (HAL_I2C_Mem_Write(&hi2c1, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
-                          (uint8_t *)buf, (uint16_t)len, 1000) != HAL_OK)
-        return -1;
+        if (chunk > 0xFFFFU) chunk = 0xFFFFU;
+        dev_addr = fram_addr_to_dev(addr);
+        offset   = fram_addr_to_offset(addr);
+
+        if (HAL_I2C_Mem_Write(&hi2c1, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
+                              (uint8_t *)buf, (uint16_t)chunk, 1000) != HAL_OK)
+            return -1;
+        addr += (uint32_t)chunk;
+        buf  += chunk;
+        len  -= chunk;
+    }
     return 0;
 }
 
@@ -217,7 +263,10 @@ int cyclic_buffer_write(const uint8_t *data, size_t len)
 
 int cyclic_buffer_read(uint32_t offset, uint8_t *buf, size_t len)
 {
-    if (offset + len > FRAM_SIZE) return -1;
+    /* Same wrap-safe bound check as fram_range_valid(): offset + len in
+     * 32-bit arithmetic can wrap past zero. fram_read() re-checks and splits
+     * at chip boundaries, so a multi-chip read is served, not rejected. */
+    if (((uint64_t)offset + (uint64_t)len) > (uint64_t)FRAM_SIZE) return -1;
     return fram_read(offset, buf, len);
 }
 

@@ -441,8 +441,8 @@ void test_fram_rejects_out_of_range_access(void)
 }
 
 /* The STM32 HAL I2C API takes the device address already shifted left by one.
- * The bank answers on 7-bit 0x50..0x57 (chip in bits 3..2, A16 page select
- * in bit 1), so the bytes that must reach HAL_I2C_Mem_Read/Write for the
+ * The bank answers on 7-bit 0x50..0x57 (chip in bits 2..1, A16 page select
+ * in bit 0), so the bytes that must reach HAL_I2C_Mem_Read/Write for the
  * page-0 window of each chip are 0xA0, 0xA4, 0xA8, 0xAC. Handing the HAL the
  * raw 7-bit value would address 0x28 on the real bus, and no host double is
  * allowed to paper over that. */
