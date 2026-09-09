@@ -114,8 +114,9 @@ void fault_dwt_enable(void)
  * the image ever incremented uwTick: SysTick_Handler() in stm32l4xx_it.c was
  * empty and HAL_IncTick() had no callers, so EVERY record - fault, boot CRC,
  * SEU, dual bank - carried timestamp 0 and the post-mortem trail could not be
- * ordered at all. SysTick_Handler() now calls HAL_IncTick() (and the FreeRTOS
- * tick hook), so HAL_GetTick() is a real millisecond counter.
+ * ordered at all. TIM6 (the HAL timebase, see stm32l4xx_hal_timebase_tim.c)
+ * calls HAL_IncTick() while SysTick_Handler() calls only the FreeRTOS tick
+ * hook, so HAL_GetTick() is a real millisecond counter.
  *
  * A fault handler still cannot rely on it alone: a fault taken before
  * HAL_Init() (MPU setup, clock configuration, boot-CRC verification) sees
