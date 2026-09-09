@@ -100,6 +100,12 @@ void temp_inject_ops(const temp_bus_ops_t *ops)
 {
     g_ops = ops;
 }
+
+/* Unit-test seam: bind the flight PB2 backend back (see temp.h). */
+void temp_restore_flight_ops(void)
+{
+    g_ops = &pb2_ops;
+}
 #endif
 
 /* ---------- Byte-level protocol (backend-agnostic) ---------- */

@@ -67,6 +67,11 @@ typedef struct {
 #ifdef HOST_UNIT_TEST
 /* Unit-test seam: replace the PB2 backend (default) with a scripted model. */
 void temp_inject_ops(const temp_bus_ops_t *ops);
+
+/* Unit-test seam: bind the flight PB2 backend back after temp_inject_ops().
+ * Lets a test drive pb2_reset()/pb2_write_bit()/pb2_read_bit() through the
+ * HAL GPIO doubles (fakes/main.h + support/hal_stubs.c). */
+void temp_restore_flight_ops(void);
 #endif
 
 #endif /* TEMP_H */

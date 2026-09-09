@@ -23,6 +23,7 @@
 
 #include "unity.h"
 #include "temp.h"
+#include "host_support.h"     /* host_gpio_* for the flight-backend test */
 
 #include <string.h>
 
@@ -410,5 +411,78 @@ void test_read_stuck_conversion_times_out(void)
 
     TEST_ASSERT_EQUAL_INT(4, temp_init());
     emu_stuck = 1;
+    TEST_ASSERT_TRUE(temp_read_tenths_c(0u, &v) < 0);
+}
+
+/* ---------- Flight PB2 backend (via the HAL GPIO doubles) ---------- */
+
+/* The flight backend (pb2_reset/write_bit/read_bit) runs the same
+ * SEARCHADDR exchange through the real HAL GPIO doubles: presence forced
+ * LOW traces the all-zero ROM path, which the family check then rejects.
+ * What this pins is that the backend runs end to end without a slave. */
+void test_flight_backend_search_runs_on_gpio_doubles(void)
+{
+    temp_restore_flight_ops();
+    host_gpio_reset();
+    host_gpio_force_input(2, 0);   /* PB2: presence pulse, then all-zero */
+    TEST_ASSERT_EQUAL_INT(0, temp_init());
+    TEST_ASSERT_EQUAL_INT(0, temp_sensor_count());
+}
+
+/* Reset answers, but every bus level reads HIGH: the SEARCHADDR triplet
+ * sees (1,1) — no device answered mid-search — and enumeration stops. */
+static int high_reset(void) { return 1; }
+static void high_write(int b) { (void)b; }
+static int high_read(void) { return 1; }
+static const temp_bus_ops_t high_ops = {
+    .reset     = high_reset,
+    .write_bit = high_write,
+    .read_bit  = high_read,
+};
+
+void test_init_rejects_no_device_triplet(void)
+{
+    temp_inject_ops(&high_ops);
+    TEST_ASSERT_EQUAL_INT(0, temp_init());
+    TEST_ASSERT_EQUAL_INT(0, temp_sensor_count());
+}
+
+/* ---------- Mid-read bus loss ---------- */
+
+/* Same emulator underneath, but the reset line drops on one chosen call:
+ * lets the second address_sensor() in temp_read_tenths_c() fail after a
+ * good enumeration, CONVERT and poll. */
+static int wrap_resets;
+static int wrap_fail_at = -1;   /* 1-based reset call to fail, -1 = never */
+
+static int wrap_reset(void)
+{
+    wrap_resets++;
+    if (wrap_resets == wrap_fail_at) {
+        return 0;
+    }
+    return emu_reset();
+}
+
+static void wrap_write(int b) { emu_write_bit(b); }
+static int wrap_read(void) { return emu_read_bit(); }
+
+static const temp_bus_ops_t wrap_ops = {
+    .reset     = wrap_reset,
+    .write_bit = wrap_write,
+    .read_bit  = wrap_read,
+};
+
+void test_read_fails_when_second_address_reset_lost(void)
+{
+    int16_t v = 0x7FFF;
+
+    temp_inject_ops(&wrap_ops);
+    wrap_resets = 0;
+    wrap_fail_at = -1;
+    TEST_ASSERT_EQUAL_INT(4, temp_init());
+    /* Enumeration spent one reset per device; the read below spends one
+     * reset per address_sensor(): fail the second. */
+    wrap_fail_at = wrap_resets + 2;
     TEST_ASSERT_TRUE(temp_read_tenths_c(0u, &v) < 0);
 }
