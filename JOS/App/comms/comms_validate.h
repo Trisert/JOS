@@ -53,6 +53,16 @@
  *     bounds-checked before use; fixed upper bounds on every loop.
  *   - NASA-STD-8739.8 : command validation — malformed, oversized, unknown or
  *     out-of-range commands are rejected, never executed.
+ *
+ * LAYER COUPLING (deliberate): this header includes obsw_types.h for
+ * BEACON_INTERVAL_MIN/MAX, so the comms layer depends on the obsw layer for
+ * exactly one fact — the beacon cadence band. That keeps a single source of
+ * truth: a separate copy here previously accepted [1 s, 1 h] while the state
+ * machine enforced [10 s, 16 min], letting an uplink pass validation that
+ * was then rejected at apply time. The dependency is one-directional
+ * (obsw never includes comms_validate.h) and limited to integer constants,
+ * so no init-order or link-cycle risk. Decoupling would reintroduce the
+ * two-band drift — documented here so it is never "cleaned up" apart.
  */
 
 #include <stdbool.h>
@@ -149,6 +159,13 @@ typedef enum {
     COMMS_TC_ERR_PARAM_RANGE,   /**< numeric parameter outside min/max bounds */
     COMMS_TC_ERR_MAC,           /**< missing or invalid HMAC tag (appended last
                                      so all existing verdict values are stable) */
+    COMMS_TC_ERR_PHY            /**< radio rejected the frame below the validator
+                                     (oversize PHY payload, read error). Never
+                                     returned by comms_validate_tc() — only
+                                     accounted by the RX task via
+                                     comms_rx_account() so PHY drops are not a
+                                     stat blind spot. */
+>>>>>>> 3dab375 (fix(comms): hunt findings on framing — msg id, abort counting, PHY stats)
 } comms_tc_result_t;
 
 /** RX acceptance/rejection counters (telemetry + ground diagnostics). */
@@ -160,6 +177,7 @@ typedef struct {
     uint32_t rejected_opcode;
     uint32_t rejected_range;      /**< payload length or parameter range      */
     uint32_t rejected_mac;        /**< missing or invalid HMAC tag            */
+    uint32_t rejected_phy;        /**< radio dropped it below the validator   */
 } comms_rx_stats_t;
 
 /**

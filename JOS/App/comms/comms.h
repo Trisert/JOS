@@ -10,10 +10,18 @@
 #define COMMS_MAX_PACKET   64U    /* LoRa payload chunk */
 #define COMMS_BEACON_SIZE  128U   /* 96 B telemetry + 32 B system */
 
-/* Chunk framing header (see lora_send_chunked): byte 0 = seq (0-based),
-   byte 1 = total chunk count. Payload per chunk is therefore
-   COMMS_MAX_PACKET - COMMS_CHUNK_HDR_LEN; the 128 B beacon ships as 3 chunks. */
-#define COMMS_CHUNK_HDR_LEN 2U
+/* Chunk framing header (see lora_send_chunked): byte 0 = message id, byte 1 =
+   0-based sequence number, byte 2 = total chunk count. Payload per chunk is
+   therefore COMMS_MAX_PACKET - COMMS_CHUNK_HDR_LEN; the 128 B beacon ships as
+   3 chunks. The message id is a monotonic per-sequence counter: consecutive
+   beacons carry consecutive ids, so the ground segment can tell two beacons
+   apart, spot a missing message, and flag a duplicate (same id + seq seen
+   twice, e.g. a re-driven TX_DONE). Wraps mod 256 — duplicates are only
+   unambiguous within a 256-message window, which is plenty at beacon rates. */
+#define COMMS_CHUNK_HDR_LEN 3U
+#define COMMS_CHUNK_OFF_MSG   0U
+#define COMMS_CHUNK_OFF_SEQ   1U
+#define COMMS_CHUNK_OFF_TOTAL 2U
 
 /* RX task wake flag (DIO1 RX_DONE). Must match LORA_FLAG_RX_DONE in
    radiolib_driver.cpp so the ISR and the task agree on the bit. */
@@ -32,12 +40,36 @@ void lora_rx_task(void *arg);
 
 /* Send data in chunks of at most COMMS_MAX_PACKET bytes.
  *
- * Every chunk carries a COMMS_CHUNK_HDR_LEN-byte header (byte 0 = 0-based
- * sequence number, byte 1 = total chunk count) so the ground segment can
- * detect a lost/reordered chunk and reassemble the payload. Returns 0 on
+ * Every chunk carries a COMMS_CHUNK_HDR_LEN-byte header (byte 0 = message id,
+ * byte 1 = 0-based sequence number, byte 2 = total chunk count) so the
+ * ground segment can tell consecutive messages apart, detect a
+ * lost/duplicated/reordered chunk and reassemble the payload. Returns 0 on
  * success, -1 on NULL/length errors, an undersized TX buffer, a count that
- * would not fit in the 1-byte total field, or a radio error. */
+ * would not fit in the 1-byte total field, or a radio error.
+ *
+ * Failure semantics: the sequence aborts at the first failed chunk (no
+ * further chunks go on air — a partial message is always detectable via its
+ * total field) and the failure is counted in the TX stats below. The beacon
+ * task retries the whole message at the next interval.
+ *
+ * Blocking: one lora_tx_wait_done() (up to 2000 ms) per chunk. The 128 B
+ * beacon is 3 chunks, so a beacon TX blocks this task for up to ~6 s. That
+ * is covered by the watchdog with huge margin — the beacon task is monitored
+ * against its 1..16 min cadence (flagged only after 3x the period, i.e. no
+ * earlier than 3 min), so no mid-sequence kick is needed. */
 int lora_send_chunked(const uint8_t *data, size_t len);
+
+/* TX sequence counters (telemetry + ground diagnostics). A failed sequence
+ * means the message was truncated on air — always cross-check chunks_sent
+ * against the per-message total field on the ground. */
+typedef struct {
+    uint32_t sequences_ok;      /**< fully transmitted messages            */
+    uint32_t sequences_failed;  /**< aborted mid-sequence (radio error)    */
+    uint32_t chunks_sent;       /**< chunks handed to the radio, all time  */
+} comms_tx_stats_t;
+
+/* Snapshot of the TX counters. Safe with @p out == NULL. */
+void comms_tx_get_stats(comms_tx_stats_t *out);
 
 /* Validate a raw uplink frame and dispatch it only when it is well formed,
  * CRC-clean, HMAC-authenticated, of a whitelisted opcode and with in-range

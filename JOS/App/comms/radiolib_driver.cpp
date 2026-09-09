@@ -41,6 +41,15 @@ extern "C" void lora_rx_task_register(osThreadId_t handle)
     g_rx_handle = handle;
 }
 
+/* Oversize-PHY drops since boot (diagnostics): frames the radio delivered
+   that did not fit the caller's buffer and were rejected, never truncated. */
+static uint32_t g_rx_oversize_drops = 0U;
+
+extern "C" uint32_t lora_rx_oversize_drops(void)
+{
+    return g_rx_oversize_drops;
+}
+
 extern "C" int lora_init(void)
 {
     /* Bind virtual pins to real OBC V2.0 GPIO (radiolib_hal.h, main.h):
@@ -111,11 +120,14 @@ extern "C" int lora_rx(uint8_t* buf, size_t* len)
         /* Oversized PHY payload: REJECT, never deliver a truncated frame. A
            silent truncation would hand the validator a well-formed-looking
            prefix of a longer frame (wrong length/CRC semantics) and could
-           turn one uplink into a different, dispatchable command. Report the
-           actual on-air length and let the caller drop + re-arm. The RX
-           staging buffer is COMMS_MAX_PACKET bytes, matching the
-           COMMS_TC_MAX_FRAME validation budget. */
-        *len = received;
+           turn one uplink into a different, dispatchable command.
+           *len is left holding the caller's buffer capacity (never overwritten
+           with the larger on-air length — the old code reported `received`
+           here, claiming the buffer held more bytes than it does), the drop
+           is counted, and the caller re-arms. The RX staging buffer is
+           COMMS_MAX_PACKET bytes, matching the COMMS_TC_MAX_FRAME validation
+           budget. */
+        g_rx_oversize_drops++;
         return -1;
     }
     int16_t s = radio.readData(buf, received);

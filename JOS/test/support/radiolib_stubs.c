@@ -91,29 +91,57 @@ void lora_rx_task_register(void *handle)       { (void)handle; }
 void lora_on_dio1_irq(void)                    { }
 
 /* ---------- TX call log (framing tests, host only) ----------
- * Records every lora_tx() payload (up to 64 B per call — the flight
- * COMMS_MAX_PACKET budget) so chunk-framing tests can assert per-chunk
- * lengths, seq/total headers and reassembly. Flight code never calls these;
- * they are linked into every test binary but inert unless used. */
+ * Records every lora_tx() payload (up to RADIOLIB_STUB_TX_CAP per call — the
+ * flight COMMS_MAX_PACKET budget, App/comms/comms.h) so chunk-framing tests
+ * can assert per-chunk lengths, msg/seq/total headers and reassembly. Flight
+ * code never calls these; they are linked into every test binary but inert
+ * unless used.
+ *
+ * RADIOLIB_STUB_TX_CAP must equal COMMS_MAX_PACKET. The stub deliberately
+ * does NOT include comms.h (support/ files must stay free of App headers —
+ * see project.yml), so the equality is pinned by the host test
+ * test_stub_tx_cap_matches_comms_max_packet instead of a _Static_assert. */
+#define RADIOLIB_STUB_TX_CAP 64U
 #define RADIOLIB_STUB_TX_LOG_MAX 300U
-static uint8_t stub_tx_data[RADIOLIB_STUB_TX_LOG_MAX][64];
+static uint8_t stub_tx_data[RADIOLIB_STUB_TX_LOG_MAX][RADIOLIB_STUB_TX_CAP];
 static size_t  stub_tx_len[RADIOLIB_STUB_TX_LOG_MAX];
 static size_t  stub_tx_n = 0U;
 
+/* Fault injection for the abort-path tests (reset by radiolib_stub_tx_reset):
+ * fail the Nth TX call (0-based), or fail every TX_DONE wait. A failed call
+ * is NOT logged — it never went on air. */
+static size_t stub_tx_fail_at = (size_t)-1;
+static int    stub_wait_fail  = 0;
+
+void radiolib_stub_tx_fail_at_index(size_t i) { stub_tx_fail_at = i; }
+void radiolib_stub_tx_fail_wait_done(int fail) { stub_wait_fail = fail; }
+
 int lora_tx(const uint8_t *data, size_t len)
 {
-    if ((stub_tx_n < (size_t)RADIOLIB_STUB_TX_LOG_MAX) && (data != NULL)) {
-        size_t copy = (len < 64U) ? len : 64U;
-        for (size_t i = 0U; i < copy; i++) {
+    if (data == NULL) {
+        return -1;
+    }
+    if (len > (size_t)RADIOLIB_STUB_TX_CAP) {
+        return -1;   /* past the on-air budget: fail loudly, never truncate */
+    }
+    if (stub_tx_n == stub_tx_fail_at) {
+        return -1;   /* injected mid-sequence failure */
+    }
+    if (stub_tx_n < (size_t)RADIOLIB_STUB_TX_LOG_MAX) {
+        for (size_t i = 0U; i < len; i++) {
             stub_tx_data[stub_tx_n][i] = data[i];
         }
-        stub_tx_len[stub_tx_n] = len;   /* record the FULL claimed length */
+        stub_tx_len[stub_tx_n] = len;
         stub_tx_n++;
     }
     (void)data; (void)len; return 0;
 }
 int  lora_rx(uint8_t *buf, size_t *len)       { (void)buf; if (len) *len = 0U; return 0; }
-int  lora_tx_wait_done(uint32_t timeout_ms)    { (void)timeout_ms; return 0; }
+int  lora_tx_wait_done(uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    return stub_wait_fail ? -1 : 0;
+}
 
 /* Log accessors for the framing tests (inert unless a test calls them). */
 size_t radiolib_stub_tx_count(void)            { return stub_tx_n; }
@@ -125,4 +153,9 @@ const uint8_t *radiolib_stub_tx_data(size_t i)
 {
     return (i < stub_tx_n) ? stub_tx_data[i] : (const uint8_t *)0;
 }
-void radiolib_stub_tx_reset(void)              { stub_tx_n = 0U; }
+void radiolib_stub_tx_reset(void)
+{
+    stub_tx_n      = 0U;
+    stub_tx_fail_at = (size_t)-1;
+    stub_wait_fail  = 0;
+}

@@ -64,6 +64,9 @@ uint8_t *comms_tx_buffer(size_t *len)
 /* lora_init() is implemented in radiolib_driver.cpp (target build). The host
    unit-test build links a fake from test/fakes/ instead (see B4). */
 
+/* TX sequence counters (defined below; single writer — see note there). */
+static comms_tx_stats_t tx_stats;
+
 int lora_send_chunked(const uint8_t *data, size_t len)
 {
     size_t chunk_max = 0U;
@@ -79,7 +82,7 @@ int lora_send_chunked(const uint8_t *data, size_t len)
         return -1;  /* TX buffer cannot even hold the framing header */
     }
 
-    /* Payload bytes per chunk after the 1 B seq + 1 B total header. */
+    /* Payload bytes per chunk after the msg + seq + total header. */
     const size_t payload_max = chunk_max - (size_t)COMMS_CHUNK_HDR_LEN;
 
     /* Bounded: payload_max >= 1, so total >= 1 and <= len. */
@@ -88,28 +91,64 @@ int lora_send_chunked(const uint8_t *data, size_t len)
         return -1;  /* count must fit in the 1-byte total field */
     }
 
+    /* Monotonic message id: consecutive sequences carry consecutive ids so
+       ground can distinguish beacons and flag duplicates. Wraps mod 256;
+       only consumed here (single writer — the beacon path is one task). */
+    static uint8_t tx_msg_id = 0U;
+    const uint8_t msg = tx_msg_id++;
+
     /* Hand each framed chunk to RadioLib. TX is async (startTransmit); wait
        for the DIO1 TX_DONE flag before staging the next chunk so we never
        overwrite the buffer mid-air. 2000 ms covers SF10 @ 125 kHz for the
-       largest chunk. */
+       largest chunk.
+       On ANY radio failure the sequence aborts here: no further chunks go on
+       air (the partial message is detectable via its total field), the
+       failure is counted, and the caller retries the whole message later. */
     for (size_t seq = 0U; seq < total; seq++) {
         const size_t off = seq * payload_max;   /* no overflow: seq < total <= len */
         size_t n = len - off;
         if (n > payload_max) {
             n = payload_max;
         }
-        tx[0] = (uint8_t)seq;
-        tx[1] = (uint8_t)total;
+        tx[COMMS_CHUNK_OFF_MSG]   = msg;
+        tx[COMMS_CHUNK_OFF_SEQ]   = (uint8_t)seq;
+        tx[COMMS_CHUNK_OFF_TOTAL] = (uint8_t)total;
         memcpy(&tx[COMMS_CHUNK_HDR_LEN], data + off, n);
         if (lora_tx(tx, n + (size_t)COMMS_CHUNK_HDR_LEN) != 0) {
+            tx_stats.sequences_failed++;
             return -1;
         }
+        tx_stats.chunks_sent++;
         if (lora_tx_wait_done(2000U) != 0) {
+            tx_stats.sequences_failed++;
             return -1;
         }
     }
+    tx_stats.sequences_ok++;
     return 0;
 }
+
+/* ---------- TX counters ---------- */
+
+/* TX counters live at file scope above (single writer — lora_send_chunked()
+ * runs only on the beacon task, so the increments never race). Same snapshot
+ * semantics as the RX counters in comms_validate.c (diagnostics-grade, not
+ * flight-critical). */
+void comms_tx_get_stats(comms_tx_stats_t *out)
+{
+    if (out != NULL) {
+        out->sequences_ok     = tx_stats.sequences_ok;
+        out->sequences_failed = tx_stats.sequences_failed;
+        out->chunks_sent      = tx_stats.chunks_sent;
+    }
+}
+
+/* Compile-time proof for the chunk_max <= HDR guard above: with the fixed
+   SRAM2 sizing the TX buffer always holds a header plus payload. If someone
+   ever shrinks COMMS_MAX_PACKET to the header size, this — not a runtime
+   field failure — tells them. */
+_Static_assert(COMMS_MAX_PACKET > COMMS_CHUNK_HDR_LEN,
+               "TX buffer must hold the chunk header plus payload");
 
 /* ---------- Telecommand dispatcher (private) ---------- */
 
@@ -259,10 +298,20 @@ void lora_beacon_task(void *arg)
            TODO: full telemetry encoding. For now transmit the staging buffer
            as-is so the link is exercised end-to-end. The 128 B beacon does
            NOT fit one LoRa payload (COMMS_MAX_PACKET = 64): fragment it via
-           lora_send_chunked(), which frames every chunk with a 1 B seq + 1 B
-           total header (3 chunks on the air). */
+           lora_send_chunked(), which frames every chunk with a msg + seq +
+           total header (3 chunks on the air).
+           A failed sequence is already counted in the TX stats by
+           lora_send_chunked() — the whole message is retried here at the next
+           interval, never resumed mid-sequence (ground detects the truncation
+           via the total field).
+           Blocking note: a full beacon holds this task for up to ~6 s
+           (3 x 2 s TX_DONE waits). The watchdog judges this task against its
+           1..16 min cadence and flags it only after 3x the period (>= 3 min),
+           so the block is two orders of magnitude inside the monitor window. */
         if (beacon_len > 0U) {
-            (void)lora_send_chunked(beacon, beacon_len);
+            if (lora_send_chunked(beacon, beacon_len) != 0) {
+                /* counted — retry the whole message next interval */
+            }
         }
 
         osDelay(pdMS_TO_TICKS(interval));
@@ -328,6 +377,11 @@ void lora_rx_task(void *arg)
                     const char *why = comms_tc_result_str(r);
                     (void)why;  /* TODO: forward `why` to telemetry/log sink */
                 }
+            } else {
+                /* PHY-level reject (oversize payload or radio read error):
+                   the frame never reached the validator, so account it here —
+                   otherwise the drop is a blind spot in the RX stats. */
+                comms_rx_account(COMMS_TC_ERR_PHY);
             }
 
             /* Re-arm RX for the next frame. */

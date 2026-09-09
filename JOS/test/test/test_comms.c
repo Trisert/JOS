@@ -27,7 +27,12 @@
  *     out-of-range parameter) is rejected AND never dispatched.
  *   - well-formed frames for every whitelisted opcode are accepted and reach
  *     exactly the expected action.
- *   - RX accounting counters classify each verdict correctly.
+ *   - RX accounting counters classify each verdict correctly (including the
+ *     PHY bucket for frames the radio drops below the validator).
+ *   - chunk framing: msg/seq/total headers, consecutive-message ids, the
+ *     255-chunk cap, mid-sequence abort + TX stats, and a ground reassembly
+ *     model proving loss/duplicate/mixed-message detection and
+ *     reorder-tolerant reassembly.
  *   - lora_rx_task_create()/lora_beacon_task_create() register with the
  *     watchdog monitor, and their loops kick it on every iteration.
  *
@@ -51,11 +56,17 @@
 #include <signal.h>             /* SIGALRM hang ceiling for task-loop tests  */
 
 /* TX call log in support/radiolib_stubs.c (host only): lets the framing tests
-   assert the exact on-air chunks (lengths, seq/total headers, reassembly). */
+   assert the exact on-air chunks (lengths, msg/seq/total headers, reassembly). */
 extern size_t          radiolib_stub_tx_count(void);
 extern size_t          radiolib_stub_tx_len(size_t i);
 extern const uint8_t  *radiolib_stub_tx_data(size_t i);
 extern void            radiolib_stub_tx_reset(void);
+/* Fault injection in the same stub: fail the Nth TX call, or fail every
+   TX_DONE wait. Armed by the abort-path tests, cleared by _reset(). */
+extern void            radiolib_stub_tx_fail_at_index(size_t i);
+extern void            radiolib_stub_tx_fail_wait_done(int fail);
+/* Direct stub entry points (the past-cap loud-fail test calls lora_tx). */
+extern int             lora_tx(const uint8_t *data, size_t len);
 
 /* ---------- Frame builder ---------- */
 
@@ -348,10 +359,11 @@ void test_validate_reports_null_payload_for_empty_command(void)
 
 void test_result_strings_are_never_null(void)
 {
-    for (int r = COMMS_TC_OK; r <= COMMS_TC_ERR_MAC; r++) {
+    for (int r = COMMS_TC_OK; r <= COMMS_TC_ERR_PHY; r++) {
         TEST_ASSERT_NOT_NULL(comms_tc_result_str((comms_tc_result_t)r));
     }
     TEST_ASSERT_EQUAL_STRING("MAC", comms_tc_result_str(COMMS_TC_ERR_MAC));
+    TEST_ASSERT_EQUAL_STRING("PHY", comms_tc_result_str(COMMS_TC_ERR_PHY));
     TEST_ASSERT_EQUAL_STRING("UNKNOWN", comms_tc_result_str((comms_tc_result_t)999));
 }
 
@@ -460,7 +472,7 @@ void test_rx_gate_dispatches_reset(void)
 void test_rx_gate_dispatches_in_range_beacon_interval(void)
 {
     uint8_t p[4];
-    put_be32(p, 60000UL);                    /* 60 s — inside [1 s, 1 h] */
+    put_be32(p, 60000UL);                    /* 60 s — inside [10 s, 16 min] */
     state_machine_set_beacon_interval_ExpectAndReturn(60000UL, 0);
     size_t n = build_auth_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U);
     TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_frame(frame_buf, n));
@@ -938,11 +950,11 @@ void test_lora_init_reports_success(void)
 }
 
 /* lora_send_chunked() stages the payload through the SRAM2 TX buffer in framed
-   chunks: every radio call carries a 2-byte header (0-based seq, total count)
-   plus up to COMMS_MAX_PACKET - COMMS_CHUNK_HDR_LEN payload bytes. The radio
-   itself is a recording stub (support/radiolib_stubs.c), so what is verified
-   is the on-air framing contract: per-chunk lengths within the LoRa budget,
-   seq/total headers, and byte-exact reassembly. */
+   chunks: every radio call carries a 3-byte header (message id, 0-based seq,
+   total count) plus up to COMMS_MAX_PACKET - COMMS_CHUNK_HDR_LEN payload
+   bytes. The radio itself is a recording stub (support/radiolib_stubs.c), so
+   what is verified is the on-air framing contract: per-chunk lengths within
+   the LoRa budget, msg/seq/total headers, and byte-exact reassembly. */
 void test_lora_send_chunked_rejects_null_with_nonzero_length(void)
 {
     TEST_ASSERT_EQUAL_INT(-1, lora_send_chunked(NULL, 16U));
@@ -981,11 +993,14 @@ void test_lora_send_chunked_stages_multi_chunk_payload(void)
     TEST_ASSERT_EQUAL_size_t(7U + (size_t)COMMS_CHUNK_HDR_LEN,
                              radiolib_stub_tx_len(1));
 
-    /* Headers: 0-based seq, total count. */
-    TEST_ASSERT_EQUAL_UINT8(0U, radiolib_stub_tx_data(0)[0]);
-    TEST_ASSERT_EQUAL_UINT8(2U, radiolib_stub_tx_data(0)[1]);
-    TEST_ASSERT_EQUAL_UINT8(1U, radiolib_stub_tx_data(1)[0]);
-    TEST_ASSERT_EQUAL_UINT8(2U, radiolib_stub_tx_data(1)[1]);
+    /* Headers: one message id shared by both chunks, 0-based seq, total. */
+    const uint8_t *c0 = radiolib_stub_tx_data(0);
+    const uint8_t *c1 = radiolib_stub_tx_data(1);
+    TEST_ASSERT_EQUAL_UINT8(c0[COMMS_CHUNK_OFF_MSG], c1[COMMS_CHUNK_OFF_MSG]);
+    TEST_ASSERT_EQUAL_UINT8(0U, c0[COMMS_CHUNK_OFF_SEQ]);
+    TEST_ASSERT_EQUAL_UINT8(2U, c0[COMMS_CHUNK_OFF_TOTAL]);
+    TEST_ASSERT_EQUAL_UINT8(1U, c1[COMMS_CHUNK_OFF_SEQ]);
+    TEST_ASSERT_EQUAL_UINT8(2U, c1[COMMS_CHUNK_OFF_TOTAL]);
 
     /* Payload slices land after the header, byte-exact. */
     TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, &radiolib_stub_tx_data(0)[COMMS_CHUNK_HDR_LEN],
@@ -994,12 +1009,13 @@ void test_lora_send_chunked_stages_multi_chunk_payload(void)
                                   &radiolib_stub_tx_data(1)[COMMS_CHUNK_HDR_LEN], 7);
 
     /* The staging buffer holds the LAST chunk staged: header + remainder. */
-    TEST_ASSERT_EQUAL_UINT8(1U, tx[0]);
-    TEST_ASSERT_EQUAL_UINT8(2U, tx[1]);
+    TEST_ASSERT_EQUAL_UINT8(c1[COMMS_CHUNK_OFF_MSG], tx[COMMS_CHUNK_OFF_MSG]);
+    TEST_ASSERT_EQUAL_UINT8(1U, tx[COMMS_CHUNK_OFF_SEQ]);
+    TEST_ASSERT_EQUAL_UINT8(2U, tx[COMMS_CHUNK_OFF_TOTAL]);
     TEST_ASSERT_EQUAL_UINT8_ARRAY(&payload[payload_max], &tx[COMMS_CHUNK_HDR_LEN], 7);
 }
 
-/* A payload that fits one chunk still gets its seq/total header (seq 0 of 1),
+/* A payload that fits one chunk still gets its full header (seq 0 of 1),
    so the ground segment sees one framing format, never two. */
 void test_lora_send_chunked_single_chunk_carries_seq_zero_total_one(void)
 {
@@ -1016,14 +1032,14 @@ void test_lora_send_chunked_single_chunk_carries_seq_zero_total_one(void)
                              radiolib_stub_tx_len(0));
     const uint8_t *c = radiolib_stub_tx_data(0);
     TEST_ASSERT_NOT_NULL(c);
-    TEST_ASSERT_EQUAL_UINT8(0U, c[0]);
-    TEST_ASSERT_EQUAL_UINT8(1U, c[1]);
+    TEST_ASSERT_EQUAL_UINT8(0U, c[COMMS_CHUNK_OFF_SEQ]);
+    TEST_ASSERT_EQUAL_UINT8(1U, c[COMMS_CHUNK_OFF_TOTAL]);
     TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, &c[COMMS_CHUNK_HDR_LEN], sizeof(payload));
 }
 
-/* The 128 B beacon must ship as ceil(128/62) = 3 framed chunks, each within
+/* The 128 B beacon must ship as ceil(128/61) = 3 framed chunks, each within
    the 64 B LoRa budget, reassembling byte-exact — never as one 128 B call
-   that violates COMMS_MAX_PACKET. */
+   that violates COMMS_MAX_PACKET. All three chunks share one message id. */
 void test_lora_send_chunked_fragments_128B_beacon_within_budget(void)
 {
     size_t chunk_max = 0U;
@@ -1038,6 +1054,7 @@ void test_lora_send_chunked_fragments_128B_beacon_within_budget(void)
     TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(beacon, sizeof(beacon)));
 
     TEST_ASSERT_EQUAL_size_t(3U, radiolib_stub_tx_count());
+    const uint8_t msg = radiolib_stub_tx_data(0)[COMMS_CHUNK_OFF_MSG];
     size_t off = 0U;
     for (size_t i = 0U; i < 3U; i++) {
         const size_t   ln = radiolib_stub_tx_len(i);
@@ -1045,8 +1062,9 @@ void test_lora_send_chunked_fragments_128B_beacon_within_budget(void)
         TEST_ASSERT_LESS_OR_EQUAL_size_t(chunk_max, ln);
         TEST_ASSERT_GREATER_THAN_size_t((size_t)COMMS_CHUNK_HDR_LEN, ln);
         TEST_ASSERT_NOT_NULL(c);
-        TEST_ASSERT_EQUAL_UINT8((uint8_t)i, c[0]);
-        TEST_ASSERT_EQUAL_UINT8(3U, c[1]);
+        TEST_ASSERT_EQUAL_UINT8(msg, c[COMMS_CHUNK_OFF_MSG]);
+        TEST_ASSERT_EQUAL_UINT8((uint8_t)i, c[COMMS_CHUNK_OFF_SEQ]);
+        TEST_ASSERT_EQUAL_UINT8(3U, c[COMMS_CHUNK_OFF_TOTAL]);
         const size_t n = ln - (size_t)COMMS_CHUNK_HDR_LEN;
         TEST_ASSERT_EQUAL_UINT8_ARRAY(&beacon[off], &c[COMMS_CHUNK_HDR_LEN], n);
         off += n;
@@ -1060,6 +1078,327 @@ void test_lora_send_chunked_empty_payload_sends_nothing(void)
     radiolib_stub_tx_reset();
     TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(frame_buf, 0U));
     TEST_ASSERT_EQUAL_size_t(0U, radiolib_stub_tx_count());
+}
+
+/* Consecutive messages carry consecutive ids: ground can tell two beacons
+   apart and spot a missing one. (Ids wrap mod 256 — the +1 arithmetic below
+   is wraparound-safe by construction.) */
+void test_lora_send_chunked_tags_consecutive_messages_with_distinct_ids(void)
+{
+    uint8_t payload[10];
+    for (size_t i = 0U; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)(0x50U + i);
+    }
+
+    radiolib_stub_tx_reset();
+    TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(payload, sizeof(payload)));
+    TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(payload, sizeof(payload)));
+
+    TEST_ASSERT_EQUAL_size_t(2U, radiolib_stub_tx_count());
+    const uint8_t *a = radiolib_stub_tx_data(0);
+    const uint8_t *b = radiolib_stub_tx_data(1);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)(a[COMMS_CHUNK_OFF_MSG] + 1U),
+                            b[COMMS_CHUNK_OFF_MSG]);
+}
+
+/* The 1-byte total field caps a message at 255 chunks: anything longer is
+   rejected before the first chunk goes on air (and, as a pre-air validation
+   failure, is NOT counted as a radio abort in the TX stats). */
+void test_lora_send_chunked_rejects_total_beyond_255(void)
+{
+    size_t chunk_max = 0U;
+    (void)comms_tx_buffer(&chunk_max);
+    const size_t payload_max = chunk_max - (size_t)COMMS_CHUNK_HDR_LEN;
+
+    static uint8_t big[256U * 64U];
+    const size_t len = 255U * payload_max + 1U;   /* needs 256 chunks */
+    TEST_ASSERT_LESS_THAN_size_t(sizeof(big) + 1U, len);
+
+    radiolib_stub_tx_reset();
+    comms_tx_stats_t before, after;
+    comms_tx_get_stats(&before);
+    TEST_ASSERT_EQUAL_INT(-1, lora_send_chunked(big, len));
+    TEST_ASSERT_EQUAL_size_t(0U, radiolib_stub_tx_count());
+    comms_tx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.sequences_ok, after.sequences_ok);
+    TEST_ASSERT_EQUAL_UINT32(before.sequences_failed, after.sequences_failed);
+    TEST_ASSERT_EQUAL_UINT32(before.chunks_sent, after.chunks_sent);
+}
+
+/* Successful sequences are counted: one message ok, chunks added up. */
+void test_lora_send_chunked_counts_sequences_and_chunks(void)
+{
+    size_t chunk_max = 0U;
+    (void)comms_tx_buffer(&chunk_max);
+    const size_t payload_max = chunk_max - (size_t)COMMS_CHUNK_HDR_LEN;
+
+    uint8_t payload[64];
+    for (size_t i = 0U; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)i;
+    }
+
+    radiolib_stub_tx_reset();
+    comms_tx_stats_t before, after;
+    comms_tx_get_stats(&before);
+    /* payload_max + 1 payload bytes -> exactly 2 chunks. */
+    TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(payload, payload_max + 1U));
+    comms_tx_get_stats(&after);
+    TEST_ASSERT_EQUAL_size_t(2U, radiolib_stub_tx_count());
+    TEST_ASSERT_EQUAL_UINT32(before.sequences_ok + 1U, after.sequences_ok);
+    TEST_ASSERT_EQUAL_UINT32(before.sequences_failed, after.sequences_failed);
+    TEST_ASSERT_EQUAL_UINT32(before.chunks_sent + 2U, after.chunks_sent);
+}
+
+void test_tx_stats_tolerates_null_out(void)
+{
+    comms_tx_get_stats(NULL);   /* must not fault */
+}
+
+/* A TX failure mid-sequence aborts: chunks 2..3 never go on air, the call
+   reports the error, and the abort is counted exactly once. */
+void test_lora_send_chunked_aborts_on_mid_sequence_tx_failure(void)
+{
+    uint8_t beacon[COMMS_BEACON_SIZE];
+    for (size_t i = 0U; i < sizeof(beacon); i++) {
+        beacon[i] = (uint8_t)(i & 0xFFU);
+    }
+
+    radiolib_stub_tx_reset();
+    radiolib_stub_tx_fail_at_index(1U);   /* chunk 0 ok, chunk 1 fails */
+
+    comms_tx_stats_t before, after;
+    comms_tx_get_stats(&before);
+    TEST_ASSERT_EQUAL_INT(-1, lora_send_chunked(beacon, sizeof(beacon)));
+    TEST_ASSERT_EQUAL_size_t(1U, radiolib_stub_tx_count());
+    comms_tx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.sequences_ok, after.sequences_ok);
+    TEST_ASSERT_EQUAL_UINT32(before.sequences_failed + 1U, after.sequences_failed);
+    TEST_ASSERT_EQUAL_UINT32(before.chunks_sent + 1U, after.chunks_sent);
+
+    radiolib_stub_tx_reset();   /* disarm the fault for later tests */
+}
+
+/* Same abort contract when the TX_DONE wait times out instead: the chunk did
+   go on air (it counts as sent) but the sequence still stops and fails. */
+void test_lora_send_chunked_aborts_on_mid_sequence_wait_failure(void)
+{
+    uint8_t beacon[COMMS_BEACON_SIZE];
+    for (size_t i = 0U; i < sizeof(beacon); i++) {
+        beacon[i] = (uint8_t)(0x80U + (i & 0x7FU));
+    }
+
+    radiolib_stub_tx_reset();
+    radiolib_stub_tx_fail_wait_done(1);
+
+    comms_tx_stats_t before, after;
+    comms_tx_get_stats(&before);
+    TEST_ASSERT_EQUAL_INT(-1, lora_send_chunked(beacon, sizeof(beacon)));
+    TEST_ASSERT_EQUAL_size_t(1U, radiolib_stub_tx_count());
+    comms_tx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.sequences_ok, after.sequences_ok);
+    TEST_ASSERT_EQUAL_UINT32(before.sequences_failed + 1U, after.sequences_failed);
+    TEST_ASSERT_EQUAL_UINT32(before.chunks_sent + 1U, after.chunks_sent);
+
+    radiolib_stub_tx_reset();   /* disarm the fault for later tests */
+}
+
+/* The stub fails loudly past the on-air budget instead of truncating: a full
+   budget call is logged, one byte over is rejected and never logged. This
+   pins RADIOLIB_STUB_TX_CAP == COMMS_MAX_PACKET behaviourally (the stub
+   cannot include comms.h — see its header comment). */
+void test_stub_tx_rejects_calls_past_comms_max_packet(void)
+{
+    uint8_t buf[COMMS_MAX_PACKET + 1U];
+    memset(buf, 0xA5U, sizeof(buf));
+
+    radiolib_stub_tx_reset();
+    TEST_ASSERT_EQUAL_INT(0, lora_tx(buf, (size_t)COMMS_MAX_PACKET));
+    TEST_ASSERT_EQUAL_size_t(1U, radiolib_stub_tx_count());
+    TEST_ASSERT_EQUAL_size_t((size_t)COMMS_MAX_PACKET, radiolib_stub_tx_len(0));
+    TEST_ASSERT_EQUAL_INT(-1, lora_tx(buf, (size_t)COMMS_MAX_PACKET + 1U));
+    TEST_ASSERT_EQUAL_size_t(1U, radiolib_stub_tx_count());
+}
+
+/* PHY-level drops (what lora_rx_task() accounts when lora_rx() != 0) land in
+   their own bucket: counted, never dispatched, never misfiled as malformed. */
+void test_rx_stats_accounts_phy_failures_without_dispatch(void)
+{
+    comms_rx_stats_t before, after;
+    comms_rx_get_stats(&before);
+
+    comms_rx_account(COMMS_TC_ERR_PHY);
+    comms_rx_account(COMMS_TC_ERR_PHY);
+
+    comms_rx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.accepted, after.accepted);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected + 2U, after.rejected);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_phy + 2U, after.rejected_phy);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_malformed, after.rejected_malformed);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_crc, after.rejected_crc);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_opcode, after.rejected_opcode);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_range, after.rejected_range);
+}
+
+/* ---------- Ground-segment reassembly model ----------
+ * The flight side only frames; reassembly happens on the ground. This model
+ * proves the on-air bytes carry ENOUGH information: fed with the stub-logged
+ * chunks it must reassemble byte-exact, and must refuse a loss, a duplicate,
+ * or chunks mixed from two messages. (Reorder needs no refusal — seq drives
+ * placement, so any arrival order reassembles.) Returns 0 with *out_len payload bytes in out on
+ * success, -1 on any gap, duplicate, or id/total mismatch. */
+#define GROUND_REASS_MAX_TOTAL 16U
+
+static int ground_reassemble(const uint8_t *chunks[], const size_t lens[],
+                             size_t n, uint8_t *out, size_t out_cap,
+                             size_t *out_len)
+{
+    if ((n == 0U) || (out == NULL) || (out_len == NULL)) {
+        return -1;
+    }
+    const uint8_t msg   = chunks[0][COMMS_CHUNK_OFF_MSG];
+    const uint8_t total = chunks[0][COMMS_CHUNK_OFF_TOTAL];
+    if ((total == 0U) || (total > GROUND_REASS_MAX_TOTAL) ||
+        (n != (size_t)total)) {
+        return -1;
+    }
+    uint8_t seen[GROUND_REASS_MAX_TOTAL]    = { 0U };
+    size_t  seq_len[GROUND_REASS_MAX_TOTAL] = { 0U };
+    size_t  total_payload = 0U;
+    for (size_t i = 0U; i < n; i++) {
+        if (chunks[i] == NULL) {
+            return -1;
+        }
+        if ((chunks[i][COMMS_CHUNK_OFF_MSG] != msg) ||
+            (chunks[i][COMMS_CHUNK_OFF_TOTAL] != total)) {
+            return -1;   /* mixed messages */
+        }
+        const uint8_t seq = chunks[i][COMMS_CHUNK_OFF_SEQ];
+        if ((seq >= total) || (seen[seq] != 0U)) {
+            return -1;   /* out of range or duplicate */
+        }
+        if (lens[i] <= (size_t)COMMS_CHUNK_HDR_LEN) {
+            return -1;
+        }
+        seen[seq]    = 1U;
+        seq_len[seq] = lens[i] - (size_t)COMMS_CHUNK_HDR_LEN;
+        total_payload += seq_len[seq];
+    }
+    for (uint8_t s = 0U; s < total; s++) {
+        if (seen[s] == 0U) {
+            return -1;   /* gap */
+        }
+    }
+    if (total_payload > out_cap) {
+        return -1;
+    }
+    size_t off = 0U;
+    for (uint8_t s = 0U; s < total; s++) {
+        for (size_t i = 0U; i < n; i++) {
+            if (chunks[i][COMMS_CHUNK_OFF_SEQ] == s) {
+                memcpy(&out[off], &chunks[i][COMMS_CHUNK_HDR_LEN], seq_len[s]);
+                off += seq_len[s];
+                break;
+            }
+        }
+    }
+    *out_len = off;
+    return 0;
+}
+
+static void fill_beacon_pattern(uint8_t *beacon, size_t len, uint8_t base)
+{
+    for (size_t i = 0U; i < len; i++) {
+        beacon[i] = (uint8_t)(base + (i & 0xFFU));
+    }
+}
+
+/* A lost chunk is detectable: 2 of 3 chunks (n != total) refuse to reassemble. */
+void test_ground_model_detects_lost_chunk(void)
+{
+    uint8_t beacon[COMMS_BEACON_SIZE];
+    fill_beacon_pattern(beacon, sizeof(beacon), 0U);
+
+    radiolib_stub_tx_reset();
+    TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(beacon, sizeof(beacon)));
+    TEST_ASSERT_EQUAL_size_t(3U, radiolib_stub_tx_count());
+
+    const uint8_t *got[2] = { radiolib_stub_tx_data(0), radiolib_stub_tx_data(2) };
+    const size_t   lens[2] = { radiolib_stub_tx_len(0), radiolib_stub_tx_len(2) };
+    uint8_t out[COMMS_BEACON_SIZE];
+    size_t  out_len = 0U;
+    TEST_ASSERT_EQUAL_INT(-1, ground_reassemble(got, lens, 2U, out, sizeof(out), &out_len));
+}
+
+/* Reordered chunks still reassemble byte-exact: placement follows seq, not
+   arrival order. */
+void test_ground_model_reassembles_reordered_chunks(void)
+{
+    uint8_t beacon[COMMS_BEACON_SIZE];
+    fill_beacon_pattern(beacon, sizeof(beacon), 0x20U);
+
+    radiolib_stub_tx_reset();
+    TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(beacon, sizeof(beacon)));
+    TEST_ASSERT_EQUAL_size_t(3U, radiolib_stub_tx_count());
+
+    /* arrival order 2, 0, 1 */
+    const uint8_t *got[3] = {
+        radiolib_stub_tx_data(2), radiolib_stub_tx_data(0), radiolib_stub_tx_data(1)
+    };
+    const size_t lens[3] = {
+        radiolib_stub_tx_len(2), radiolib_stub_tx_len(0), radiolib_stub_tx_len(1)
+    };
+    uint8_t out[COMMS_BEACON_SIZE];
+    size_t  out_len = 0U;
+    TEST_ASSERT_EQUAL_INT(0, ground_reassemble(got, lens, 3U, out, sizeof(out), &out_len));
+    TEST_ASSERT_EQUAL_size_t(sizeof(beacon), out_len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(beacon, out, sizeof(beacon));
+}
+
+/* A duplicate chunk (same msg + seq twice, one seq missing) is refused. */
+void test_ground_model_detects_duplicate_chunk(void)
+{
+    uint8_t beacon[COMMS_BEACON_SIZE];
+    fill_beacon_pattern(beacon, sizeof(beacon), 0x40U);
+
+    radiolib_stub_tx_reset();
+    TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(beacon, sizeof(beacon)));
+    TEST_ASSERT_EQUAL_size_t(3U, radiolib_stub_tx_count());
+
+    const uint8_t *got[3] = {
+        radiolib_stub_tx_data(0), radiolib_stub_tx_data(1), radiolib_stub_tx_data(1)
+    };
+    const size_t lens[3] = {
+        radiolib_stub_tx_len(0), radiolib_stub_tx_len(1), radiolib_stub_tx_len(1)
+    };
+    uint8_t out[COMMS_BEACON_SIZE];
+    size_t  out_len = 0U;
+    TEST_ASSERT_EQUAL_INT(-1, ground_reassemble(got, lens, 3U, out, sizeof(out), &out_len));
+}
+
+/* Chunks from two consecutive messages never merge: the id mismatch refuses,
+   and the two ids are consecutive. */
+void test_ground_model_refuses_chunks_from_two_messages(void)
+{
+    uint8_t beacon[COMMS_BEACON_SIZE];
+    fill_beacon_pattern(beacon, sizeof(beacon), 0x60U);
+
+    radiolib_stub_tx_reset();
+    TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(beacon, sizeof(beacon)));
+    TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(beacon, sizeof(beacon)));
+    TEST_ASSERT_EQUAL_size_t(6U, radiolib_stub_tx_count());
+
+    const uint8_t *first  = radiolib_stub_tx_data(0);
+    const uint8_t *second = radiolib_stub_tx_data(3);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)(first[COMMS_CHUNK_OFF_MSG] + 1U),
+                            second[COMMS_CHUNK_OFF_MSG]);
+
+    const uint8_t *got[2] = { first, second };
+    const size_t   lens[2] = { radiolib_stub_tx_len(0), radiolib_stub_tx_len(3) };
+    uint8_t out[COMMS_BEACON_SIZE];
+    size_t  out_len = 0U;
+    TEST_ASSERT_EQUAL_INT(-1, ground_reassemble(got, lens, 2U, out, sizeof(out), &out_len));
 }
 
 /* The validator band must equal the state-machine band [10 s, 16 min]: the
@@ -1306,8 +1645,9 @@ void test_lora_beacon_task_loop_registers_actual_cadence_once(void)
 
 /* End-to-end framing proof: one beacon iteration emits the 128 B beacon as 3
    framed chunks (never a single 128 B lora_tx violating COMMS_MAX_PACKET).
-   Three loop iterations therefore log 9 radio calls with cycling seq 0,1,2
-   and total 3, every call within the 64 B budget. */
+   Three loop iterations therefore log 9 radio calls with msg ids stepping by
+   one per beacon, cycling seq 0,1,2 and total 3, every call within the 64 B
+   budget. */
 void test_lora_beacon_task_fragments_beacon_into_framed_chunks(void)
 {
     radiolib_stub_tx_reset();
@@ -1325,14 +1665,16 @@ void test_lora_beacon_task_fragments_beacon_into_framed_chunks(void)
     run_task_iterations(lora_beacon_task);
 
     TEST_ASSERT_EQUAL_size_t(9U, radiolib_stub_tx_count());
+    const uint8_t base = radiolib_stub_tx_data(0)[COMMS_CHUNK_OFF_MSG];
     for (size_t i = 0U; i < 9U; i++) {
         const size_t   ln = radiolib_stub_tx_len(i);
         const uint8_t *c  = radiolib_stub_tx_data(i);
         TEST_ASSERT_LESS_OR_EQUAL_size_t((size_t)COMMS_MAX_PACKET, ln);
         TEST_ASSERT_GREATER_THAN_size_t((size_t)COMMS_CHUNK_HDR_LEN, ln);
         TEST_ASSERT_NOT_NULL(c);
-        TEST_ASSERT_EQUAL_UINT8((uint8_t)(i % 3U), c[0]);
-        TEST_ASSERT_EQUAL_UINT8(3U, c[1]);
+        TEST_ASSERT_EQUAL_UINT8((uint8_t)(base + i / 3U), c[COMMS_CHUNK_OFF_MSG]);
+        TEST_ASSERT_EQUAL_UINT8((uint8_t)(i % 3U), c[COMMS_CHUNK_OFF_SEQ]);
+        TEST_ASSERT_EQUAL_UINT8(3U, c[COMMS_CHUNK_OFF_TOTAL]);
     }
 }
 
