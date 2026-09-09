@@ -156,6 +156,79 @@ void test_fram_read_splits_a_transfer_crossing_a_chip_boundary(void)
     TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, buf, sizeof(buf));
 }
 
+/* A transfer that stays inside one 128 KB chip but crosses the 64 KB A16
+ * page (slave 0xA0 -> 0xA2) must be split by the driver into one HAL call
+ * per device select: a single cross-select HAL transfer would wrap to
+ * offset 0 of the first select on HW. The last slave on the bus proves the
+ * tail really went to page 1. */
+void test_fram_write_splits_at_a16_page_inside_one_chip(void)
+{
+    uint8_t payload[4096];
+    uint8_t readback[4096];
+
+    fram_init();
+    for (size_t i = 0u; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)((i * 31u + 7u) & 0xFFu);
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, fram_write(62u * 1024u, payload, sizeof(payload)));
+    TEST_ASSERT_EQUAL_HEX16(0xA2u, host_flash_last_i2c_addr());
+
+    memset(readback, 0, sizeof(readback));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(62u * 1024u, readback, sizeof(readback)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, readback, sizeof(payload));
+}
+
+/* 70 KB at bank start stays inside chip 0 but crosses the A16 page AND
+ * exceeds the 0xFFFF HAL chunk cap, so this covers page-split + chunking
+ * together. The tail lands on select 1 (slave 0xA2). */
+static uint8_t page70k_write[70u * 1024u];
+static uint8_t page70k_read[70u * 1024u];
+
+void test_fram_write_above_hal_chunk_cap_splits(void)
+{
+    fram_init();
+    for (size_t i = 0u; i < sizeof(page70k_write); i++) {
+        page70k_write[i] = (uint8_t)((i * 31u + 7u) & 0xFFu);
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, fram_write(0u, page70k_write,
+                                        sizeof(page70k_write)));
+    TEST_ASSERT_EQUAL_HEX16(0xA2u, host_flash_last_i2c_addr());
+
+    memset(page70k_read, 0, sizeof(page70k_read));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(0u, page70k_read,
+                                       sizeof(page70k_read)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(page70k_write, page70k_read,
+                                  sizeof(page70k_write));
+}
+
+/* Whole-bank round trip: 512 KB across all 8 selects and 4 chips must come
+ * back byte-exact. The index-dependent pattern catches any misrouting. */
+static uint8_t bank_write[4u * 128u * 1024u];
+static uint8_t bank_read[4u * 128u * 1024u];
+
+void test_fram_full_bank_round_trip(void)
+{
+    fram_init();
+    for (size_t i = 0u; i < sizeof(bank_write); i++) {
+        bank_write[i] = (uint8_t)(((i * 131u) ^ (i >> 8)) & 0xFFu);
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, fram_write(0u, bank_write, sizeof(bank_write)));
+
+    memset(bank_read, 0, sizeof(bank_read));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(0u, bank_read, sizeof(bank_read)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(bank_write, bank_read, sizeof(bank_write));
+}
+
+/* fram_init() must see all 8 selects answer on a healthy bank. */
+void test_fram_init_reports_all_selects_present(void)
+{
+    fram_init();
+    TEST_ASSERT_EQUAL_HEX8(0x00u, fram_missing_selects());
+}
+
 /* addr + len must not wrap in 32-bit arithmetic: 0xFFFFFFF0 + 32 is 0x10,
  * which would pass a naive `addr + len > FRAM_SIZE` bound check and hand the
  * HAL a wild range. The driver must reject it before touching the bus. */

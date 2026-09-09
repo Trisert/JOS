@@ -9,6 +9,9 @@
 void fram_init(void);
 int  fram_read(uint32_t addr, uint8_t *buf, size_t len);
 int  fram_write(uint32_t addr, const uint8_t *buf, size_t len);
+/* Bitmask of the 8 device selects (7-bit 0x50+i) that did NOT answer during
+ * fram_init(): bit i = select i missing. 0 = whole 512 KB bank present. */
+uint8_t fram_missing_selects(void);
 
 /* ---------- Cyclic buffer ---------- */
 void cyclic_buffer_init(void);

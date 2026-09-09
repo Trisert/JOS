@@ -61,9 +61,22 @@
  */
 
 #define FM24VN_I2C_ADDR_BASE  0x50
-#define FM24VN_PAGE_SIZE      16
 #define FM24VN_CHIP_SIZE      (128UL * 1024UL)
 #define FM24VN_CHIP_SIZE_LOG2 17U    /* 128 KB = 2^17 */
+
+/* One device select spans 64 KB (one A16 page); the bank is 8 selects.
+ * Split at every select boundary so each HAL call carries a single slave
+ * byte — this also covers the 128 KB chip boundary, and stays correct
+ * whether or not the part streams across A16 inside a longer transfer. */
+#define FRAM_SEL_SIZE       (64UL * 1024UL)
+#define FRAM_SEL_SIZE_LOG2  16U
+
+/* Bounded retry on the I2C bus: a NACK/arbitration loss is transient, but an
+ * unbounded loop inside a HAL timeout (1 s each) would wedge the caller.
+ * FRAM writes are idempotent (same data, same cell), so a retry after a
+ * failed attempt cannot corrupt a partially written select. */
+#define FRAM_I2C_TRIES      3U
+#define FRAM_I2C_TIMEOUT_MS 1000
 /* One A16 page: the most a single device select (and a single 16-bit
  * memory-address field) spans. A transfer may stream across the page
  * boundary inside a chip - the part latches the full 17-bit address and
@@ -124,9 +137,45 @@ static uint16_t fram_addr_to_offset(uint32_t addr)
     return (uint16_t)(addr & (FM24VN_PAGE_BYTES - 1U));
 }
 
+/* Presence bitmap of the 8 device selects, filled by fram_init(): bit i is 1
+ * when select i (7-bit 0x50+i) did NOT answer. 0 means the whole bank is
+ * present. Checked at boot so a dead chip is found before it can corrupt a
+ * mission record at runtime. */
+static uint8_t s_fram_missing = 0U;
+
 void fram_init(void)
 {
-    /* TODO: verify each chip responds at its I2C address */
+    uint8_t missing = 0U;
+    for (uint8_t sel = 0U; sel < 8U; sel++) {
+        uint16_t dev = (uint16_t)((FM24VN_I2C_ADDR_BASE + sel) << 1);
+        if (HAL_I2C_IsDeviceReady(&hi2c1, dev, FRAM_I2C_TRIES,
+                                  FRAM_I2C_TIMEOUT_MS) != HAL_OK) {
+            missing |= (uint8_t)(1U << sel);
+        }
+    }
+    s_fram_missing = missing;
+}
+
+uint8_t fram_missing_selects(void)
+{
+    return s_fram_missing;
+}
+
+/* One HAL transfer with bounded bus retry (see FRAM_I2C_TRIES). */
+static int fram_xfer(int is_write, uint16_t dev_addr, uint16_t offset,
+                     uint8_t *buf, uint16_t size)
+{
+    for (uint8_t t = 0U; t < FRAM_I2C_TRIES; t++) {
+        HAL_StatusTypeDef st = is_write
+            ? HAL_I2C_Mem_Write(&hi2c1, dev_addr, offset,
+                                I2C_MEMADD_SIZE_16BIT, buf, size,
+                                FRAM_I2C_TIMEOUT_MS)
+            : HAL_I2C_Mem_Read(&hi2c1, dev_addr, offset,
+                               I2C_MEMADD_SIZE_16BIT, buf, size,
+                               FRAM_I2C_TIMEOUT_MS);
+        if (st == HAL_OK) return 0;
+    }
+    return -1;
 }
 
 /* Total-size bound check, safe against uint32 wrap: addr and len arrive in
@@ -140,23 +189,23 @@ static int fram_range_valid(uint32_t addr, size_t len)
     return ((uint64_t)addr + (uint64_t)len) <= (uint64_t)FRAM_SIZE;
 }
 
-/* One HAL transfer serves a single chip: the FM24VN10-G latches the slave
- * byte (chip + A16 page) at START, and a transfer past the end of the chip
- * wraps to offset 0 of the SAME chip on real hardware (rollover only at
- * 1FFFFh -> 00000h), silently corrupting it. fram_read()/fram_write()
- * therefore split at every 128 KB chip boundary - one HAL call per chip,
- * chunked further to 0xFFFF B, the widest the HAL uint16_t size takes - so
- * no caller can hand HAL a cross-chip range. The A16 page boundary inside a
- * chip needs no split: the part streams across it. */
+/* One HAL transfer serves a single device select: the FM24VN10-G latches the
+ * slave byte (chip + A16 page) at START, and a transfer past the end of the
+ * select wraps to offset 0 of the SAME select on real hardware, silently
+ * corrupting it. fram_read()/fram_write() therefore split at every 64 KB
+ * select boundary - one HAL call per select (this also covers the 128 KB
+ * chip boundary) - chunked further to 0xFFFF B, the widest the HAL uint16_t
+ * size takes, each with bounded bus retry - so no caller can hand HAL a
+ * range that crosses a slave address. */
 int fram_read(uint32_t addr, uint8_t *buf, size_t len)
 {
     if (!fram_range_valid(addr, len)) return -1;
     if ((len > 0U) && (buf == NULL)) return -1;
 
     while (len > 0U) {
-        size_t   to_chip_end = (size_t)(FM24VN_CHIP_SIZE -
-                                (addr & (uint32_t)(FM24VN_CHIP_SIZE - 1U)));
-        size_t   chunk = (len < to_chip_end) ? len : to_chip_end;
+        size_t   to_sel_end = (size_t)(FRAM_SEL_SIZE -
+                               (addr & (uint32_t)(FRAM_SEL_SIZE - 1U)));
+        size_t   chunk = (len < to_sel_end) ? len : to_sel_end;
         uint16_t dev_addr;
         uint16_t offset;
 
@@ -164,8 +213,7 @@ int fram_read(uint32_t addr, uint8_t *buf, size_t len)
         dev_addr = fram_addr_to_dev(addr);
         offset   = fram_addr_to_offset(addr);
 
-        if (HAL_I2C_Mem_Read(&hi2c1, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
-                             buf, (uint16_t)chunk, 1000) != HAL_OK)
+        if (fram_xfer(0, dev_addr, offset, buf, (uint16_t)chunk) != 0)
             return -1;
         addr += (uint32_t)chunk;
         buf  += chunk;
@@ -180,9 +228,9 @@ int fram_write(uint32_t addr, const uint8_t *buf, size_t len)
     if ((len > 0U) && (buf == NULL)) return -1;
 
     while (len > 0U) {
-        size_t   to_chip_end = (size_t)(FM24VN_CHIP_SIZE -
-                                (addr & (uint32_t)(FM24VN_CHIP_SIZE - 1U)));
-        size_t   chunk = (len < to_chip_end) ? len : to_chip_end;
+        size_t   to_sel_end = (size_t)(FRAM_SEL_SIZE -
+                               (addr & (uint32_t)(FRAM_SEL_SIZE - 1U)));
+        size_t   chunk = (len < to_sel_end) ? len : to_sel_end;
         uint16_t dev_addr;
         uint16_t offset;
 
@@ -190,8 +238,8 @@ int fram_write(uint32_t addr, const uint8_t *buf, size_t len)
         dev_addr = fram_addr_to_dev(addr);
         offset   = fram_addr_to_offset(addr);
 
-        if (HAL_I2C_Mem_Write(&hi2c1, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
-                              (uint8_t *)buf, (uint16_t)chunk, 1000) != HAL_OK)
+        if (fram_xfer(1, dev_addr, offset, (uint8_t *)buf,
+                      (uint16_t)chunk) != 0)
             return -1;
         addr += (uint32_t)chunk;
         buf  += chunk;
@@ -211,25 +259,12 @@ void cyclic_buffer_init(void)
     cb_head = 0;
 }
 
-/* Write one contiguous range without handing HAL_I2C_Mem_Write() a
- * cross-chip transfer: each FM24VN10-G owns only its 128 KB window, and a
- * transfer past it would address a different slave. (The A16 page boundary
- * inside a chip needs no split: the part streams across it.) */
+/* Write one contiguous range: fram_write() already splits at every 64 KB
+ * device-select boundary, so this is a plain pass-through kept as the single
+ * choke point for future per-range policy (wear spread, bad-select skip). */
 static int cyclic_buffer_write_range(uint32_t addr, const uint8_t *data, size_t len)
 {
-    while (len > 0U) {
-        const size_t to_chip_end = (size_t)(FM24VN_CHIP_SIZE -
-                                  (addr & (FM24VN_CHIP_SIZE - 1U)));
-        const size_t chunk = (len < to_chip_end) ? len : to_chip_end;
-
-        if (fram_write(addr, data, chunk) != 0) {
-            return -1;
-        }
-        addr += (uint32_t)chunk;
-        data += chunk;
-        len  -= chunk;
-    }
-    return 0;
+    return fram_write(addr, data, len);
 }
 
 int cyclic_buffer_write(const uint8_t *data, size_t len)
@@ -243,8 +278,8 @@ int cyclic_buffer_write(const uint8_t *data, size_t len)
         return -1;
     }
 
-    /* Split once at the ring boundary, then cyclic_buffer_write_range() splits
-     * further at every physical FRAM chip boundary. Advance cb_head only after
+    /* Split once at the ring boundary, then fram_write() splits further at
+     * every 64 KB device-select boundary. Advance cb_head only after
      * all transfers succeed: a failed I2C write must remain visible to the
      * caller rather than silently creating a hole in the telemetry stream. */
     first = (len < (size_t)(FRAM_SIZE - cb_head)) ? len :
@@ -265,7 +300,7 @@ int cyclic_buffer_read(uint32_t offset, uint8_t *buf, size_t len)
 {
     /* Same wrap-safe bound check as fram_range_valid(): offset + len in
      * 32-bit arithmetic can wrap past zero. fram_read() re-checks and splits
-     * at chip boundaries, so a multi-chip read is served, not rejected. */
+     * at select boundaries, so a multi-select read is served, not rejected. */
     if (((uint64_t)offset + (uint64_t)len) > (uint64_t)FRAM_SIZE) return -1;
     return fram_read(offset, buf, len);
 }

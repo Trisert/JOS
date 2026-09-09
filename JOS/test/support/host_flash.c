@@ -357,3 +357,17 @@ HAL_StatusTypeDef HAL_I2C_Mem_Write(I2C_HandleTypeDef *hi2c, uint16_t DevAddress
     memcpy(&fram[index], pData, Size);
     return HAL_OK;
 }
+
+HAL_StatusTypeDef HAL_I2C_IsDeviceReady(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
+                                        uint32_t Trials, uint32_t Timeout)
+{
+    (void)Trials; (void)Timeout;
+    if (hi2c == NULL) {
+        return HAL_ERROR;
+    }
+    /* All 8 selects (0xA0..0xAE shifted) are present on the host. */
+    if (DevAddress < FRAM_I2C_ADDR_FIRST || DevAddress > FRAM_I2C_ADDR_LAST) {
+        return HAL_ERROR;
+    }
+    return HAL_OK;
+}
