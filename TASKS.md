@@ -61,8 +61,8 @@ It replaces the old Hermes kanban board (SQLite), which was archived on
 | 31 | done | **TEMP 1-wire PB2 + DEPLOY/LoRa_NRST mux PB1 (SPF §3.7.5.3.1)** → PR #72 `fix/deploy-temp-pins`: driver temp.c/h, deploy_sense.c/h, .ioc+main.h, 161/161 test. | [#72](https://github.com/Trisert/JOS/pull/72) | Subagent review: APPROVE (timing AN187 ok, mux sicuro, GPIO liberi). Nit: break vs continue su CRC, poll ~100ms task-only. |
 | 32 | done | **Subagent reviews (criterio 3)**: #70 APPROVE, #63 APPROVE, #72 APPROVE, #68 APPROVE, #69 APPROVE (cr=8), #73 APPROVE, #74 APPROVE, #75 APPROVE (security). | — | #63 mergiabile (Kilo pending). |
 | 33 | done | **FRAM full-size 128KB/chip (512KB)** → PR #73: rework `414ae83` APPROVE (reviewer ha riverificato build+147/147). | [#73](https://github.com/Trisert/JOS/pull/73) | Resta: strapping A2/A1 (Nicola) + Kilo. |
-| 34 | done | **TRIGGER_TASK_COMPLETE s4→s3** → PR #74: gate verificato, 150/150. | [#74](https://github.com/Trisert/JOS/pull/74) | Subagent review + review indipendente /review: APPROVE. |
-| 35 | done | **HMAC uplink (design upstream)** → PR #75: KAT riverificati, constant-time ok, enforce default, 168/168. | [#75](https://github.com/Trisert/JOS/pull/75) | Subagent review + review indipendente /review: APPROVE. Residuo: chiave reale + replay pre-volo. |
+| 34 | done | **TRIGGER_TASK_COMPLETE s4→s3** → PR #74: coverage fix `ab67c5a` (20 test, linee 92.2%, branch 82.8%). | [#74](https://github.com/Trisert/JOS/pull/74) | Subagent review + /review: APPROVE. CI re-run. |
+| 35 | done | **HMAC uplink (design upstream)** → PR #75: cppcheck fix `66fdfd1` (t1/t2 nel loop), 168/168. | [#75](https://github.com/Trisert/JOS/pull/75) | Subagent review + /review: APPROVE. CI re-run. |
 
 *Ultimo aggiornamento: 2026-09-08 — Verifica SPF V3 avanzata: T32 ✅, T33 ✅(PR #63), T34 ✅(gap report), T35 ✅, T-PAY ✅(11 gap), T-AOCS ✅(gap molto ampi), T-COMMS ✅(5 gap incluso bug CR=4/9), T-SM ✅( TRIGGER_TASK_COMPLETE mancante). Issues #68-#70 create. Bloccati su decisioni utente (FRAM bus), merge PR #63, fix CR=4/9, DMA IRQ.*
 
