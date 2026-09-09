@@ -29,7 +29,10 @@ volatile uint32_t s_spi_last_error = 0U;
 }
 
 /* HAL callbacks: C linkage, SPI1 only. TX/RX complete share one flag because
- * TransmitReceive_DMA always runs both directions together. */
+ * TransmitReceive_DMA always runs both directions together. Signatures must
+ * match the HAL weak symbols exactly (non-const pointer), hence the
+ * cppcheck suppressions below. */
+// cppcheck-suppress constParameterPointer
 extern "C" void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 {
     if ((hspi != nullptr) && (hspi->Instance == SPI1)) {
@@ -37,6 +40,7 @@ extern "C" void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
     }
 }
 
+// cppcheck-suppress constParameterPointer
 extern "C" void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
     if ((hspi != nullptr) && (hspi->Instance == SPI1)) {
