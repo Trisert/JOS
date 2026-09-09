@@ -1,20 +1,24 @@
 /**
  * @file    comms_validate.c
- * @brief   Uplink telecommand validation — structure, CRC, opcode whitelist and
- *          per-opcode numeric parameter range checks.
+ * @brief   Uplink telecommand validation — structure, CRC, HMAC authentication,
+ *          opcode whitelist and per-opcode numeric parameter range checks.
  *
- * Scope: STRUCTURAL validation only. The CRC-16/CCITT-FALSE trailer is unkeyed,
- * so it detects corrupted/malformed frames but does NOT authenticate the sender
- * and offers no replay protection — any transmitter that knows the frame format
- * can produce a CRC-valid telecommand. Authentication would require a keyed MAC
- * plus a monotonic counter / rolling code.
+ * Scope: STRUCTURAL validation (CRC-16/CCITT-FALSE trailer — unkeyed, detects
+ * corrupted/malformed frames but does NOT authenticate) PLUS keyed
+ * authentication (truncated HMAC-SHA256 tag, upstream RedPill makeMAC design).
+ * A frame is dispatched only after its tag verifies (verify-then-dispatch);
+ * frames with a missing or invalid tag are rejected with COMMS_TC_ERR_MAC and
+ * counted separately. Replay protection is NOT provided (no counter field in
+ * the JOS frame yet) — tracked as follow-up work.
  *
  * Standards: NASA Power of Ten #1 (bounded, overflow-free arithmetic; no
- * unchecked indexing), NASA-STD-8739.8 (command validation — a malformed or
- * out-of-range telecommand is rejected, never dispatched).
+ * unchecked indexing), NASA-STD-8739.8 (command validation — a malformed,
+ * out-of-range or unauthenticated telecommand is rejected, never dispatched).
  */
 
 #include "comms_validate.h"
+
+#include "sha256.h"
 
 /* ---------- Per-opcode validation table ---------- */
 
@@ -55,6 +59,12 @@ _Static_assert(COMMS_TC_MAX_PAYLOAD + COMMS_TC_OVERHEAD == COMMS_TC_MAX_FRAME,
                "TC payload budget inconsistent with max frame size");
 _Static_assert(COMMS_TC_MAX_PAYLOAD <= 255U,
                "payload length field is one byte");
+_Static_assert(COMMS_TC_MAX_AUTH_PAYLOAD + COMMS_TC_AUTH_OVERHEAD == COMMS_TC_MAX_FRAME,
+               "auth payload budget inconsistent with max frame size");
+_Static_assert(COMMS_TC_MAC_LEN == 4U,
+               "tag is the first 4 bytes of HMAC-SHA256 (upstream makeMAC)");
+_Static_assert((COMMS_AUTH_ENFORCE == 0) || (COMMS_AUTH_ENFORCE == 1),
+               "COMMS_AUTH_ENFORCE must be 0 or 1");
 
 /* ---------- Private helpers ---------- */
 
@@ -74,6 +84,174 @@ static uint32_t be32(const uint8_t *p)
            ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] <<  8) |
             (uint32_t)p[3];
+}
+
+/*
+ * Shared tail of both validators: opcode whitelist, per-opcode payload size
+ * contract and numeric parameter range check. `frame` is the raw frame whose
+ * payload starts at COMMS_TC_HDR_LEN (identical offset in both layouts);
+ * `payload_len` is the already-bounds-checked declared length. Writes the
+ * out-parameters only on acceptance.
+ */
+static comms_tc_result_t tc_check_opcode_and_params(uint8_t         opcode,
+                                                    const uint8_t  *frame,
+                                                    size_t          payload_len,
+                                                    uint8_t        *out_opcode,
+                                                    const uint8_t **out_payload,
+                                                    size_t         *out_len)
+{
+    /* Opcode whitelist */
+    const tc_spec_t *spec = tc_lookup(opcode);
+    if (spec == NULL) {
+        return COMMS_TC_ERR_OPCODE;
+    }
+
+    /* Per-opcode payload size contract */
+    if ((payload_len < (size_t)spec->min_payload) ||
+        (payload_len > (size_t)spec->max_payload)) {
+        return COMMS_TC_ERR_PAYLOAD_LEN;
+    }
+
+    /* (a) numeric parameter range check */
+    if (spec->has_param) {
+        const size_t need = (size_t)spec->param_off + 4U;
+        if (need > payload_len) {
+            return COMMS_TC_ERR_PAYLOAD_LEN;
+        }
+        const uint32_t value = be32(&frame[COMMS_TC_HDR_LEN + spec->param_off]);
+        const bool     zero_ok = spec->allow_zero && (value == 0UL);
+        if (!zero_ok &&
+            ((value < spec->param_min) || (value > spec->param_max))) {
+            return COMMS_TC_ERR_PARAM_RANGE;
+        }
+    }
+
+    *out_opcode  = opcode;
+    *out_payload = (payload_len > 0U) ? &frame[COMMS_TC_HDR_LEN] : NULL;
+    *out_len     = payload_len;
+    return COMMS_TC_OK;
+}
+
+/* ---------- Uplink authentication (HMAC-SHA256, truncated) ---------- */
+
+/*
+ * Flight key, bytes overridable per mission via -DCOMMS_AUTH_KEY0..3.
+ * Function-local copy is NOT used: hmac_sha256() only reads the key, so a
+ * shared file-static const is safe (single reader on the RX path, no
+ * mutation) and keeps the 4 bytes in .rodata instead of on the stack.
+ */
+static const uint8_t auth_key[4] = {
+    (uint8_t)COMMS_AUTH_KEY0,
+    (uint8_t)COMMS_AUTH_KEY1,
+    (uint8_t)COMMS_AUTH_KEY2,
+    (uint8_t)COMMS_AUTH_KEY3,
+};
+
+uint32_t comms_auth_tag(const uint8_t *data, size_t len)
+{
+    uint8_t mac[32];
+
+    if (data == NULL) {
+        return 0U;
+    }
+    if (len > (size_t)COMMS_TC_MAX_FRAME) {   /* hard upper bound on the hash */
+        len = (size_t)COMMS_TC_MAX_FRAME;
+    }
+
+    /* Upstream makeMAC: HMAC-SHA256, truncate to the first 4 bytes BE. */
+    hmac_sha256(auth_key, sizeof(auth_key), data, len, mac);
+    return be32(&mac[0]);
+}
+
+/*
+ * Constant-time tag comparison: no data-dependent branches or early exit,
+ * so a bit-flip oracle gains nothing over one blind guess per frame. The
+ * single final compare is against a value already folded from all 32 bits.
+ */
+static bool tag_matches(uint32_t got, uint32_t want)
+{
+    uint32_t diff = got ^ want;
+
+    diff |= diff >> 16U;
+    diff |= diff >> 8U;
+    return ((uint8_t)(diff & 0xFFU) == 0U);
+}
+
+bool comms_frame_is_auth_layout(const uint8_t *frame, size_t len)
+{
+    size_t payload_len;
+
+    if ((frame == NULL) || (len < (size_t)COMMS_TC_HDR_LEN) ||
+        (len > (size_t)COMMS_TC_MAX_FRAME)) {
+        return false;
+    }
+    payload_len = (size_t)frame[1];
+    if (payload_len > (size_t)COMMS_TC_MAX_AUTH_PAYLOAD) {
+        return false;
+    }
+    /* Both operands bounded (<= 56 and == 8), so no overflow. len == P + 8
+     * holds for authenticated frames only: legacy frames satisfy len == P+4
+     * and the two equations are mutually exclusive. */
+    return ((payload_len + (size_t)COMMS_TC_AUTH_OVERHEAD) == len);
+}
+
+comms_tc_result_t comms_validate_tc_auth(const uint8_t   *frame,
+                                         size_t           len,
+                                         uint8_t         *out_opcode,
+                                         const uint8_t  **out_payload,
+                                         size_t          *out_len)
+{
+    if ((frame == NULL) || (out_opcode == NULL) ||
+        (out_payload == NULL) || (out_len == NULL)) {
+        return COMMS_TC_ERR_NULL;
+    }
+
+    /* (c) reject malformed / oversized frames before touching their content */
+    if (len < (size_t)COMMS_TC_MIN_AUTH_FRAME) {
+        return COMMS_TC_ERR_TOO_SHORT;
+    }
+    if (len > (size_t)COMMS_TC_MAX_FRAME) {
+        return COMMS_TC_ERR_TOO_LONG;
+    }
+
+    const uint8_t opcode      = frame[0];
+    const size_t  payload_len = (size_t)frame[1];
+
+    /* Reachability ordering, mirroring comms_validate_tc(): a header
+     * declaring more than the auth payload budget lands here, not in the
+     * mismatch case below (MISRA C:2025 Rule 2.1 — no dead code). */
+    if (payload_len > (size_t)COMMS_TC_MAX_AUTH_PAYLOAD) {
+        return COMMS_TC_ERR_TOO_LONG;
+    }
+
+    /* Declared length must match the received length exactly (P + 8). Both
+     * operands bounded (<= 56 and == 8): no overflow. */
+    if ((payload_len + (size_t)COMMS_TC_AUTH_OVERHEAD) != len) {
+        return COMMS_TC_ERR_LEN_MISMATCH;
+    }
+
+    /* (b) integrity: CRC-16/CCITT over header + payload + tag, BE trailer */
+    const size_t   crc_off = (size_t)COMMS_TC_HDR_LEN + payload_len +
+                             (size_t)COMMS_TC_MAC_LEN;
+    const uint16_t rx_crc  = (uint16_t)(((uint16_t)frame[crc_off] << 8) |
+                                         (uint16_t)frame[crc_off + 1U]);
+    if (comms_crc16_ccitt(frame, crc_off) != rx_crc) {
+        return COMMS_TC_ERR_CRC;
+    }
+
+    /* (d) authentication BEFORE opcode parsing: verify-then-dispatch. The tag
+     * covers header + payload (bytes [0 .. 2+P-1]); the received tag sits at
+     * [2+P .. 6+P-1]. Unauthenticated senders learn nothing about the
+     * whitelist — a bad tag rejects before the opcode is even looked up. */
+    const size_t   tag_off  = (size_t)COMMS_TC_HDR_LEN + payload_len;
+    const uint32_t rx_tag   = be32(&frame[tag_off]);
+    const uint32_t good_tag = comms_auth_tag(frame, tag_off);
+    if (!tag_matches(rx_tag, good_tag)) {
+        return COMMS_TC_ERR_MAC;
+    }
+
+    return tc_check_opcode_and_params(opcode, frame, payload_len,
+                                      out_opcode, out_payload, out_len);
 }
 
 /* ---------- Public API ---------- */
@@ -163,36 +341,11 @@ comms_tc_result_t comms_validate_tc(const uint8_t   *frame,
         return COMMS_TC_ERR_CRC;
     }
 
-    /* Opcode whitelist */
-    const tc_spec_t *spec = tc_lookup(opcode);
-    if (spec == NULL) {
-        return COMMS_TC_ERR_OPCODE;
-    }
-
-    /* Per-opcode payload size contract */
-    if ((payload_len < (size_t)spec->min_payload) ||
-        (payload_len > (size_t)spec->max_payload)) {
-        return COMMS_TC_ERR_PAYLOAD_LEN;
-    }
-
-    /* (a) numeric parameter range check */
-    if (spec->has_param) {
-        const size_t need = (size_t)spec->param_off + 4U;
-        if (need > payload_len) {
-            return COMMS_TC_ERR_PAYLOAD_LEN;
-        }
-        const uint32_t value = be32(&frame[COMMS_TC_HDR_LEN + spec->param_off]);
-        const bool     zero_ok = spec->allow_zero && (value == 0UL);
-        if (!zero_ok &&
-            ((value < spec->param_min) || (value > spec->param_max))) {
-            return COMMS_TC_ERR_PARAM_RANGE;
-        }
-    }
-
-    *out_opcode  = opcode;
-    *out_payload = (payload_len > 0U) ? &frame[COMMS_TC_HDR_LEN] : NULL;
-    *out_len     = payload_len;
-    return COMMS_TC_OK;
+    /* Opcode whitelist, per-opcode size contract and parameter ranges share
+     * one implementation with the authenticated validator (behaviour
+     * unchanged — pure refactor, no verdict or boundary moved). */
+    return tc_check_opcode_and_params(opcode, frame, payload_len,
+                                      out_opcode, out_payload, out_len);
 }
 
 const char *comms_tc_result_str(comms_tc_result_t result)
@@ -207,6 +360,7 @@ const char *comms_tc_result_str(comms_tc_result_t result)
     case COMMS_TC_ERR_OPCODE:       return "BAD_OPCODE";
     case COMMS_TC_ERR_PAYLOAD_LEN:  return "BAD_PAYLOAD_LEN";
     case COMMS_TC_ERR_PARAM_RANGE:  return "PARAM_RANGE";
+    case COMMS_TC_ERR_MAC:          return "MAC";
     default:                        return "UNKNOWN";
     }
 }
@@ -237,6 +391,9 @@ void comms_rx_account(comms_tc_result_t result)
     case COMMS_TC_ERR_OPCODE:
         rx_stats.rejected_opcode++;
         break;
+    case COMMS_TC_ERR_MAC:
+        rx_stats.rejected_mac++;
+        break;
     case COMMS_TC_ERR_PAYLOAD_LEN:
     case COMMS_TC_ERR_PARAM_RANGE:
         rx_stats.rejected_range++;
@@ -257,5 +414,6 @@ void comms_rx_get_stats(comms_rx_stats_t *out)
         out->rejected_malformed = rx_stats.rejected_malformed;
         out->rejected_opcode    = rx_stats.rejected_opcode;
         out->rejected_range     = rx_stats.rejected_range;
+        out->rejected_mac       = rx_stats.rejected_mac;
     }
 }

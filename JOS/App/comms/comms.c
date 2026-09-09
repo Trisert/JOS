@@ -149,13 +149,20 @@ static void comms_dispatch_command_unchecked(uint8_t cmd_id,
 
 /**
  * Validate a raw uplink frame and dispatch it only if it is well formed,
- * CRC-clean, of a known opcode and with in-range parameters. Every rejection
- * is counted (comms_rx_get_stats) and never reaches the dispatcher.
+ * CRC-clean, HMAC-authenticated, of a known opcode and with in-range
+ * parameters. Every rejection is counted (comms_rx_get_stats) and never
+ * reaches the dispatcher.
  *
- * Scope: this is *structural* validation (framing, CRC-16 integrity, opcode
- * whitelist, parameter ranges). The CRC is unkeyed, so it detects corruption
- * and malformed frames — it does NOT authenticate the sender and gives no
- * replay protection. A keyed MAC + rolling counter would be needed for that.
+ * Scope: structural validation (framing, CRC-16 integrity, opcode whitelist,
+ * parameter ranges) PLUS keyed authentication. The CRC is unkeyed, so it
+ * detects corruption and malformed frames only; the truncated HMAC-SHA256 tag
+ * (upstream RedPill makeMAC design) authenticates the sender. Layout
+ * discrimination is by exact length: len == P+8 selects the authenticated
+ * validator, anything else the legacy one. With COMMS_AUTH_ENFORCE=1 (flight
+ * default) a structurally valid but untagged legacy frame is rejected with
+ * COMMS_TC_ERR_MAC; with COMMS_AUTH_ENFORCE=0 (bench/migration only) legacy
+ * CRC-only frames are still dispatched. Either way a bad tag is rejected
+ * before the dispatcher runs (verify-then-dispatch).
  *
  * Standards: NASA-PoT #1 (bounds-checked, no overflow), NASA-STD-8739.8
  * (command validation before execution).
@@ -165,9 +172,22 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len)
     uint8_t        opcode      = 0U;
     const uint8_t *payload     = NULL;
     size_t         payload_len = 0U;
+    comms_tc_result_t result;
 
-    comms_tc_result_t result =
-        comms_validate_tc(frame, len, &opcode, &payload, &payload_len);
+    if (comms_frame_is_auth_layout(frame, len)) {
+        result = comms_validate_tc_auth(frame, len,
+                                        &opcode, &payload, &payload_len);
+    } else {
+        result = comms_validate_tc(frame, len, &opcode, &payload, &payload_len);
+#if COMMS_AUTH_ENFORCE
+        /* Structurally valid but untagged: well-formed legacy frames parse
+         * cleanly yet carry no authentication — reject, do NOT dispatch.
+         * Malformed frames keep their structural verdict for telemetry. */
+        if (result == COMMS_TC_OK) {
+            result = COMMS_TC_ERR_MAC;
+        }
+#endif
+    }
 
     comms_rx_account(result);
 
@@ -250,7 +270,8 @@ static const osThreadAttr_t rx_attrs = {
 /*
  * NOW WIRED: the SX1268 driver (radiolib_driver.cpp) lands the PHY payload into
  * `rx` via the DIO1 IRQ. The ONLY permitted path from PHY payload to dispatcher
- * is comms_rx_handle_frame(), which performs structure + CRC + opcode + range
+ * is comms_rx_handle_frame(), which performs structure + CRC + HMAC tag +
+ * opcode + range
  * validation and dispatches only valid telecommands. A rejection reason must be
  * logged/telemetered, never discarded.
  */

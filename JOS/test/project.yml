@@ -84,6 +84,11 @@
     # the only way to reach the BOOT_CRC_BAD_REGION branch on the host.
     :test_bad_region:
       - HOST_FW_BAD_REGION
+    # test_comms_legacy.c compiles the RX gate with authentication relaxed
+    # (COMMS_AUTH_ENFORCE=0) to cover the bench/migration branch. Every other
+    # test binary uses the flight default (1) from comms_validate.h.
+    :test_comms_legacy:
+      - COMMS_AUTH_ENFORCE=0
     # test_boot_unstamped_bench.c links the same boot_crc.c with the bench
     # opt-out of the unstamped-image policy, which is the only way to reach
     # the #if BOOT_CRC_TRUST_UNSTAMPED branch of boot_crc_image_trusted().

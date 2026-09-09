@@ -29,15 +29,19 @@ void lora_rx_task(void *arg);
 int lora_send_chunked(const uint8_t *data, size_t len);
 
 /* Validate a raw uplink frame and dispatch it only when it is well formed,
- * CRC-clean, of a whitelisted opcode and with in-range parameters.
+ * CRC-clean, HMAC-authenticated, of a whitelisted opcode and with in-range
+ * parameters.
  *
  * This is the ONLY exported entry point for received telecommands: the
  * dispatcher itself is file-static inside comms.c, so no caller can reach an
- * opcode without passing structural validation first.
+ * opcode without passing validation first. Layout discrimination is by exact
+ * length (len == P+8 selects the authenticated validator); with
+ * COMMS_AUTH_ENFORCE=1 (flight default) untagged legacy frames are rejected
+ * with COMMS_TC_ERR_MAC, with =0 (bench only) they are still dispatched.
  *
- * NOTE: the CRC is unkeyed (CRC-16/CCITT-FALSE) — this is *structural*
- * validation against corruption and malformed frames, NOT authentication.
- * It provides no protection against a deliberately forged or replayed uplink.
+ * NOTE: the CRC is unkeyed (CRC-16/CCITT-FALSE) — it is a corruption check,
+ * not authentication. Authentication is the truncated HMAC-SHA256 tag; there
+ * is still no replay protection (no counter field yet).
  *
  * Returns COMMS_TC_OK when dispatched, otherwise the rejection reason. */
 comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len);

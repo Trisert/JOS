@@ -39,6 +39,7 @@
 #include "unity.h"
 #include "comms.h"
 #include "comms_validate.h"
+#include "sha256.h"                /* wrong-key forgery test only           */
 #include "host_support.h"      /* HOST_EXPECT_NVIC_RESET()                    */
 #include "mock_state_machine.h"
 #include "mock_watchdog.h"     /* also pulls watchdog.h for the WDG_PERIOD_*  */
@@ -68,6 +69,30 @@ static size_t build_frame(uint8_t opcode, const uint8_t *payload, uint8_t len)
     return crc_off + COMMS_TC_CRC_LEN;
 }
 
+/* Build authenticated "opcode | len | payload | TAG32-BE | CRC16-BE" sealed
+ * with the flight key. Returns the frame length. Misuse (payload beyond the
+ * auth budget) fails the test loudly instead of staging a runt frame. */
+static size_t build_auth_frame(uint8_t opcode, const uint8_t *payload, uint8_t len)
+{
+    TEST_ASSERT_LESS_OR_EQUAL_UINT8((uint8_t)COMMS_TC_MAX_AUTH_PAYLOAD, len);
+    frame_buf[0] = opcode;
+    frame_buf[1] = len;
+    if ((payload != NULL) && (len > 0U)) {
+        memcpy(&frame_buf[COMMS_TC_HDR_LEN], payload, len);
+    }
+    const size_t   tag_off = (size_t)COMMS_TC_HDR_LEN + len;
+    const uint32_t tag     = comms_auth_tag(frame_buf, tag_off);
+    frame_buf[tag_off]     = (uint8_t)(tag >> 24);
+    frame_buf[tag_off + 1] = (uint8_t)(tag >> 16);
+    frame_buf[tag_off + 2] = (uint8_t)(tag >> 8);
+    frame_buf[tag_off + 3] = (uint8_t)tag;
+    const size_t   crc_off = tag_off + (size_t)COMMS_TC_MAC_LEN;
+    const uint16_t crc     = comms_crc16_ccitt(frame_buf, crc_off);
+    frame_buf[crc_off]     = (uint8_t)(crc >> 8);
+    frame_buf[crc_off + 1] = (uint8_t)(crc & 0xFFU);
+    return crc_off + COMMS_TC_CRC_LEN;
+}
+
 static void put_be32(uint8_t *p, uint32_t v)
 {
     p[0] = (uint8_t)(v >> 24);
@@ -83,6 +108,15 @@ static comms_tc_result_t validate(const uint8_t *f, size_t len)
     const uint8_t *payload = (const uint8_t *)1;   /* poison */
     size_t         plen    = 0xDEADU;
     return comms_validate_tc(f, len, &opcode, &payload, &plen);
+}
+
+/* Validate an authenticated frame without caring about the out-parameters. */
+static comms_tc_result_t validate_auth(const uint8_t *f, size_t len)
+{
+    uint8_t        opcode  = 0xFFU;
+    const uint8_t *payload = (const uint8_t *)1;   /* poison */
+    size_t         plen    = 0xDEADU;
+    return comms_validate_tc_auth(f, len, &opcode, &payload, &plen);
 }
 
 void setUp(void)   { memset(frame_buf, 0, sizeof(frame_buf)); }
@@ -302,9 +336,10 @@ void test_validate_reports_null_payload_for_empty_command(void)
 
 void test_result_strings_are_never_null(void)
 {
-    for (int r = COMMS_TC_OK; r <= COMMS_TC_ERR_PARAM_RANGE; r++) {
+    for (int r = COMMS_TC_OK; r <= COMMS_TC_ERR_MAC; r++) {
         TEST_ASSERT_NOT_NULL(comms_tc_result_str((comms_tc_result_t)r));
     }
+    TEST_ASSERT_EQUAL_STRING("MAC", comms_tc_result_str(COMMS_TC_ERR_MAC));
     TEST_ASSERT_EQUAL_STRING("UNKNOWN", comms_tc_result_str((comms_tc_result_t)999));
 }
 
@@ -322,19 +357,57 @@ void test_rx_gate_drops_malformed_frames_without_dispatching(void)
     TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_TOO_LONG,
                           comms_rx_handle_frame(frame_buf, (size_t)COMMS_TC_MAX_FRAME + 1U));
 
-    /* CRC error on an otherwise perfect RESET — must not reboot the OBC. */
+    /* CRC error on an otherwise perfectly sealed RESET — must not reboot. */
+    size_t n = build_auth_frame(COMMS_TC_RESET, NULL, 0U);
+    frame_buf[n - 1] ^= 0x55U;
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_CRC, comms_rx_handle_frame(frame_buf, n));
+
+    /* Bad tag on a CRC-valid RESET — must not reboot either. */
+    n = build_auth_frame(COMMS_TC_RESET, NULL, 0U);
+    frame_buf[2] ^= 0x01U;                       /* flip one tag bit ... */
+    /* ... and repair the CRC over the tampered bytes so only the tag fails. */
+    {
+        const uint16_t crc = comms_crc16_ccitt(frame_buf, n - 2U);
+        frame_buf[n - 2]   = (uint8_t)(crc >> 8);
+        frame_buf[n - 1]   = (uint8_t)(crc & 0xFFU);
+    }
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, comms_rx_handle_frame(frame_buf, n));
+
+    /* Unknown opcode with a VALID tag (proves the tag covers any byte). */
+    n = build_auth_frame(0xEEU, NULL, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_OPCODE, comms_rx_handle_frame(frame_buf, n));
+
+    /* Out-of-range beacon interval, sealed. */
+    put_be32(p, 10UL);
+    n = build_auth_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PARAM_RANGE, comms_rx_handle_frame(frame_buf, n));
+}
+
+/* Enforcement (COMMS_AUTH_ENFORCE=1, the flight default compiled into this
+ * binary): a structurally perfect legacy CRC-only frame carries no tag and
+ * must be rejected with COMMS_TC_ERR_MAC, never dispatched. No
+ * state_machine_* / NVIC_SystemReset expectations are queued, so CMock fails
+ * if the frame reaches the dispatcher. */
+void test_rx_gate_rejects_untagged_legacy_frame_when_enforced(void)
+{
+    size_t n = build_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, validate(frame_buf, n));  /* well formed */
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, comms_rx_handle_frame(frame_buf, n));
+
+    n = build_frame(COMMS_TC_RESET, NULL, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, comms_rx_handle_frame(frame_buf, n));
+}
+
+/* Malformed legacy frames keep their structural verdict under enforcement —
+ * the OK->MAC mapping applies only to frames that parsed cleanly. */
+void test_rx_gate_keeps_structural_verdict_for_malformed_legacy(void)
+{
     size_t n = build_frame(COMMS_TC_RESET, NULL, 0U);
     frame_buf[n - 1] ^= 0x55U;
     TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_CRC, comms_rx_handle_frame(frame_buf, n));
 
-    /* Unknown opcode. */
-    n = build_frame(0xEEU, NULL, 0U);
-    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_OPCODE, comms_rx_handle_frame(frame_buf, n));
-
-    /* Out-of-range beacon interval. */
-    put_be32(p, 10UL);
-    n = build_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U);
-    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PARAM_RANGE, comms_rx_handle_frame(frame_buf, n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_TOO_SHORT,
+                          comms_rx_handle_frame(frame_buf, 2U));
 }
 
 /* ================= RX gate: accept must dispatch exactly once ============= */
@@ -342,14 +415,14 @@ void test_rx_gate_drops_malformed_frames_without_dispatching(void)
 void test_rx_gate_dispatches_exit_state(void)
 {
     state_machine_request_transition_ExpectAndReturn(STATE_READY, TRIGGER_GROUND_CMD, 0);
-    size_t n = build_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+    size_t n = build_auth_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
     TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_frame(frame_buf, n));
 }
 
 void test_rx_gate_dispatches_activate_payload(void)
 {
     state_machine_request_transition_ExpectAndReturn(STATE_ACTIVE, TRIGGER_GROUND_CMD, 0);
-    size_t n = build_frame(COMMS_TC_ACTIVATE_PAYLOAD, NULL, 0U);
+    size_t n = build_auth_frame(COMMS_TC_ACTIVATE_PAYLOAD, NULL, 0U);
     TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_frame(frame_buf, n));
 }
 
@@ -363,7 +436,7 @@ void test_rx_gate_dispatches_reset(void)
     comms_rx_get_stats(&before);
 
     const uint32_t resets_before = host_nvic_reset_count();
-    size_t         n             = build_frame(COMMS_TC_RESET, NULL, 0U);
+    size_t         n             = build_auth_frame(COMMS_TC_RESET, NULL, 0U);
 
     HOST_EXPECT_NVIC_RESET(comms_rx_handle_frame(frame_buf, n));
 
@@ -377,7 +450,7 @@ void test_rx_gate_dispatches_in_range_beacon_interval(void)
     uint8_t p[4];
     put_be32(p, 60000UL);                    /* 60 s — inside [1 s, 1 h] */
     state_machine_set_beacon_interval_ExpectAndReturn(60000UL, 0);
-    size_t n = build_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U);
+    size_t n = build_auth_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U);
     TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_frame(frame_buf, n));
 }
 
@@ -386,7 +459,7 @@ void test_rx_gate_dispatches_zero_beacon_interval_escape(void)
     uint8_t p[4];
     put_be32(p, 0UL);
     state_machine_set_beacon_interval_ExpectAndReturn(0UL, 0);
-    size_t n = build_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U);
+    size_t n = build_auth_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U);
     TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_frame(frame_buf, n));
 }
 
@@ -397,22 +470,35 @@ void test_rx_stats_classify_each_verdict(void)
     comms_rx_stats_t before, after;
     comms_rx_get_stats(&before);
 
-    /* 1 accepted */
+    /* 1 accepted (sealed EXIT_STATE) */
     state_machine_request_transition_ExpectAndReturn(STATE_READY, TRIGGER_GROUND_CMD, 0);
-    (void)comms_rx_handle_frame(frame_buf, build_frame(COMMS_TC_EXIT_STATE, NULL, 0U));
+    (void)comms_rx_handle_frame(frame_buf, build_auth_frame(COMMS_TC_EXIT_STATE, NULL, 0U));
 
-    /* 1 CRC rejection */
-    size_t n = build_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+    /* 1 CRC rejection (sealed frame, corrupted trailer) */
+    size_t n = build_auth_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
     frame_buf[n - 1] ^= 0x01U;
     (void)comms_rx_handle_frame(frame_buf, n);
 
-    /* 1 opcode rejection */
-    (void)comms_rx_handle_frame(frame_buf, build_frame(0xABU, NULL, 0U));
+    /* 1 MAC rejection (sealed frame, corrupted tag, repaired CRC) */
+    n = build_auth_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+    frame_buf[3] ^= 0x01U;
+    {
+        const uint16_t crc = comms_crc16_ccitt(frame_buf, n - 2U);
+        frame_buf[n - 2]   = (uint8_t)(crc >> 8);
+        frame_buf[n - 1]   = (uint8_t)(crc & 0xFFU);
+    }
+    (void)comms_rx_handle_frame(frame_buf, n);
 
-    /* 1 range rejection */
+    /* 1 opcode rejection (sealed frame, unknown opcode) */
+    (void)comms_rx_handle_frame(frame_buf, build_auth_frame(0xABU, NULL, 0U));
+
+    /* 1 range rejection (sealed frame, out-of-range parameter) */
     uint8_t p[4];
     put_be32(p, 1UL);
-    (void)comms_rx_handle_frame(frame_buf, build_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U));
+    (void)comms_rx_handle_frame(frame_buf, build_auth_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U));
+
+    /* 1 untagged-legacy rejection (well formed, no tag — enforced) */
+    (void)comms_rx_handle_frame(frame_buf, build_frame(COMMS_TC_EXIT_STATE, NULL, 0U));
 
     /* 2 malformed rejections */
     (void)comms_rx_handle_frame(NULL, 8U);
@@ -420,8 +506,9 @@ void test_rx_stats_classify_each_verdict(void)
 
     comms_rx_get_stats(&after);
     TEST_ASSERT_EQUAL_UINT32(before.accepted + 1U,            after.accepted);
-    TEST_ASSERT_EQUAL_UINT32(before.rejected + 5U,            after.rejected);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected + 7U,            after.rejected);
     TEST_ASSERT_EQUAL_UINT32(before.rejected_crc + 1U,        after.rejected_crc);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_mac + 2U,        after.rejected_mac);
     TEST_ASSERT_EQUAL_UINT32(before.rejected_opcode + 1U,     after.rejected_opcode);
     TEST_ASSERT_EQUAL_UINT32(before.rejected_range + 1U,      after.rejected_range);
     TEST_ASSERT_EQUAL_UINT32(before.rejected_malformed + 2U,  after.rejected_malformed);
@@ -430,6 +517,270 @@ void test_rx_stats_classify_each_verdict(void)
 void test_rx_stats_tolerates_null_out(void)
 {
     comms_rx_get_stats(NULL);   /* must not fault */
+}
+
+/* ================= uplink authentication (HMAC-SHA256) ================= */
+
+/* Known-answer vectors for comms_auth_tag(), computed independently with
+ * Python hashlib (hmac.new(key, data, sha256)) — NOT with the C code under
+ * test. Key = A1 B2 C3 D4 (upstream RedPill SECRET_KEY). */
+void test_auth_tag_known_answer_vectors(void)
+{
+    static const uint8_t exit_state[2] = { 0x02U, 0x00U };
+    static const uint8_t reset[2]      = { 0x01U, 0x00U };
+    static const uint8_t beacon[6]     = { 0x06U, 0x04U, 0x00U, 0x00U, 0xEAU, 0x60U };
+
+    TEST_ASSERT_EQUAL_HEX32(0xD7D5199CU, comms_auth_tag(exit_state, sizeof(exit_state)));
+    TEST_ASSERT_EQUAL_HEX32(0x2413C884U, comms_auth_tag(reset, sizeof(reset)));
+    TEST_ASSERT_EQUAL_HEX32(0x9FB4A7A7U, comms_auth_tag(beacon, sizeof(beacon)));
+}
+
+void test_auth_tag_null_returns_zero(void)
+{
+    TEST_ASSERT_EQUAL_HEX32(0U, comms_auth_tag(NULL, 4U));
+}
+
+void test_auth_layout_discriminator(void)
+{
+    size_t n;
+
+    n = build_auth_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+    TEST_ASSERT_TRUE(comms_frame_is_auth_layout(frame_buf, n));
+
+    n = build_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+    TEST_ASSERT_FALSE(comms_frame_is_auth_layout(frame_buf, n));
+
+    TEST_ASSERT_FALSE(comms_frame_is_auth_layout(NULL, 8U));
+    TEST_ASSERT_FALSE(comms_frame_is_auth_layout(frame_buf, 0U));
+    TEST_ASSERT_FALSE(comms_frame_is_auth_layout(frame_buf, 1U));
+    TEST_ASSERT_FALSE(comms_frame_is_auth_layout(frame_buf, (size_t)COMMS_TC_MAX_FRAME + 1U));
+
+    /* Declared payload beyond the auth budget is never an auth layout. */
+    (void)build_frame(COMMS_TC_SET_CONFIG, NULL, 0U);
+    frame_buf[1] = (uint8_t)(COMMS_TC_MAX_AUTH_PAYLOAD + 1U);
+    TEST_ASSERT_FALSE(comms_frame_is_auth_layout(frame_buf, (size_t)COMMS_TC_MAX_FRAME));
+}
+
+void test_validate_auth_accepts_sealed_frame_and_reports_slice(void)
+{
+    uint8_t        payload[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    uint8_t        opcode     = 0U;
+    const uint8_t *out        = NULL;
+    size_t         out_len    = 0U;
+
+    size_t n = build_auth_frame(COMMS_TC_SEND_DATA, payload, 8U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK,
+                          comms_validate_tc_auth(frame_buf, n, &opcode, &out, &out_len));
+    TEST_ASSERT_EQUAL_HEX8(COMMS_TC_SEND_DATA, opcode);
+    TEST_ASSERT_EQUAL_size_t(8U, out_len);
+    /* Payload slice excludes the 4 tag bytes that follow it on the wire. */
+    TEST_ASSERT_EQUAL_PTR(&frame_buf[COMMS_TC_HDR_LEN], out);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, out, 8);
+}
+
+void test_validate_auth_accepts_empty_command_with_null_payload(void)
+{
+    uint8_t        opcode  = 0U;
+    const uint8_t *out     = (const uint8_t *)1;
+    size_t         out_len = 99U;
+
+    size_t n = build_auth_frame(COMMS_TC_ACTIVATE_PAYLOAD, NULL, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK,
+                          comms_validate_tc_auth(frame_buf, n, &opcode, &out, &out_len));
+    TEST_ASSERT_EQUAL_HEX8(COMMS_TC_ACTIVATE_PAYLOAD, opcode);
+    TEST_ASSERT_EQUAL_size_t(0U, out_len);
+    TEST_ASSERT_NULL(out);
+}
+
+void test_validate_auth_rejects_null_and_runt_and_oversize(void)
+{
+    uint8_t        opcode  = 0U;
+    const uint8_t *payload = NULL;
+    size_t         plen    = 0U;
+    size_t         n       = build_auth_frame(COMMS_TC_RESET, NULL, 0U);
+
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_NULL,
+                          comms_validate_tc_auth(NULL, n, &opcode, &payload, &plen));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_NULL,
+                          comms_validate_tc_auth(frame_buf, n, NULL, &payload, &plen));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_NULL,
+                          comms_validate_tc_auth(frame_buf, n, &opcode, NULL, &plen));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_NULL,
+                          comms_validate_tc_auth(frame_buf, n, &opcode, &payload, NULL));
+
+    for (size_t len = 0U; len < (size_t)COMMS_TC_MIN_AUTH_FRAME; len++) {
+        TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_TOO_SHORT, validate_auth(frame_buf, len));
+    }
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_TOO_LONG,
+                          validate_auth(frame_buf, (size_t)COMMS_TC_MAX_FRAME + 1U));
+}
+
+void test_validate_auth_rejects_declared_payload_beyond_budget(void)
+{
+    (void)build_auth_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+
+    frame_buf[1] = 250U;
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_TOO_LONG,
+                          validate_auth(frame_buf, (size_t)COMMS_TC_MAX_FRAME));
+
+    frame_buf[1] = (uint8_t)(COMMS_TC_MAX_AUTH_PAYLOAD + 1U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_TOO_LONG,
+                          validate_auth(frame_buf, (size_t)COMMS_TC_MAX_FRAME));
+}
+
+void test_validate_auth_rejects_length_mismatch(void)
+{
+    size_t n = build_auth_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+
+    frame_buf[1] = 1U;                       /* lie about the payload size */
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_LEN_MISMATCH, validate_auth(frame_buf, n));
+}
+
+/* A legacy CRC-only frame is not an authenticated frame: a 0-payload legacy
+ * frame (4 B) is below the authenticated minimum (8 B); a longer legacy
+ * frame never satisfies P+8 either. Either way the auth validator rejects
+ * it — never OK. */
+void test_validate_auth_rejects_legacy_frame(void)
+{
+    size_t n = build_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, validate(frame_buf, n));  /* legacy view */
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_TOO_SHORT, validate_auth(frame_buf, n));
+
+    uint8_t payload[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    n = build_frame(COMMS_TC_SEND_DATA, payload, 8U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, validate(frame_buf, n));  /* legacy view */
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_LEN_MISMATCH, validate_auth(frame_buf, n));
+}
+
+void test_validate_auth_rejects_corrupted_crc(void)
+{
+    size_t n = build_auth_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+    frame_buf[n - 1] ^= 0xFFU;
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_CRC, validate_auth(frame_buf, n));
+}
+
+/* Repair the CRC over tampered bytes so the ONLY failing check is the tag. */
+static void repair_crc(size_t n)
+{
+    const uint16_t crc = comms_crc16_ccitt(frame_buf, n - (size_t)COMMS_TC_CRC_LEN);
+    frame_buf[n - 2]   = (uint8_t)(crc >> 8);
+    frame_buf[n - 1]   = (uint8_t)(crc & 0xFFU);
+}
+
+void test_validate_auth_rejects_tampered_payload(void)
+{
+    uint8_t payload[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+    size_t  n = build_auth_frame(COMMS_TC_SET_CONFIG, payload, 4U);
+    frame_buf[3] ^= 0x01U;                   /* flip one payload bit */
+    repair_crc(n);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, validate_auth(frame_buf, n));
+}
+
+void test_validate_auth_rejects_tampered_tag(void)
+{
+    size_t n = build_auth_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+    frame_buf[2] ^= 0x80U;                   /* flip the top tag bit */
+    repair_crc(n);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, validate_auth(frame_buf, n));
+}
+
+void test_validate_auth_rejects_tampered_opcode(void)
+{
+    size_t n = build_auth_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+    frame_buf[0] = COMMS_TC_RESET;           /* opcode covered by the tag */
+    repair_crc(n);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, validate_auth(frame_buf, n));
+}
+
+/* A tag sealed with any other key must fail — proves the verifier actually
+ * keys the HMAC and does not accept a self-consistent forgery. */
+void test_validate_auth_rejects_wrong_key(void)
+{
+    static const uint8_t wrong_key[4] = { 0xDEU, 0xADU, 0xBEU, 0xEFU };
+    uint8_t  mac[32];
+    uint8_t  p[4];
+    size_t   n;
+
+    put_be32(p, 60000UL);
+    n = build_auth_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U);
+
+    /* Re-seal the header slice with the wrong key, then repair the CRC so
+     * the tag is the only failing check. */
+    hmac_sha256(wrong_key, sizeof(wrong_key), frame_buf,
+                (size_t)COMMS_TC_HDR_LEN + 4U, mac);
+    frame_buf[6] = mac[0];
+    frame_buf[7] = mac[1];
+    frame_buf[8] = mac[2];
+    frame_buf[9] = mac[3];
+    repair_crc(n);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, validate_auth(frame_buf, n));
+}
+
+/* Authentication runs BEFORE opcode parsing: a bad tag reports MAC even when
+ * the opcode is also unknown, while a good tag over an unknown opcode
+ * reports OPCODE. Unauthenticated senders learn nothing about the whitelist. */
+void test_validate_auth_checks_tag_before_opcode(void)
+{
+    size_t n = build_auth_frame(0xEEU, NULL, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_OPCODE, validate_auth(frame_buf, n));
+
+    frame_buf[2] ^= 0x01U;
+    repair_crc(n);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, validate_auth(frame_buf, n));
+}
+
+void test_validate_auth_enforces_opcode_and_range_after_tag(void)
+{
+    uint8_t p[4];
+
+    /* Valid tag, illegal size for RESET. */
+    uint8_t junk[2] = { 0x00, 0x01 };
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PAYLOAD_LEN,
+                          validate_auth(frame_buf,
+                                        build_auth_frame(COMMS_TC_RESET, junk, 2U)));
+
+    /* Valid tag, out-of-range beacon interval. */
+    put_be32(p, COMMS_TC_BEACON_MIN_MS - 1UL);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PARAM_RANGE,
+                          validate_auth(frame_buf,
+                                        build_auth_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U)));
+
+    /* Valid tag, in-range beacon interval. */
+    put_be32(p, 60000UL);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK,
+                          validate_auth(frame_buf,
+                                        build_auth_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U)));
+}
+
+/* Largest payload any whitelisted opcode accepts (SET_CONFIG, 32 B) seals
+ * and verifies — exercises the multi-block HMAC path on the flight side. */
+void test_validate_auth_accepts_largest_opcode_payload(void)
+{
+    uint8_t payload[32];
+    for (size_t i = 0U; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)(i & 0xFFU);
+    }
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK,
+                          validate_auth(frame_buf,
+                                        build_auth_frame(COMMS_TC_SET_CONFIG,
+                                                         payload, (uint8_t)sizeof(payload))));
+}
+
+/* A full-budget authenticated frame (56 B) passes framing, CRC and tag, then
+ * fails the per-opcode size contract — no opcode accepts that much. A
+ * tampered tag on the same frame fails earlier with MAC. */
+void test_validate_auth_full_budget_frame_fails_opcode_size(void)
+{
+    uint8_t payload[COMMS_TC_MAX_AUTH_PAYLOAD];
+    memset(payload, 0xA5, sizeof(payload));
+
+    size_t n = build_auth_frame(COMMS_TC_SET_CONFIG, payload, (uint8_t)sizeof(payload));
+    TEST_ASSERT_EQUAL_size_t((size_t)COMMS_TC_MAX_FRAME, n);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PAYLOAD_LEN, validate_auth(frame_buf, n));
+
+    frame_buf[2] ^= 0x01U;
+    repair_crc(n);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, validate_auth(frame_buf, n));
 }
 
 /* ================= LoRa task wiring (watchdog mocked) ================= */
