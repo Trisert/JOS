@@ -53,11 +53,22 @@
  *     bounds-checked before use; fixed upper bounds on every loop.
  *   - NASA-STD-8739.8 : command validation — malformed, oversized, unknown or
  *     out-of-range commands are rejected, never executed.
+ *
+ * LAYER COUPLING (deliberate): this header includes obsw_types.h for
+ * BEACON_INTERVAL_MIN/MAX, so the comms layer depends on the obsw layer for
+ * exactly one fact — the beacon cadence band. That keeps a single source of
+ * truth: a separate copy here previously accepted [1 s, 1 h] while the state
+ * machine enforced [10 s, 16 min], letting an uplink pass validation that
+ * was then rejected at apply time. The dependency is one-directional
+ * (obsw never includes comms_validate.h) and limited to integer constants,
+ * so no init-order or link-cycle risk. Decoupling would reintroduce the
+ * two-band drift — documented here so it is never "cleaned up" apart.
  */
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "obsw_types.h"   /* BEACON_INTERVAL_MIN/MAX: single source of truth */
 
 /** Maximum LoRa PHY payload accepted on the uplink (bytes). */
 #define COMMS_TC_MAX_FRAME    64U
@@ -124,9 +135,16 @@
 #define COMMS_TC_ACTIVATE_PAYLOAD     0x05U
 #define COMMS_TC_SET_BEACON_INTERVAL  0x06U
 
-/** Accepted beacon interval bounds (ms). 0 is the "use per-state default" escape. */
-#define COMMS_TC_BEACON_MIN_MS        1000UL      /*  1 s  */
-#define COMMS_TC_BEACON_MAX_MS        3600000UL   /*  1 h  */
+/** Accepted beacon interval bounds (ms). 0 is the "use per-state default" escape.
+ *
+ * Aliased to [BEACON_INTERVAL_MIN, BEACON_INTERVAL_MAX] enforced by
+ * state_machine_set_beacon_interval(): 10 s protects the RF duty-cycle/TX
+ * chain, 16 min is the slowest cadence the beacon watchdog is dimensioned
+ * for. A separate copy here previously accepted [1 s, 1 h] and let an uplink
+ * through validation that the state machine then rejected — the two bands
+ * must never disagree again. */
+#define COMMS_TC_BEACON_MIN_MS        BEACON_INTERVAL_MIN
+#define COMMS_TC_BEACON_MAX_MS        BEACON_INTERVAL_MAX
 
 /** Validation verdicts. Only COMMS_TC_OK may be dispatched. */
 typedef enum {
@@ -141,6 +159,12 @@ typedef enum {
     COMMS_TC_ERR_PARAM_RANGE,   /**< numeric parameter outside min/max bounds */
     COMMS_TC_ERR_MAC,           /**< missing or invalid HMAC tag (appended last
                                      so all existing verdict values are stable) */
+    COMMS_TC_ERR_PHY            /**< radio rejected the frame below the validator
+                                     (oversize PHY payload, read error). Never
+                                     returned by comms_validate_tc() — only
+                                     accounted by the RX task via
+                                     comms_rx_account() so PHY drops are not a
+                                     stat blind spot. */
 } comms_tc_result_t;
 
 /** RX acceptance/rejection counters (telemetry + ground diagnostics). */
@@ -152,6 +176,7 @@ typedef struct {
     uint32_t rejected_opcode;
     uint32_t rejected_range;      /**< payload length or parameter range      */
     uint32_t rejected_mac;        /**< missing or invalid HMAC tag            */
+    uint32_t rejected_phy;        /**< radio dropped it below the validator   */
 } comms_rx_stats_t;
 
 /**

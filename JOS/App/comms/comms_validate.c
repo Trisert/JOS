@@ -371,6 +371,7 @@ const char *comms_tc_result_str(comms_tc_result_t result)
     case COMMS_TC_ERR_PAYLOAD_LEN:  return "BAD_PAYLOAD_LEN";
     case COMMS_TC_ERR_PARAM_RANGE:  return "PARAM_RANGE";
     case COMMS_TC_ERR_MAC:          return "MAC";
+    case COMMS_TC_ERR_PHY:          return "PHY";
     default:                        return "UNKNOWN";
     }
 }
@@ -408,6 +409,9 @@ void comms_rx_account(comms_tc_result_t result)
     case COMMS_TC_ERR_PARAM_RANGE:
         rx_stats.rejected_range++;
         break;
+    case COMMS_TC_ERR_PHY:
+        rx_stats.rejected_phy++;
+        break;
     default:
         rx_stats.rejected_malformed++;
         break;
@@ -425,5 +429,6 @@ void comms_rx_get_stats(comms_rx_stats_t *out)
         out->rejected_opcode    = rx_stats.rejected_opcode;
         out->rejected_range     = rx_stats.rejected_range;
         out->rejected_mac       = rx_stats.rejected_mac;
+        out->rejected_phy       = rx_stats.rejected_phy;
     }
 }
