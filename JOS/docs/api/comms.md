@@ -22,7 +22,7 @@ Semtech SX1268 on SPI1.
 | `lora_rx_task(void *arg)` | `void` | FreeRTOS task: interrupt-driven RX, CRC, decrypt, dispatch |
 | `lora_beacon_task_create(void)` | `osThreadId_t` | Create beacon task (declared in `comms.h`) |
 | `lora_rx_task_create(void)` | `osThreadId_t` | Create RX task (declared in `comms.h`) |
-| `lora_send_chunked(uint8_t *data, size_t len)` | — | Fragment into ≤64 B packets w/ sequence numbers |
+| `lora_send_chunked(const uint8_t *data, size_t len)` | `int` | Fragment into ≤64 B packets; each chunk carries a 2-B header (byte 0 = 0-based seq, byte 1 = total count), 128-B beacon ships as 3 chunks |
 
 > `lora_beacon_task_create` / `lora_rx_task_create` prototypes were missing
 > from `comms.h` and caused a build failure on GCC 15 (implicit-function-

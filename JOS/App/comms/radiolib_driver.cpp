@@ -108,7 +108,15 @@ extern "C" int lora_rx(uint8_t* buf, size_t* len)
        back to the caller. getPacketLength() must be called BEFORE readData(). */
     size_t received = radio.getPacketLength();
     if (received > *len) {
-        received = *len;   /* truncate to buffer capacity */
+        /* Oversized PHY payload: REJECT, never deliver a truncated frame. A
+           silent truncation would hand the validator a well-formed-looking
+           prefix of a longer frame (wrong length/CRC semantics) and could
+           turn one uplink into a different, dispatchable command. Report the
+           actual on-air length and let the caller drop + re-arm. The RX
+           staging buffer is COMMS_MAX_PACKET bytes, matching the
+           COMMS_TC_MAX_FRAME validation budget. */
+        *len = received;
+        return -1;
     }
     int16_t s = radio.readData(buf, received);
     if (s != RADIOLIB_ERR_NONE) {

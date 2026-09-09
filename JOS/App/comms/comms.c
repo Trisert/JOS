@@ -68,25 +68,45 @@ int lora_send_chunked(const uint8_t *data, size_t len)
 {
     size_t chunk_max = 0U;
     uint8_t *tx = comms_tx_buffer(&chunk_max);
-    size_t off = 0U;
 
     if ((data == NULL) && (len != 0U)) {
         return -1;
     }
+    if (len == 0U) {
+        return 0;   /* nothing to stage — NULL/0 is a successful no-op */
+    }
+    if (chunk_max <= (size_t)COMMS_CHUNK_HDR_LEN) {
+        return -1;  /* TX buffer cannot even hold the framing header */
+    }
 
-    /* Hand each chunk to RadioLib. TX is async (startTransmit); wait for the
-       DIO1 TX_DONE flag before staging the next chunk so we never overwrite
-       the buffer mid-air. 2000 ms covers SF10 @ 125 kHz for the largest chunk. */
-    while (off < len) {
-        size_t n = ((len - off) < chunk_max) ? (len - off) : chunk_max;
-        memcpy(tx, data + off, n);
-        if (lora_tx(tx, n) != 0) {
+    /* Payload bytes per chunk after the 1 B seq + 1 B total header. */
+    const size_t payload_max = chunk_max - (size_t)COMMS_CHUNK_HDR_LEN;
+
+    /* Bounded: payload_max >= 1, so total >= 1 and <= len. */
+    const size_t total = ((len - 1U) / payload_max) + 1U;
+    if (total > 255U) {
+        return -1;  /* count must fit in the 1-byte total field */
+    }
+
+    /* Hand each framed chunk to RadioLib. TX is async (startTransmit); wait
+       for the DIO1 TX_DONE flag before staging the next chunk so we never
+       overwrite the buffer mid-air. 2000 ms covers SF10 @ 125 kHz for the
+       largest chunk. */
+    for (size_t seq = 0U; seq < total; seq++) {
+        const size_t off = seq * payload_max;   /* no overflow: seq < total <= len */
+        size_t n = len - off;
+        if (n > payload_max) {
+            n = payload_max;
+        }
+        tx[0] = (uint8_t)seq;
+        tx[1] = (uint8_t)total;
+        memcpy(&tx[COMMS_CHUNK_HDR_LEN], data + off, n);
+        if (lora_tx(tx, n + (size_t)COMMS_CHUNK_HDR_LEN) != 0) {
             return -1;
         }
         if (lora_tx_wait_done(2000U) != 0) {
             return -1;
         }
-        off += n;
     }
     return 0;
 }
@@ -237,10 +257,12 @@ void lora_beacon_task(void *arg)
 
         /* Build beacon packet (96 B telemetry + 32 B sys) in `beacon`.
            TODO: full telemetry encoding. For now transmit the staging buffer
-           as-is so the link is exercised end-to-end. */
+           as-is so the link is exercised end-to-end. The 128 B beacon does
+           NOT fit one LoRa payload (COMMS_MAX_PACKET = 64): fragment it via
+           lora_send_chunked(), which frames every chunk with a 1 B seq + 1 B
+           total header (3 chunks on the air). */
         if (beacon_len > 0U) {
-            (void)lora_tx(beacon, beacon_len);
-            (void)lora_tx_wait_done(2000U);
+            (void)lora_send_chunked(beacon, beacon_len);
         }
 
         osDelay(pdMS_TO_TICKS(interval));

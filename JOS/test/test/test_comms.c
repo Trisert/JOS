@@ -50,6 +50,13 @@
 #include <unistd.h>             /* alarm(), STDERR_FILENO, _exit()           */
 #include <signal.h>             /* SIGALRM hang ceiling for task-loop tests  */
 
+/* TX call log in support/radiolib_stubs.c (host only): lets the framing tests
+   assert the exact on-air chunks (lengths, seq/total headers, reassembly). */
+extern size_t          radiolib_stub_tx_count(void);
+extern size_t          radiolib_stub_tx_len(size_t i);
+extern const uint8_t  *radiolib_stub_tx_data(size_t i);
+extern void            radiolib_stub_tx_reset(void);
+
 /* ---------- Frame builder ---------- */
 
 static uint8_t frame_buf[COMMS_TC_MAX_FRAME + 8];
@@ -930,11 +937,12 @@ void test_lora_init_reports_success(void)
     TEST_ASSERT_EQUAL_INT(0, lora_init());
 }
 
-/* lora_send_chunked() stages the payload through the SRAM2 TX buffer in
-   chunk_max-sized pieces. The radio itself is still a stub, so what is
-   verified is the bounds contract: a NULL buffer with a non-zero length is
-   refused, and a payload larger than one chunk is walked without running off
-   the end of the staging buffer (the last chunk must be the remainder). */
+/* lora_send_chunked() stages the payload through the SRAM2 TX buffer in framed
+   chunks: every radio call carries a 2-byte header (0-based seq, total count)
+   plus up to COMMS_MAX_PACKET - COMMS_CHUNK_HDR_LEN payload bytes. The radio
+   itself is a recording stub (support/radiolib_stubs.c), so what is verified
+   is the on-air framing contract: per-chunk lengths within the LoRa budget,
+   seq/total headers, and byte-exact reassembly. */
 void test_lora_send_chunked_rejects_null_with_nonzero_length(void)
 {
     TEST_ASSERT_EQUAL_INT(-1, lora_send_chunked(NULL, 16U));
@@ -952,20 +960,158 @@ void test_lora_send_chunked_stages_multi_chunk_payload(void)
     uint8_t        payload[3U * 64U];
 
     TEST_ASSERT_NOT_NULL(tx);
-    TEST_ASSERT_GREATER_THAN_size_t(0U, chunk_max);
+    TEST_ASSERT_GREATER_THAN_size_t((size_t)COMMS_CHUNK_HDR_LEN, chunk_max);
 
     for (size_t i = 0U; i < sizeof(payload); i++) {
         payload[i] = (uint8_t)(i & 0xFFU);
     }
 
-    /* One-and-a-bit chunks: exercises both the full-chunk and the remainder
-       iteration of the staging loop. */
-    const size_t len = chunk_max + 7U;
+    radiolib_stub_tx_reset();
+
+    /* One full framed chunk plus a 7-byte remainder: exercises both the
+       full-chunk and the remainder iteration of the staging loop. */
+    const size_t payload_max = chunk_max - (size_t)COMMS_CHUNK_HDR_LEN;
+    const size_t len = payload_max + 7U;
     TEST_ASSERT_LESS_OR_EQUAL_size_t(sizeof(payload), len);
     TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(payload, len));
 
-    /* The buffer holds the LAST chunk staged, i.e. the 7-byte remainder. */
-    TEST_ASSERT_EQUAL_UINT8_ARRAY(&payload[chunk_max], tx, 7);
+    /* Two radio calls, each within the LoRa payload budget. */
+    TEST_ASSERT_EQUAL_size_t(2U, radiolib_stub_tx_count());
+    TEST_ASSERT_EQUAL_size_t(chunk_max, radiolib_stub_tx_len(0));
+    TEST_ASSERT_EQUAL_size_t(7U + (size_t)COMMS_CHUNK_HDR_LEN,
+                             radiolib_stub_tx_len(1));
+
+    /* Headers: 0-based seq, total count. */
+    TEST_ASSERT_EQUAL_UINT8(0U, radiolib_stub_tx_data(0)[0]);
+    TEST_ASSERT_EQUAL_UINT8(2U, radiolib_stub_tx_data(0)[1]);
+    TEST_ASSERT_EQUAL_UINT8(1U, radiolib_stub_tx_data(1)[0]);
+    TEST_ASSERT_EQUAL_UINT8(2U, radiolib_stub_tx_data(1)[1]);
+
+    /* Payload slices land after the header, byte-exact. */
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, &radiolib_stub_tx_data(0)[COMMS_CHUNK_HDR_LEN],
+                                  payload_max);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(&payload[payload_max],
+                                  &radiolib_stub_tx_data(1)[COMMS_CHUNK_HDR_LEN], 7);
+
+    /* The staging buffer holds the LAST chunk staged: header + remainder. */
+    TEST_ASSERT_EQUAL_UINT8(1U, tx[0]);
+    TEST_ASSERT_EQUAL_UINT8(2U, tx[1]);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(&payload[payload_max], &tx[COMMS_CHUNK_HDR_LEN], 7);
+}
+
+/* A payload that fits one chunk still gets its seq/total header (seq 0 of 1),
+   so the ground segment sees one framing format, never two. */
+void test_lora_send_chunked_single_chunk_carries_seq_zero_total_one(void)
+{
+    uint8_t payload[10];
+    for (size_t i = 0U; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)(0xA0U + i);
+    }
+
+    radiolib_stub_tx_reset();
+    TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(payload, sizeof(payload)));
+
+    TEST_ASSERT_EQUAL_size_t(1U, radiolib_stub_tx_count());
+    TEST_ASSERT_EQUAL_size_t(sizeof(payload) + (size_t)COMMS_CHUNK_HDR_LEN,
+                             radiolib_stub_tx_len(0));
+    const uint8_t *c = radiolib_stub_tx_data(0);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_EQUAL_UINT8(0U, c[0]);
+    TEST_ASSERT_EQUAL_UINT8(1U, c[1]);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, &c[COMMS_CHUNK_HDR_LEN], sizeof(payload));
+}
+
+/* The 128 B beacon must ship as ceil(128/62) = 3 framed chunks, each within
+   the 64 B LoRa budget, reassembling byte-exact — never as one 128 B call
+   that violates COMMS_MAX_PACKET. */
+void test_lora_send_chunked_fragments_128B_beacon_within_budget(void)
+{
+    size_t chunk_max = 0U;
+    (void)comms_tx_buffer(&chunk_max);
+
+    uint8_t beacon[COMMS_BEACON_SIZE];
+    for (size_t i = 0U; i < sizeof(beacon); i++) {
+        beacon[i] = (uint8_t)(i & 0xFFU);
+    }
+
+    radiolib_stub_tx_reset();
+    TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(beacon, sizeof(beacon)));
+
+    TEST_ASSERT_EQUAL_size_t(3U, radiolib_stub_tx_count());
+    size_t off = 0U;
+    for (size_t i = 0U; i < 3U; i++) {
+        const size_t   ln = radiolib_stub_tx_len(i);
+        const uint8_t *c  = radiolib_stub_tx_data(i);
+        TEST_ASSERT_LESS_OR_EQUAL_size_t(chunk_max, ln);
+        TEST_ASSERT_GREATER_THAN_size_t((size_t)COMMS_CHUNK_HDR_LEN, ln);
+        TEST_ASSERT_NOT_NULL(c);
+        TEST_ASSERT_EQUAL_UINT8((uint8_t)i, c[0]);
+        TEST_ASSERT_EQUAL_UINT8(3U, c[1]);
+        const size_t n = ln - (size_t)COMMS_CHUNK_HDR_LEN;
+        TEST_ASSERT_EQUAL_UINT8_ARRAY(&beacon[off], &c[COMMS_CHUNK_HDR_LEN], n);
+        off += n;
+    }
+    TEST_ASSERT_EQUAL_size_t(sizeof(beacon), off);
+}
+
+/* Zero length stages nothing and touches the radio not at all. */
+void test_lora_send_chunked_empty_payload_sends_nothing(void)
+{
+    radiolib_stub_tx_reset();
+    TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(frame_buf, 0U));
+    TEST_ASSERT_EQUAL_size_t(0U, radiolib_stub_tx_count());
+}
+
+/* The validator band must equal the state-machine band [10 s, 16 min]: the
+   certified edges pass, one millisecond outside fails on both sides. */
+void test_validate_beacon_interval_matches_state_machine_band(void)
+{
+    TEST_ASSERT_EQUAL_UINT32(10000UL, (uint32_t)COMMS_TC_BEACON_MIN_MS);
+    TEST_ASSERT_EQUAL_UINT32(960000UL, (uint32_t)COMMS_TC_BEACON_MAX_MS);
+
+    uint8_t p[4];
+
+    put_be32(p, 10000UL);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK,
+                          validate(frame_buf, build_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U)));
+    put_be32(p, 960000UL);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK,
+                          validate(frame_buf, build_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U)));
+
+    put_be32(p, 9999UL);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PARAM_RANGE,
+                          validate(frame_buf, build_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U)));
+    put_be32(p, 960001UL);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PARAM_RANGE,
+                          validate(frame_buf, build_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U)));
+}
+
+/* Regression: the legacy [1 s, 1 h] edges the validator used to accept must
+   now fail — 1 s hammers the TX chain below the duty-cycle floor, 1 h
+   out-runs the beacon watchdog ceiling. */
+void test_validate_rejects_legacy_1s_1h_band_edges(void)
+{
+    uint8_t p[4];
+
+    put_be32(p, 1000UL);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PARAM_RANGE,
+                          validate(frame_buf, build_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U)));
+
+    put_be32(p, 3600000UL);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PARAM_RANGE,
+                          validate(frame_buf, build_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U)));
+}
+
+/* The RX staging buffer, the validator budget and the driver reject threshold
+   must agree: a PHY payload that fits the buffer fits validation, so the
+   driver's oversize reject (radiolib_driver.cpp, no silent truncation) fires
+   exactly where comms_validate_tc() reports TOO_LONG — no gap between them. */
+void test_rx_buffer_matches_max_frame_budget(void)
+{
+    size_t rx_len = 0U;
+    TEST_ASSERT_NOT_NULL(comms_rx_buffer(&rx_len));
+    TEST_ASSERT_EQUAL_size_t((size_t)COMMS_TC_MAX_FRAME, rx_len);
+    TEST_ASSERT_EQUAL_size_t((size_t)COMMS_MAX_PACKET, rx_len);
 }
 
 /* A radio refusal mid-staging aborts the transfer: the chunk that failed
@@ -1156,6 +1302,38 @@ void test_lora_beacon_task_loop_registers_actual_cadence_once(void)
     }
 
     run_task_iterations(lora_beacon_task);
+}
+
+/* End-to-end framing proof: one beacon iteration emits the 128 B beacon as 3
+   framed chunks (never a single 128 B lora_tx violating COMMS_MAX_PACKET).
+   Three loop iterations therefore log 9 radio calls with cycling seq 0,1,2
+   and total 3, every call within the 64 B budget. */
+void test_lora_beacon_task_fragments_beacon_into_framed_chunks(void)
+{
+    radiolib_stub_tx_reset();
+
+    for (int i = 0; i < 3; i++) {
+        state_machine_get_beacon_interval_ExpectAndReturn(BEACON_INTERVAL_READY);
+        if (i == 0) {
+            osThreadGetId_ExpectAndReturn(BEACON_TH);
+            watchdog_register_task_ExpectAndReturn(BEACON_TH,
+                                                   BEACON_INTERVAL_READY, 0);
+        }
+        watchdog_alive_self_Expect();
+    }
+
+    run_task_iterations(lora_beacon_task);
+
+    TEST_ASSERT_EQUAL_size_t(9U, radiolib_stub_tx_count());
+    for (size_t i = 0U; i < 9U; i++) {
+        const size_t   ln = radiolib_stub_tx_len(i);
+        const uint8_t *c  = radiolib_stub_tx_data(i);
+        TEST_ASSERT_LESS_OR_EQUAL_size_t((size_t)COMMS_MAX_PACKET, ln);
+        TEST_ASSERT_GREATER_THAN_size_t((size_t)COMMS_CHUNK_HDR_LEN, ln);
+        TEST_ASSERT_NOT_NULL(c);
+        TEST_ASSERT_EQUAL_UINT8((uint8_t)(i % 3U), c[0]);
+        TEST_ASSERT_EQUAL_UINT8(3U, c[1]);
+    }
 }
 
 /* A cadence change commanded from ground must be re-declared to the monitor,

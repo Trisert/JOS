@@ -10,6 +10,11 @@
 #define COMMS_MAX_PACKET   64U    /* LoRa payload chunk */
 #define COMMS_BEACON_SIZE  128U   /* 96 B telemetry + 32 B system */
 
+/* Chunk framing header (see lora_send_chunked): byte 0 = seq (0-based),
+   byte 1 = total chunk count. Payload per chunk is therefore
+   COMMS_MAX_PACKET - COMMS_CHUNK_HDR_LEN; the 128 B beacon ships as 3 chunks. */
+#define COMMS_CHUNK_HDR_LEN 2U
+
 /* RX task wake flag (DIO1 RX_DONE). Must match LORA_FLAG_RX_DONE in
    radiolib_driver.cpp so the ISR and the task agree on the bit. */
 #define LORA_RX_FLAG 0x02U
@@ -25,7 +30,13 @@ osThreadId_t lora_rx_task_create(void);
 /* RX task — continuous uplink listening, command dispatch */
 void lora_rx_task(void *arg);
 
-/* Send data in 64-byte chunks */
+/* Send data in chunks of at most COMMS_MAX_PACKET bytes.
+ *
+ * Every chunk carries a COMMS_CHUNK_HDR_LEN-byte header (byte 0 = 0-based
+ * sequence number, byte 1 = total chunk count) so the ground segment can
+ * detect a lost/reordered chunk and reassemble the payload. Returns 0 on
+ * success, -1 on NULL/length errors, an undersized TX buffer, a count that
+ * would not fit in the 1-byte total field, or a radio error. */
 int lora_send_chunked(const uint8_t *data, size_t len);
 
 /* Validate a raw uplink frame and dispatch it only when it is well formed,

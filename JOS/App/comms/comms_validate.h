@@ -58,6 +58,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "obsw_types.h"   /* BEACON_INTERVAL_MIN/MAX: single source of truth */
 
 /** Maximum LoRa PHY payload accepted on the uplink (bytes). */
 #define COMMS_TC_MAX_FRAME    64U
@@ -124,9 +125,16 @@
 #define COMMS_TC_ACTIVATE_PAYLOAD     0x05U
 #define COMMS_TC_SET_BEACON_INTERVAL  0x06U
 
-/** Accepted beacon interval bounds (ms). 0 is the "use per-state default" escape. */
-#define COMMS_TC_BEACON_MIN_MS        1000UL      /*  1 s  */
-#define COMMS_TC_BEACON_MAX_MS        3600000UL   /*  1 h  */
+/** Accepted beacon interval bounds (ms). 0 is the "use per-state default" escape.
+ *
+ * Aliased to [BEACON_INTERVAL_MIN, BEACON_INTERVAL_MAX] enforced by
+ * state_machine_set_beacon_interval(): 10 s protects the RF duty-cycle/TX
+ * chain, 16 min is the slowest cadence the beacon watchdog is dimensioned
+ * for. A separate copy here previously accepted [1 s, 1 h] and let an uplink
+ * through validation that the state machine then rejected — the two bands
+ * must never disagree again. */
+#define COMMS_TC_BEACON_MIN_MS        BEACON_INTERVAL_MIN
+#define COMMS_TC_BEACON_MAX_MS        BEACON_INTERVAL_MAX
 
 /** Validation verdicts. Only COMMS_TC_OK may be dispatched. */
 typedef enum {
