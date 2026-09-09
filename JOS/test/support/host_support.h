@@ -146,4 +146,17 @@ void host_flash_fail_program_after(uint32_t successes);
  * address, so a correct FM24VN10-G access is 0xA0/0xA2/0xA4/0xA6. */
 uint16_t host_flash_last_i2c_addr(void);
 
+/* ==========================================================================
+ * Radio doubles (support/radiolib_stubs.c) — SX1268 failure injection
+ * ========================================================================== */
+
+/* The n-th upcoming lora_tx() / lora_tx_wait_done() call fails (-1), so
+ * tests can reach lora_send_chunked()'s radio/timeout error paths in
+ * comms.c — including mid-transfer (n = 2 on a two-chunk payload).
+ * n <= 0 disarms. Default is success; host_lora_reset() restores it
+ * (call from setUp()). */
+void host_lora_fail_tx_on_call(int n);
+void host_lora_fail_wait_on_call(int n);
+void host_lora_reset(void);
+
 #endif /* HOST_SUPPORT_H */

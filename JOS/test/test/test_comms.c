@@ -121,7 +121,10 @@ static comms_tc_result_t validate_auth(const uint8_t *f, size_t len)
     return comms_validate_tc_auth(f, len, &opcode, &payload, &plen);
 }
 
-void setUp(void)   { memset(frame_buf, 0, sizeof(frame_buf)); }
+/* host_lora_reset() resets the lora failure-INJECTION state (call counters +
+ * armed one-shot failures), not the radio model itself: a leftover armed
+ * failure must never leak into the next test. */
+void setUp(void)   { memset(frame_buf, 0, sizeof(frame_buf)); host_lora_reset(); }
 /* Safety net: the hang ceiling must NEVER survive past its own test case.
    The early-return path inside run_task_until_escape() longjmps into Unity
    before alarm(0) runs, so tearDown() disarms unconditionally — otherwise a
@@ -963,6 +966,58 @@ void test_lora_send_chunked_stages_multi_chunk_payload(void)
 
     /* The buffer holds the LAST chunk staged, i.e. the 7-byte remainder. */
     TEST_ASSERT_EQUAL_UINT8_ARRAY(&payload[chunk_max], tx, 7);
+}
+
+/* A radio refusal mid-staging aborts the transfer: the chunk that failed
+ * is reported, not retried, not skipped. */
+void test_lora_send_chunked_reports_radio_tx_failure(void)
+{
+    uint8_t payload[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+
+    host_lora_fail_tx_on_call(1);
+    TEST_ASSERT_EQUAL_INT(-1, lora_send_chunked(payload, sizeof(payload)));
+}
+
+/* TX_DONE never arriving (DIO1 timeout) aborts the transfer the same way. */
+void test_lora_send_chunked_reports_tx_done_timeout(void)
+{
+    uint8_t payload[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+
+    host_lora_fail_wait_on_call(1);
+    TEST_ASSERT_EQUAL_INT(-1, lora_send_chunked(payload, sizeof(payload)));
+}
+
+/* A failure on the SECOND chunk still aborts: the first chunk went out,
+ * but the transfer as a whole did not complete. */
+void test_lora_send_chunked_reports_failure_on_later_chunk(void)
+{
+    size_t         chunk_max = 0U;
+    const uint8_t *tx        = comms_tx_buffer(&chunk_max);
+    static uint8_t payload[3U * 64U];
+    size_t         i;
+
+    TEST_ASSERT_NOT_NULL(tx);
+    TEST_ASSERT_GREATER_THAN_size_t(0U, chunk_max);
+    for (i = 0U; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)(i & 0xFFU);
+    }
+
+    host_lora_fail_wait_on_call(2);   /* first chunk OK, second TX_DONE times out */
+    TEST_ASSERT_EQUAL_INT(-1,
+                          lora_send_chunked(payload, chunk_max + 7U));
+}
+
+/* SET_CONFIG and SEND_DATA are accepted by the gate (validation only). Handlers are TODO (no-op), so no mock expectations are queued. Frames are sealed: ENFORCE=1 rejects legacy CRC-only frames with ERR_MAC. */
+void test_rx_gate_dispatches_set_config_and_send_data(void)
+{
+    uint8_t payload[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    size_t  n;
+
+    n = build_auth_frame(COMMS_TC_SET_CONFIG, payload, 4U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_frame(frame_buf, n));
+
+    n = build_auth_frame(COMMS_TC_SEND_DATA, payload, 8U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_frame(frame_buf, n));
 }
 
 /* ================= task loops ================= */

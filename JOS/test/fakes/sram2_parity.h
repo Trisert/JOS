@@ -13,14 +13,24 @@
  * gcov instrumentation of the translation unit.
  *
  * The functional API (sram2_parity_init(), the NMI handlers, the .noinit
- * store) is deliberately NOT declared: no host-compiled module calls it, and a
- * declaration with no definition on the :support: path is a link error waiting
- * for the next test that includes this header.
+ * store) is deliberately NOT declared below, with three exceptions:
+ * App/obsw/state_machine.c (host-compiled) calls sram2_parity_boot_fault(),
+ * sram2_parity_boot_fault_ack() and sram2_restore_from_image(), so they are
+ * declared here with signatures mirroring Core/Inc/sram2_parity.h exactly.
+ * Their definitions live in the test binary that links state_machine.c
+ * (test/test_state_machine.c), nowhere on :support:.
  */
 #ifndef JOS_TEST_FAKE_SRAM2_PARITY_H
 #define JOS_TEST_FAKE_SRAM2_PARITY_H
 
+#include <stddef.h>
+
 #define SRAM2_CRITICAL
 #define SRAM2_CRITICAL_NOINIT
+
+/* Mirrors Core/Inc/sram2_parity.h (same signatures). */
+int sram2_parity_boot_fault(void);
+void sram2_parity_boot_fault_ack(void);
+int sram2_restore_from_image(void *obj, size_t len);
 
 #endif /* JOS_TEST_FAKE_SRAM2_PARITY_H */

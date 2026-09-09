@@ -48,6 +48,9 @@ the resulting failures look like flight-code bugs. One version, from one place.
 | `test_boot_crc.c` | `App/obsw/boot_crc.c` | CRC-32 known-answer vectors, `boot_crc_verify()` OK / MISMATCH / UNSTAMPED, all four latching accessors |
 | `test_bad_region.c` | `App/obsw/boot_crc.c` | the `BOOT_CRC_BAD_REGION` guard, built with `-DHOST_FW_BAD_REGION` |
 | `test_laststates.c` | `App/memory/memory.c` | LastStates Flash round trip, wrap/erase protocol, FRAM + cyclic buffer |
+| `test_state_machine.c` | `App/obsw/state_machine.c` | transitions via the public API (INIT/OFF rules, CRIT recovery SoC-gated, boot-CRC + parity confinement, LastStates-refusal, beacon cadence), plus the task boot sequence + autonomous loop through the captured entry point |
+| `test_temp.c` | `App/payloads/temp.c` | emulator + flight PB2 backend via the GPIO doubles, no-device triplet, mid-read reset loss, stuck-conversion timeout |
+| `test_comms.c` | `App/comms/comms.c` | validation gate, dispatch, RX accounting, plus `lora_send_chunked()` radio/timeout aborts (incl. mid-transfer) via the radio failure injection |
 
 ## Coverage gate
 
@@ -63,13 +66,19 @@ so the command exits non-zero when coverage of the modules under test drops
 below those numbers. It needs `gcovr` on `PATH`; CI installs it explicitly and
 prints its version, because a missing gcovr silently degrades the gate.
 
-Current numbers (gcovr, `App/obsw` + `App/memory` only):
+Current numbers (gcovr, all host-compilable modules — 179 tests green):
 
 ```
-lines:     93.5% (116 / 124)
-functions: 100.0% (22 / 22)
-branches:  77.6% (45 / 58)
+lines:     98.2% (928 / 945)
+functions: 100.0% (113 / 113)
+branches:  90.2% (433 / 480)
 ```
+
+Per-file: `temp.c` 100%, `boot_crc.c` / `aocs.c` 100%, `comms.c` 97%
+(only the `break` after the noreturn `NVIC_SystemReset()` and the
+whitelist-unreachable `default` arm are uncovered — both by design),
+`state_machine.c` 97% (only the dead context-copy arm, one loop
+bookkeeping line and the bad-magic restore are uncovered).
 
 (`boot_crc.c`'s uncovered lines in the `test_boot_crc` executable are the
 `BOOT_CRC_BAD_REGION` block, which is covered by the separate
