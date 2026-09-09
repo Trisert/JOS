@@ -560,6 +560,16 @@ static void MX_I2C4_Init(void)
   * (umbilical debug/telemetry, 115200-8-N-1). Initialised by
   * usart1_dbg_init() (Core/Src/usart1_dbg.c, register-level: the HAL
   * UART/USART drivers are not vendored) — see the call in main().
+  *
+  * CUBEMX REGEN NOTE: JOS.ioc keeps the USART1 IP enabled so the pin
+  * assignment, AF mapping and clock tree stay documented, and a regen
+  * WILL emit MX_USART1_UART_Init() + huart1 + USART1 MSP code. That
+  * generated init is intentionally NOT used: discard it on regen (do not
+  * declare huart1, do not call MX_USART1_UART_Init from main(), do not
+  * let generated GPIO AF setup for PB6/PB7 linger — usart1_dbg_init()
+  * owns the peripheral, pins and baud rate). Deleting the USART1 IP from
+  * the .ioc instead would leave PB6/PB7 unreserved and invite pin
+  * collisions on the next CubeMX edit.
   */
 /**
   * @brief SPI1 Initialization Function
@@ -738,7 +748,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_15, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
@@ -792,9 +802,39 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PB0 — SX1268 DIO1 (TX_DONE/RX_DONE), rising edge.
+    Mirrors LORA_DIO1_* in Core/Inc/main.h; NVIC arming is below. */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PC4 — SX1268 BUSY, plain input (no EXTI consumed).
+    Pull-up so the pin cannot float while the radio is in reset. */
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PC15 — STWD100 WDI (net WD_IN), push-pull output.
+    hw_watchdog_kick() toggles it; the STWD100 needs an edge within tWD,
+    so any steady initial level is fine. LSE is OFF, so OSC32_OUT is GPIO. */
+  GPIO_InitStruct.Pin = GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
+
+  /* EXTI interrupt init — PB0/SX1268 DIO1. Priority mirrors
+    LORA_DIO1_IRQ_PRIO in Core/Inc/main.h (must stay at/below the
+    FreeRTOS syscall ceiling; see the _Static_assert in stm32l4xx_it.c). */
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
 }
 
 /* USER CODE BEGIN 4 */
