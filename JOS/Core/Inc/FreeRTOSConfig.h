@@ -63,7 +63,12 @@
 #define CMSIS_device_header "stm32l4xx.h"
 #endif /* CMSIS_device_header */
 
-#define configENABLE_FPU                         0
+/* NOTE: on this ARM_CM4F port, configENABLE_FPU is inert: vPortEnableVFP()
+ * (ASPEN/LSPEN) runs unconditionally in port.c, and the config flag is only
+ * honored by the ARMv8-M ports. It is kept at 1 (= upstream default) for
+ * upstream alignment / future-proofing. No first-party TU in the tree uses
+ * float/double today, so no task currently touches the FPU. */
+#define configENABLE_FPU                         1
 #define configENABLE_MPU                         0
 
 #define configUSE_PREEMPTION                     1

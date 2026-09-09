@@ -29,6 +29,25 @@ for the STM32L496VGTx target.
 HAL, FreeRTOS, RadioLib) emit warnings we do not own, and hard-failing on them
 would block the build for reasons unrelated to flight-software quality.
 
+### FPU configuration (`configENABLE_FPU = 1`)
+
+The MCU flags in `JOS/Makefile` pass `-mfpu=fpv4-sp-d16 -mfloat-abi=hard`
+because the target (STM32L496VGTx, Cortex-M4F) has a single-precision FPU.
+No first-party translation unit uses `float`/`double` today (`aocs.c` is a
+no-op placeholder), so nothing currently emits FP instructions.
+
+The matching `configENABLE_FPU = 1` in `JOS/Core/Inc/FreeRTOSConfig.h` is
+inert on this port: the ARM_CM4F port enables VFP / lazy stacking
+(`ASPEN`/`LSPEN`) unconditionally in `port.c`, and the config flag is only
+honored by the ARMv8-M ports. It is kept at 1 (= upstream default) for
+upstream alignment / future-proofing. Should FP code land one day, its
+context is already preserved via lazy stacking (baseline 32 B exception
+frame, 104 B extended with FP state). The watchdog task's 1 KiB stack
+comment in `App/obsw/watchdog.c` accounts for the worst-case frame on top.
+
+Do **not** remove `-mfpu` / `-mfloat-abi` from the Makefile without reason:
+they match the silicon and cost nothing while no FP code exists.
+
 ## Static analysis (cppcheck)
 
 ### Running it
