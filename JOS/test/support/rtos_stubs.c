@@ -19,7 +19,9 @@
  * ------------------------------------------------------------------------- */
 #include "dual_bank.h"      /* fakes/dual_bank.h   */
 #include "hw_watchdog.h"    /* fakes/hw_watchdog.h */
+#include "task.h"           /* TaskHandle_t (host double below) */
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* ---------- IWDG backstop ---------- */
@@ -73,4 +75,27 @@ void host_dual_bank_reset(void)
 {
     boot_complete_calls         = 0u;
     boot_complete_failures_left = 0u;
+}
+
+/* ---------- LastStates pool-holder double (watchdog FDIR seam) ----------
+ * Flight version: App/memory/memory.c:laststates_pool_holder() (an
+ * xQueueGetMutexHolder() read of the pool mutex). The host build stubs the
+ * pool lock out entirely, so the holder behind the monitor's suspend/defer
+ * policy is driven by the test: NULL (default) means "mutex free", any task
+ * handle means "held by that task". */
+static TaskHandle_t host_pool_holder;
+
+TaskHandle_t laststates_pool_holder(void)
+{
+    return host_pool_holder;
+}
+
+void host_laststates_set_pool_holder(TaskHandle_t holder)
+{
+    host_pool_holder = holder;
+}
+
+void host_laststates_reset(void)
+{
+    host_pool_holder = (TaskHandle_t)NULL;
 }

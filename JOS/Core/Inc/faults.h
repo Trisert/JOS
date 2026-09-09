@@ -40,6 +40,11 @@ typedef enum {
        least specific label. Never encoded in an entry stub - fault_capture()
        derives it from HFSR/CFSR. */
     FAULT_ID_HARDFAULT_STACKING = 5,
+    /* pvPortMalloc() failed and vApplicationMallocFailedHook() ran. The heap
+       cannot grow at runtime, so this is a sizing finding, not a transient:
+       record the free/min-ever-free watermarks and reset into a known-good
+       state (fault_log_malloc_failed()). Never encoded in an entry stub. */
+    FAULT_ID_MALLOC_FAILED      = 6,
 } fault_id_t;
 
 typedef struct {
@@ -106,6 +111,21 @@ void fault_capture(const uint32_t *frame, uint32_t fault_id, uint32_t exc_return
 /* Record a FreeRTOS stack overflow (task name may be NULL) and reset the MCU.
    Called from vApplicationStackOverflowHook(). Does not return. */
 void fault_log_stack_overflow(const char *task_name);
+
+/* Record a FreeRTOS heap exhaustion (pvPortMalloc() failure) and reset the
+   MCU. Called from vApplicationMallocFailedHook(). Does not return.
+
+   Fully non-blocking: the heap watermarks are staged in a reset-persistent
+   .noinit slot (no pool mutex, no Flash, no frame-pointer chase) and the
+   MCU is reset. fault_malloc_flush() commits the slot to the LastStates
+   pool at task level on the next boot. */
+void fault_log_malloc_failed(void);
+
+/* Commit a malloc-failure record staged by fault_log_malloc_failed() to the
+   LastStates pool. Task-level boot context only (main(), next to
+   mpu_fault_log_flush()). Returns 1 persisted, 0 nothing staged,
+   -1 staged but the Flash write failed. */
+int fault_malloc_flush(void);
 
 #ifdef __cplusplus
 }

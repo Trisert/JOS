@@ -70,6 +70,10 @@ enum {
        stays in the wire contract because the codes above are ground telemetry
        and are never renumbered. */
     TRIGGER_SCRUB_FAULT     = 17,  /* SEU scrub: golden FRAM record unusable */
+    /* FreeRTOS heap exhaustion (vApplicationMallocFailedHook ->
+       fault_log_malloc_failed, see faults.h). Next free value; the wire
+       values above are never renumbered. */
+    TRIGGER_MALLOC_FAILED     = 18,  /* pvPortMalloc() failure, then reset   */
 };
 
 /* ---------- BMS interface (stub for now) ---------- */

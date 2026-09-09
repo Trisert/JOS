@@ -111,6 +111,22 @@ uint32_t laststates_count(void);
 int      laststates_pool_lock(void);
 void     laststates_pool_unlock(int held);
 
+#ifndef HOST_UNIT_TEST
+/* ---------- LastStates pool holder query (watchdog FDIR) ----------
+   Returns the task currently holding the pool mutex, or NULL when it is free
+   (or does not exist yet). The watchdog monitor must NEVER suspend that task:
+   suspending a mutex holder wedges every later laststates_write() - including
+   the monitor's own escalation record - on an osWaitForever acquire the
+   holder can no longer release. Implemented with xQueueGetMutexHolder()
+   (INCLUDE_xQueueGetMutexHolder = 1 in FreeRTOSConfig.h); a non-blocking
+   holder read, safe to call with the monitor mutex held. Flight only: the
+   host build stubs the pool lock out entirely (see above), so host tests
+   drive this seam through their own double (support/rtos_stubs.c). */
+#include "FreeRTOS.h" /* TaskHandle_t needs the kernel types first */
+#include "task.h"   /* TaskHandle_t */
+TaskHandle_t laststates_pool_holder(void);
+#endif
+
 /* Telemetry for the degraded paths above (both saturate-free 32-bit counters,
    zero after reset):
      laststates_lock_failures()   times serialisation was required and could

@@ -14,7 +14,9 @@
 
 typedef uint32_t TickType_t;
 typedef long     BaseType_t;
-typedef unsigned long UBaseType_t;
+/* 32 bits, matching the flight target: the host's native `unsigned long`
+   would be 64 bits wide and CMock would compare the wrong width. */
+typedef uint32_t UBaseType_t;
 
 #define pdTRUE                  ((BaseType_t)1)
 #define pdFALSE                 ((BaseType_t)0)

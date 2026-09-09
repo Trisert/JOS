@@ -24,6 +24,12 @@
  *     on every scan, seeds entries registered before the scheduler started,
  *     and declares the boot good only after DUAL_BANK_BOOT_OK_UPTIME_MS of
  *     scheduler uptime, retrying a bounded number of times.
++ *   - the suspend/defer policy: a stalled task that holds the LastStates
++ *     pool mutex is never suspended (that would wedge the pool) - the
++ *     escalation is deferred, counted, and retried on the next scan.
++ *   - stack high-water-mark telemetry: every scan samples
++ *     uxTaskGetStackHighWaterMark() per registered task for
++ *     watchdog_task_stack_hwm().
  *   - aocs_task_create() registers the created thread with the monitor at the
  *     declared period (WDG_PERIOD_AOCS_MS), and the aocs_task() loop calls
  *     watchdog_alive_self() on every iteration.
@@ -47,6 +53,8 @@
 uint32_t host_dual_bank_boot_complete_calls(void);
 void     host_dual_bank_fail_boot_complete(uint32_t times);
 void     host_dual_bank_reset(void);
+void     host_laststates_set_pool_holder(TaskHandle_t holder);
+void     host_laststates_reset(void);
 
 /* ---------- Fake RTOS objects (only their addresses matter) ---------- */
 static uint8_t mutex_obj;
@@ -61,6 +69,7 @@ void setUp(void)
 {
     host_dual_bank_reset();
     host_hw_watchdog_reset();
+    host_laststates_reset();
 
     /* Re-initialise the monitor before every test: watchdog.c keeps its task
        table in file-static storage that would otherwise leak between cases. */
@@ -309,6 +318,7 @@ void test_monitor_seeds_entries_registered_before_kernel_start(void)
     capture_monitor_entry();
 
     xTaskGetTickCount_IgnoreAndReturn(50u);
+    uxTaskGetStackHighWaterMark_IgnoreAndReturn(64u);
     osDelay_Stub(osDelay_escape_cb);
 
     run_monitor_scans(2);
@@ -318,9 +328,11 @@ void test_monitor_seeds_entries_registered_before_kernel_start(void)
 
 /* An armed task (it has reported liveness at least once) that then goes
    silent for more than 3x its declared period is walked over the staleness
-   branch. There is no escalation action yet (see the TODO in watchdog.c), so
-   what is asserted is that the scan completes and keeps kicking the IWDG:
-   a late task must never stop the hardware refresh. */
+   branch and escalated. On the host the two escalation back ends (suspend,
+   Flash record) are compiled out, but the policy decision - including the
+   pool-holder query - still runs, so what is asserted is that the scan
+   completes and keeps kicking the IWDG: a late task must never stop the
+   hardware refresh. */
 void test_monitor_scans_stale_armed_task_without_stopping_the_iwdg(void)
 {
     given_kernel_running();
@@ -337,6 +349,7 @@ void test_monitor_scans_stale_armed_task_without_stopping_the_iwdg(void)
        boot-OK latch is a one-shot shared by every test in this process and
        must only be consumed by the dedicated test further down. */
     xTaskGetTickCount_IgnoreAndReturn(1000u);
+    uxTaskGetStackHighWaterMark_IgnoreAndReturn(64u);
     osDelay_Stub(osDelay_escape_cb);
 
     run_monitor_scans(1);
@@ -438,4 +451,125 @@ void test_aocs_task_loop_signals_watchdog_every_iteration(void)
     }
 
     TEST_ASSERT_EQUAL_INT(3, delay_calls);
+}
+
+/* ================= suspend/defer policy (pool-mutex holder) ================= */
+
+/* A NULL suspect is never suspendable: there is nothing to suspend. */
+void test_watchdog_suspend_allowed_rejects_null_suspect(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, watchdog_suspend_allowed(NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(0, watchdog_suspend_allowed(NULL, TH(0)));
+}
+
+/* A free pool mutex constrains nothing: the suspect may be suspended. */
+void test_watchdog_suspend_allowed_grants_suspend_when_pool_free(void)
+{
+    TEST_ASSERT_EQUAL_INT(1, watchdog_suspend_allowed(TH(0), NULL));
+}
+
+/* The suspect IS the pool holder: suspending it would wedge every later
+   laststates_write() - including the monitor's own escalation record - on an
+   osWaitForever acquire its holder can no longer release. Defer instead. */
+void test_watchdog_suspend_allowed_defers_pool_mutex_holder(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, watchdog_suspend_allowed(TH(0), TH(0)));
+}
+
+/* Another task holding the pool is no reason to spare the suspect: the holder
+   keeps running and releases the mutex in bounded time. */
+void test_watchdog_suspend_allowed_grants_suspend_for_other_holder(void)
+{
+    TEST_ASSERT_EQUAL_INT(1, watchdog_suspend_allowed(TH(0), TH(1)));
+}
+
+/* A fresh monitor has deferred nothing. */
+void test_watchdog_holder_deferrals_zero_after_init(void)
+{
+    TEST_ASSERT_EQUAL_UINT32(0u, watchdog_holder_deferrals());
+}
+
+/* End to end through the monitor scan: the suspect goes silent while holding
+   the pool mutex, so the escalation is deferred (no suspend, no Flash write
+   on the host either - the policy short-circuits first), the deferral is
+   counted, the IWDG keeps being kicked, and the stall latch is left clear so
+   the next scan retries once the mutex is free. */
+void test_monitor_defers_escalation_while_suspect_holds_pool_mutex(void)
+{
+    given_kernel_running();
+    xTaskGetTickCount_ExpectAndReturn(0u);
+    TEST_ASSERT_EQUAL_INT(0, watchdog_register_task(TH(0), 100u));
+
+    xTaskGetTickCount_ExpectAndReturn(0u);
+    watchdog_alive(TH(0));                    /* arm it at tick 0 */
+
+    capture_monitor_entry();
+
+    /* The suspect is inside a LastStates write. Defer, do not suspend. */
+    host_laststates_set_pool_holder((TaskHandle_t)TH(0));
+    uxTaskGetStackHighWaterMark_IgnoreAndReturn(64u);
+    xTaskGetTickCount_IgnoreAndReturn(1000u); /* elapsed 1000 ms > 3x100 ms */
+    osDelay_Stub(osDelay_escape_cb);
+
+    run_monitor_scans(1);
+
+    TEST_ASSERT_EQUAL_UINT32(1u, watchdog_holder_deferrals());
+    TEST_ASSERT_EQUAL_UINT32(1u, host_hw_watchdog_kick_count());
+
+    /* The mutex is free again: the next scan escalates (handled, latch set)
+       instead of deferring, and later scans stay latched - one record per
+       stall, not one per scan. */
+    host_laststates_set_pool_holder((TaskHandle_t)NULL);
+    run_monitor_scans(2);
+
+    TEST_ASSERT_EQUAL_UINT32(1u, watchdog_holder_deferrals());
+    TEST_ASSERT_EQUAL_UINT32(3u, host_hw_watchdog_kick_count());
+}
+
+/* ================= stack high-water-mark telemetry ================= */
+
+/* Smoke test: two tasks, one scan, both HWMs sampled and readable back.
+   Before any scan there is no sample yet and the getter reports 0 words. */
+void test_monitor_samples_stack_hwm_every_scan(void)
+{
+    given_kernel_running();
+    xTaskGetTickCount_ExpectAndReturn(5u);
+    TEST_ASSERT_EQUAL_INT(0, watchdog_register_task(TH(0), 100u));
+    xTaskGetTickCount_ExpectAndReturn(6u);
+    TEST_ASSERT_EQUAL_INT(0, watchdog_register_task(TH(1), 100u));
+
+    UBaseType_t hwm = 0xFFFFFFFFu;
+    TEST_ASSERT_EQUAL_INT(0, watchdog_task_stack_hwm(TH(0), &hwm));
+    TEST_ASSERT_EQUAL_UINT32(0u, hwm);
+
+    capture_monitor_entry();
+
+    /* One sample per registered entry per scan, in table order. */
+    uxTaskGetStackHighWaterMark_ExpectAndReturn((TaskHandle_t)TH(0), 42u);
+    uxTaskGetStackHighWaterMark_ExpectAndReturn((TaskHandle_t)TH(1), 17u);
+    xTaskGetTickCount_IgnoreAndReturn(7u);    /* nothing near its deadline */
+    osDelay_Stub(osDelay_escape_cb);
+
+    run_monitor_scans(1);
+
+    TEST_ASSERT_EQUAL_INT(0, watchdog_task_stack_hwm(TH(0), &hwm));
+    TEST_ASSERT_EQUAL_UINT32(42u, hwm);
+    TEST_ASSERT_EQUAL_INT(0, watchdog_task_stack_hwm(TH(1), &hwm));
+    TEST_ASSERT_EQUAL_UINT32(17u, hwm);
+}
+
+/* The getter refuses what it cannot answer: unknown handles and NULL sinks. */
+void test_watchdog_task_stack_hwm_rejects_unknown_handle_and_null(void)
+{
+    UBaseType_t hwm = 0xFFFFFFFFu;
+
+    TEST_ASSERT_EQUAL_INT(-1, watchdog_task_stack_hwm(TH(0), &hwm));
+    TEST_ASSERT_EQUAL_INT(-1, watchdog_task_stack_hwm(NULL, &hwm));
+
+    given_kernel_running();
+    xTaskGetTickCount_ExpectAndReturn(5u);
+    TEST_ASSERT_EQUAL_INT(0, watchdog_register_task(TH(0), 100u));
+
+    TEST_ASSERT_EQUAL_INT(-1, watchdog_task_stack_hwm(TH(0), NULL));
+    TEST_ASSERT_EQUAL_INT(-1, watchdog_task_stack_hwm(TH(1), &hwm));
 }

@@ -65,4 +65,28 @@ void watchdog_alive(const osThreadId_t handle);
 /* Convenience wrapper: signal liveness for the calling task */
 void watchdog_alive_self(void);
 
+/* Suspend/defer policy for a stalled task (see watchdog.c): returns 1 when
+   `suspect` may be suspended now, 0 when the escalation must be deferred
+   because `suspect` currently holds the LastStates pool mutex (`pool_holder`
+   as read by laststates_pool_holder(), NULL when the mutex is free).
+   Suspending the holder would wedge every later laststates_write() on an
+   acquire its holder can no longer release, so the monitor defers the whole
+   escalation (no suspend, no Flash write) and retries on the next scan. */
+int watchdog_suspend_allowed(osThreadId_t suspect, osThreadId_t pool_holder);
+
+/* Escalations deferred by the policy above (suspect held the pool mutex).
+   The deferral leaves no Flash record by construction - writing one would
+   wedge the monitor on the held mutex - so this saturating-free 32-bit
+   counter (zero after reset / watchdog_monitor_init()) is what makes
+   deferrals visible to ground instead of silent. */
+uint32_t watchdog_holder_deferrals(void);
+
+/* Stack high-water mark of a monitored task, in words
+   (uxTaskGetStackHighWaterMark() units, not bytes), as last sampled by the
+   monitor scan. Returns 0 and fills `*hwm_words`, or -1 for a NULL argument
+   or a handle that is not registered. 0 in `*hwm_words` means "no scan has
+   sampled this entry yet". Housekeeping/beacon telemetry reads stack health
+   through here instead of touching the kernel directly. */
+int watchdog_task_stack_hwm(osThreadId_t handle, UBaseType_t *hwm_words);
+
 #endif /* WATCHDOG_H */

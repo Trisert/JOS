@@ -31,6 +31,9 @@
 #include "mpu.h"            /* mpu_memmanage_fault(): MemManage entry (W2-1) */
 #include "dual_bank.h"      /* dual_bank_mark_boot_fault() (W2-2)            */
 
+#include "FreeRTOS.h"       /* xPortGetFreeHeapSize(), xTaskGetSchedulerState */
+#include "task.h"
+
 #include <stddef.h>
 #include <string.h>
 
@@ -306,6 +309,122 @@ void fault_log_stack_overflow(const char *task_name)
     fault_persist(&rec, TRIGGER_STACK_OVERFLOW);
 
     fault_reset_now();
+}
+
+/* ---------- Deferred malloc-failure record (vApplicationMallocFailedHook) ---
+ *
+ * The hook runs in task context after pvPortMalloc() failed, i.e. with the
+ * heap exhausted. laststates_write() is unusable here: it takes the pool
+ * mutex with osWaitForever (deadlock if the scheduler is suspended or the
+ * holder can never run to release it) and programs/erases internal Flash
+ * (millisecond-scale, with failure modes of its own) — all while the
+ * allocator that just failed is the only thing between this hook and the
+ * rest of the system. So this path never touches the mutex, the Flash
+ * controller, or the frame pointer: it stages the two heap watermarks in a
+ * reset-persistent .noinit slot (same contract as mpu.c's MemManage staging)
+ * and resets. fault_malloc_flush() commits the slot to LastStates at task
+ * level on the next boot, where blocking is legal. The wire layout of the
+ * committed entry is unchanged (fault_record_t with r0 = free heap,
+ * r1 = min-ever-free under TRIGGER_MALLOC_FAILED), so the ground decoder is
+ * untouched.
+ *
+ * Fields that need an exception frame or a live tick base (exc_return,
+ * stacked registers, SCB snapshot, ts_source) stay zero/NONE: there is no
+ * frame here and the stamp clock dies with this boot. */
+
+#define FAULT_MALLOC_MAGIC      0x464D414CUL   /* "FMAL" */
+
+typedef struct
+{
+    uint32_t magic;       /* FAULT_MALLOC_MAGIC when a record is staged */
+    uint32_t free_heap;   /* xPortGetFreeHeapSize() at failure time     */
+    uint32_t min_ever;    /* xPortGetMinimumEverFreeHeapSize() ditto    */
+    uint32_t chk;         /* XOR of the fields above, for validation    */
+} fault_malloc_stage_t;
+
+/* Reset-persistent by construction: .noinit is NOLOAD, so the startup code
+   never zeroes it and the contents survive the NVIC_SystemReset() below. */
+static fault_malloc_stage_t s_malloc_stage __attribute__((section(".noinit")));
+
+static uint32_t fault_malloc_checksum(const fault_malloc_stage_t *s)
+{
+    return s->magic ^ s->free_heap ^ s->min_ever;
+}
+
+void fault_log_malloc_failed(void)
+{
+    /* Dedicated latch, not s_fault_nesting: that guards the exception path,
+       this guards the heap-exhaustion path. A second failure while staging
+       the first resets instead of recursing — with no heap left, even the
+       staging stores must not be re-entered. Lives in .bss, re-zeroed by
+       startup on the way back up. */
+    static volatile uint32_t s_malloc_nesting = 0U;
+
+    if (s_malloc_nesting != 0U) {
+        fault_reset_now();
+    }
+    s_malloc_nesting = 1U;
+
+    /* Plain variable reads only: no lock, no Flash, no frame-pointer chase.
+       The heap watermarks are safe to sample even with the scheduler
+       suspended, and __builtin_return_address() is deliberately NOT used —
+       under optimisation the hook's caller frame is not guaranteed to exist,
+       so it can return garbage or fault. */
+    s_malloc_stage.magic     = FAULT_MALLOC_MAGIC;
+    s_malloc_stage.free_heap = (uint32_t)xPortGetFreeHeapSize();
+    s_malloc_stage.min_ever  = (uint32_t)xPortGetMinimumEverFreeHeapSize();
+    s_malloc_stage.chk       = fault_malloc_checksum(&s_malloc_stage);
+
+    /* Make sure the slot has left the write buffer before the core resets. */
+    __DSB();
+
+    fault_reset_now();
+}
+
+/* Commit a staged malloc-failure record to the LastStates pool. Task-level
+   boot context only (called from main(), next to mpu_fault_log_flush()):
+   laststates_write() may block on the pool mutex and program Flash here.
+   Returns 1 persisted, 0 nothing staged, -1 staged but the write failed. */
+int fault_malloc_flush(void)
+{
+    fault_record_t rec;
+    laststates_entry_t entry;
+    int rc;
+
+    if ((s_malloc_stage.magic != FAULT_MALLOC_MAGIC) ||
+        (s_malloc_stage.chk != fault_malloc_checksum(&s_malloc_stage))) {
+        /* Nothing staged, or the slot did not survive (cold boot with random
+           SRAM contents). Clear it so a stale pattern cannot be replayed. */
+        s_malloc_stage.magic = 0U;
+        return 0;
+    }
+
+    memset(&rec, 0, sizeof(rec));
+    rec.magic    = FAULT_RECORD_MAGIC;
+    rec.fault_id = (uint32_t)FAULT_ID_MALLOC_FAILED;
+    /* Same positional layout as before the deferral: r0 = free heap,
+       r1 = min-ever-free; the ground decoder reads them positionally and
+       they carry no register meaning (no exception frame was stacked).
+       ts_source stays NONE: the fault predates this boot's tick base,
+       exactly like the MPU flush. */
+    rec.r0 = s_malloc_stage.free_heap;
+    rec.r1 = s_malloc_stage.min_ever;
+
+    memset(&entry, 0, sizeof(entry));
+    entry.timestamp  = 0U;
+    entry.state_from = FAULT_STATE_UNKNOWN;
+    entry.state_to   = FAULT_STATE_UNKNOWN;
+    entry.trigger    = TRIGGER_MALLOC_FAILED;
+    memcpy(entry.context, &rec, sizeof(rec));
+
+    rc = laststates_write(&entry);
+
+    /* One entry per failure: drop the slot whether or not the write worked,
+       so a boot loop cannot keep re-filling the pool with the same event. */
+    s_malloc_stage.magic = 0U;
+    s_malloc_stage.chk   = 0U;
+
+    return (rc == 0) ? 1 : -1;
 }
 
 /* ---------- Exception entry stubs ----------
