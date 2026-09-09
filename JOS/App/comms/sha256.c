@@ -7,8 +7,6 @@
 
 #include "sha256.h"
 #include <string.h>
-
-#define DBL_INT_ADD(a,b,c) if (a > 0xffffffff - (c)) b++; a += c;
 #define ROTLEFT(a,b) (((a) << (b)) | ((a) >> (32-(b))))
 #define ROTRIGHT(a,b) (((a) >> (b)) | ((a) << (32-(b))))
 #define CH(x,y,z) (((x) & (y)) ^ (~(x) & (z)))
@@ -58,7 +56,7 @@ void sha256_update(SHA256_CTX *ctx, const uint8_t data[], size_t len) {
 		ctx->datalen++;
 		if (ctx->datalen == 64) {
 			sha256_transform(ctx, ctx->data);
-			DBL_INT_ADD(ctx->bitlen, ctx->bitlen, 512);
+			ctx->bitlen += 512U;
 			ctx->datalen = 0;
 		}
 	}
@@ -75,7 +73,7 @@ void sha256_final(SHA256_CTX *ctx, uint8_t hash[]) {
 		sha256_transform(ctx, ctx->data);
 		memset(ctx->data, 0, 56);
 	}
-	DBL_INT_ADD(ctx->bitlen, ctx->bitlen, ctx->datalen * 8);
+	ctx->bitlen += (uint64_t)ctx->datalen * 8U;
 	ctx->data[63] = ctx->bitlen;
 	ctx->data[62] = ctx->bitlen >> 8;
 	ctx->data[61] = ctx->bitlen >> 16;
@@ -97,19 +95,37 @@ void sha256_final(SHA256_CTX *ctx, uint8_t hash[]) {
 	}
 }
 
-void hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *data, size_t data_len, uint8_t *output) {
-    uint8_t k_ipad[64], k_opad[64];
+void hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *data, size_t data_len, uint8_t *output)
+{
+    uint8_t k_ipad[64];
+    uint8_t k_opad[64];
     uint8_t tk[32];
-    if(key_len > 64) {
-        SHA256_CTX ctx; sha256_init(&ctx); sha256_update(&ctx, key, key_len); sha256_final(&ctx, tk);
-        key = tk; key_len = 32;
-    }
-    memset(k_ipad, 0, sizeof(k_ipad)); memset(k_opad, 0, sizeof(k_opad));
-    memcpy(k_ipad, key, key_len); memcpy(k_opad, key, key_len);
-    for(int i=0; i<64; i++) { k_ipad[i] ^= 0x36; k_opad[i] ^= 0x5c; }
     SHA256_CTX ctx;
-    sha256_init(&ctx); sha256_update(&ctx, k_ipad, 64); sha256_update(&ctx, data, data_len); sha256_final(&ctx, output);
-    sha256_init(&ctx); sha256_update(&ctx, k_opad, 64); sha256_update(&ctx, output, 32); sha256_final(&ctx, output);
+    size_t i;
+
+    if (key_len > 64U) {
+        sha256_init(&ctx);
+        sha256_update(&ctx, key, key_len);
+        sha256_final(&ctx, tk);
+        key = tk;
+        key_len = 32U;
+    }
+    memset(k_ipad, 0, sizeof(k_ipad));
+    memset(k_opad, 0, sizeof(k_opad));
+    memcpy(k_ipad, key, key_len);
+    memcpy(k_opad, key, key_len);
+    for (i = 0U; i < 64U; i++) {
+        k_ipad[i] ^= 0x36U;
+        k_opad[i] ^= 0x5CU;
+    }
+    sha256_init(&ctx);
+    sha256_update(&ctx, k_ipad, 64U);
+    sha256_update(&ctx, data, data_len);
+    sha256_final(&ctx, output);
+    sha256_init(&ctx);
+    sha256_update(&ctx, k_opad, 64U);
+    sha256_update(&ctx, output, 32U);
+    sha256_final(&ctx, output);
 }
 
 

@@ -147,12 +147,15 @@ static const uint8_t auth_key[4] = {
     (uint8_t)COMMS_AUTH_KEY3,
 };
 
-uint32_t comms_auth_tag(const uint8_t *data, size_t len)
+bool comms_auth_tag(const uint8_t *data, size_t len, uint32_t *out_tag)
 {
     uint8_t mac[32];
 
-    if (data == NULL) {
-        return 0U;
+    /* Every 32-bit value is a legitimate tag, so a NULL input cannot be
+     * signalled through the return value: reject it explicitly and write
+     * nothing, instead of returning 0 (a valid tag). */
+    if ((data == NULL) || (out_tag == NULL)) {
+        return false;
     }
     if (len > (size_t)COMMS_TC_MAX_FRAME) {   /* hard upper bound on the hash */
         len = (size_t)COMMS_TC_MAX_FRAME;
@@ -160,7 +163,8 @@ uint32_t comms_auth_tag(const uint8_t *data, size_t len)
 
     /* Upstream makeMAC: HMAC-SHA256, truncate to the first 4 bytes BE. */
     hmac_sha256(auth_key, sizeof(auth_key), data, len, mac);
-    return be32(&mac[0]);
+    *out_tag = be32(&mac[0]);
+    return true;
 }
 
 /*
@@ -245,7 +249,13 @@ comms_tc_result_t comms_validate_tc_auth(const uint8_t   *frame,
      * whitelist — a bad tag rejects before the opcode is even looked up. */
     const size_t   tag_off  = (size_t)COMMS_TC_HDR_LEN + payload_len;
     const uint32_t rx_tag   = be32(&frame[tag_off]);
-    const uint32_t good_tag = comms_auth_tag(frame, tag_off);
+    uint32_t       good_tag = 0U;
+
+    /* `frame` is non-NULL here (rejected at entry), so the tag computation
+     * cannot fail; the check keeps the NULL-rejecting contract explicit. */
+    if (!comms_auth_tag(frame, tag_off, &good_tag)) {
+        return COMMS_TC_ERR_NULL;
+    }
     if (!tag_matches(rx_tag, good_tag)) {
         return COMMS_TC_ERR_MAC;
     }

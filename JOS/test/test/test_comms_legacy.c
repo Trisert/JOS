@@ -47,8 +47,10 @@ static size_t build_auth_frame(uint8_t opcode, const uint8_t *payload, uint8_t l
     if ((payload != NULL) && (len > 0U)) {
         memcpy(&frame_buf[COMMS_TC_HDR_LEN], payload, len);
     }
-    const size_t   tag_off = (size_t)COMMS_TC_HDR_LEN + len;
-    const uint32_t tag     = comms_auth_tag(frame_buf, tag_off);
+    const size_t tag_off = (size_t)COMMS_TC_HDR_LEN + len;
+    uint32_t     tag     = 0U;
+
+    TEST_ASSERT_TRUE(comms_auth_tag(frame_buf, tag_off, &tag));
     frame_buf[tag_off]     = (uint8_t)(tag >> 24);
     frame_buf[tag_off + 1] = (uint8_t)(tag >> 16);
     frame_buf[tag_off + 2] = (uint8_t)(tag >> 8);

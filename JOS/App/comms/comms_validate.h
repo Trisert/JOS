@@ -202,11 +202,19 @@ void comms_rx_account(comms_tc_result_t result);
  * Ground stations call this over opcode|length|payload to seal a frame;
  * the flight side recomputes it inside comms_validate_tc_auth().
  *
- * Defensive contract: @p data == NULL returns 0, and @p len is clamped to
- * COMMS_TC_MAX_FRAME so the hash loop is always bounded. (The validator
- * rejects NULL frames before any tag comparison, so 0 is never accepted.)
+ * Every 32-bit value is a legitimate tag, so a NULL input has no
+ * distinguishable return value: the tag is therefore delivered through
+ * @p out_tag and the call reports acceptance. @p data == NULL or
+ * @p out_tag == NULL returns false and writes nothing. @p len is clamped
+ * to COMMS_TC_MAX_FRAME so the hash loop is always bounded.
+ *
+ * @param[in]  data     header+payload slice (must be non-NULL)
+ * @param[in]  len      slice length, clamped to COMMS_TC_MAX_FRAME
+ * @param[out] out_tag  truncated tag, written only on true
+ *
+ * @return true when the tag was computed, false on NULL input.
  */
-uint32_t comms_auth_tag(const uint8_t *data, size_t len);
+bool comms_auth_tag(const uint8_t *data, size_t len, uint32_t *out_tag);
 
 /**
  * @brief True when (frame, len) has the authenticated layout (len == P + 8).

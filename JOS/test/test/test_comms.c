@@ -80,8 +80,10 @@ static size_t build_auth_frame(uint8_t opcode, const uint8_t *payload, uint8_t l
     if ((payload != NULL) && (len > 0U)) {
         memcpy(&frame_buf[COMMS_TC_HDR_LEN], payload, len);
     }
-    const size_t   tag_off = (size_t)COMMS_TC_HDR_LEN + len;
-    const uint32_t tag     = comms_auth_tag(frame_buf, tag_off);
+    const size_t tag_off = (size_t)COMMS_TC_HDR_LEN + len;
+    uint32_t     tag     = 0U;
+
+    TEST_ASSERT_TRUE(comms_auth_tag(frame_buf, tag_off, &tag));
     frame_buf[tag_off]     = (uint8_t)(tag >> 24);
     frame_buf[tag_off + 1] = (uint8_t)(tag >> 16);
     frame_buf[tag_off + 2] = (uint8_t)(tag >> 8);
@@ -524,20 +526,93 @@ void test_rx_stats_tolerates_null_out(void)
 /* Known-answer vectors for comms_auth_tag(), computed independently with
  * Python hashlib (hmac.new(key, data, sha256)) — NOT with the C code under
  * test. Key = A1 B2 C3 D4 (upstream RedPill SECRET_KEY). */
+static uint32_t auth_tag_or_fail(const uint8_t *data, size_t len)
+{
+    uint32_t tag = 0U;
+
+    TEST_ASSERT_TRUE(comms_auth_tag(data, len, &tag));
+    return tag;
+}
+
 void test_auth_tag_known_answer_vectors(void)
 {
     static const uint8_t exit_state[2] = { 0x02U, 0x00U };
     static const uint8_t reset[2]      = { 0x01U, 0x00U };
     static const uint8_t beacon[6]     = { 0x06U, 0x04U, 0x00U, 0x00U, 0xEAU, 0x60U };
 
-    TEST_ASSERT_EQUAL_HEX32(0xD7D5199CU, comms_auth_tag(exit_state, sizeof(exit_state)));
-    TEST_ASSERT_EQUAL_HEX32(0x2413C884U, comms_auth_tag(reset, sizeof(reset)));
-    TEST_ASSERT_EQUAL_HEX32(0x9FB4A7A7U, comms_auth_tag(beacon, sizeof(beacon)));
+    TEST_ASSERT_EQUAL_HEX32(0xD7D5199CU, auth_tag_or_fail(exit_state, sizeof(exit_state)));
+    TEST_ASSERT_EQUAL_HEX32(0x2413C884U, auth_tag_or_fail(reset, sizeof(reset)));
+    TEST_ASSERT_EQUAL_HEX32(0x9FB4A7A7U, auth_tag_or_fail(beacon, sizeof(beacon)));
 }
 
-void test_auth_tag_null_returns_zero(void)
+/* Multi-block tag input: a 58-byte header+payload slice forces the inner
+ * SHA-256 through two compression blocks (64-byte ipad + 58 bytes of data).
+ * Expected value from Python hmac.new(key, data, sha256) — first 4 bytes. */
+void test_auth_tag_multiblock_known_answer(void)
 {
-    TEST_ASSERT_EQUAL_HEX32(0U, comms_auth_tag(NULL, 4U));
+    uint8_t slice[58];
+    size_t i;
+
+    slice[0] = 0x03U;
+    slice[1] = 0x20U;
+    for (i = 2U; i < sizeof(slice); i++) {
+        slice[i] = (uint8_t)(i - 2U);
+    }
+    TEST_ASSERT_EQUAL_HEX32(0xD43AF134U, auth_tag_or_fail(slice, sizeof(slice)));
+}
+
+/* FIPS 180-4 multi-block SHA-256 vectors, computed with Python hashlib
+ * (independent of the C code). The 56-byte message spans two blocks after
+ * padding; the 112-byte message spans two blocks before padding. Both
+ * exercise the 64-bit bit-length accumulation across compression blocks. */
+void test_sha256_multiblock_known_answer(void)
+{
+    static const char msg56[]  = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    static const char msg112[] = "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmno"
+                                 "ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+    static const uint8_t exp56[32] = {
+        0x24U, 0x8DU, 0x6AU, 0x61U, 0xD2U, 0x06U, 0x38U, 0xB8U,
+        0xE5U, 0xC0U, 0x26U, 0x93U, 0x0CU, 0x3EU, 0x60U, 0x39U,
+        0xA3U, 0x3CU, 0xE4U, 0x59U, 0x64U, 0xFFU, 0x21U, 0x67U,
+        0xF6U, 0xECU, 0xEDU, 0xD4U, 0x19U, 0xDBU, 0x06U, 0xC1U
+    };
+    static const uint8_t exp112[32] = {
+        0xCFU, 0x5BU, 0x16U, 0xA7U, 0x78U, 0xAFU, 0x83U, 0x80U,
+        0x03U, 0x6CU, 0xE5U, 0x9EU, 0x7BU, 0x04U, 0x92U, 0x37U,
+        0x0BU, 0x24U, 0x9BU, 0x11U, 0xE8U, 0xF0U, 0x7AU, 0x51U,
+        0xAFU, 0xACU, 0x45U, 0x03U, 0x7AU, 0xFEU, 0xE9U, 0xD1U
+    };
+    SHA256_CTX ctx;
+    uint8_t digest[32];
+
+    TEST_ASSERT_EQUAL_size_t(56U, sizeof(msg56) - 1U);
+    sha256_init(&ctx);
+    sha256_update(&ctx, (const uint8_t *)msg56, sizeof(msg56) - 1U);
+    sha256_final(&ctx, digest);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(exp56, digest, sizeof(digest));
+
+    TEST_ASSERT_EQUAL_size_t(112U, sizeof(msg112) - 1U);
+    sha256_init(&ctx);
+    sha256_update(&ctx, (const uint8_t *)msg112, sizeof(msg112) - 1U);
+    sha256_final(&ctx, digest);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(exp112, digest, sizeof(digest));
+}
+
+/* Every 32-bit value is a legitimate tag, so NULL must be rejected
+ * explicitly — never mapped to a return value that collides with a real
+ * tag. The out-parameter is left untouched on rejection. */
+void test_auth_tag_null_is_rejected(void)
+{
+    static const uint8_t sample[2] = { 0x02U, 0x00U };
+    uint32_t tag = 0xA5A5A5A5U;
+
+    TEST_ASSERT_FALSE(comms_auth_tag(NULL, sizeof(sample), &tag));
+    TEST_ASSERT_EQUAL_HEX32(0xA5A5A5A5U, tag);
+
+    TEST_ASSERT_FALSE(comms_auth_tag(sample, sizeof(sample), NULL));
+
+    TEST_ASSERT_FALSE(comms_auth_tag(NULL, 0U, &tag));
+    TEST_ASSERT_EQUAL_HEX32(0xA5A5A5A5U, tag);
 }
 
 void test_auth_layout_discriminator(void)

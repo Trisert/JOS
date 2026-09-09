@@ -30,7 +30,7 @@ typedef struct {
 void sha256_init(SHA256_CTX *ctx);
 void sha256_update(SHA256_CTX *ctx, const uint8_t data[], size_t len);
 void sha256_final(SHA256_CTX *ctx, uint8_t hash[]);
-// Funzione helper per HMAC
+/* HMAC-SHA256 helper. */
 void hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *data, size_t data_len, uint8_t *output);
 
 #ifdef __cplusplus
