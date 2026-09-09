@@ -1007,16 +1007,16 @@ void test_lora_send_chunked_reports_failure_on_later_chunk(void)
                           lora_send_chunked(payload, chunk_max + 7U));
 }
 
-/* SET_CONFIG and SEND_DATA are accepted by the gate (validation only). Handlers are TODO (no-op), so no mock expectations are queued. */
+/* SET_CONFIG and SEND_DATA are accepted by the gate (validation only). Handlers are TODO (no-op), so no mock expectations are queued. Frames are sealed: ENFORCE=1 rejects legacy CRC-only frames with ERR_MAC. */
 void test_rx_gate_dispatches_set_config_and_send_data(void)
 {
     uint8_t payload[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
     size_t  n;
 
-    n = build_frame(COMMS_TC_SET_CONFIG, payload, 4U);
+    n = build_auth_frame(COMMS_TC_SET_CONFIG, payload, 4U);
     TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_frame(frame_buf, n));
 
-    n = build_frame(COMMS_TC_SEND_DATA, payload, 8U);
+    n = build_auth_frame(COMMS_TC_SEND_DATA, payload, 8U);
     TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_frame(frame_buf, n));
 }
 
