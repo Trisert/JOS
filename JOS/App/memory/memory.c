@@ -26,19 +26,31 @@
  *   4x FM24VN10-G on the OBC PCB, on I2C1 (PB8/PB9, I2C1_SCL/SDA_FRAM);
  *   I2C2 (PB10/PB11) is the CAM bus.
  *
- * Device-select (7-bit) addresses: 0x50, 0x51, 0x52, 0x53 (A0/A1 pins).
- * The driver addresses ONE 16 KB window per device select, using the 16-bit
- * memory-address transfer of HAL_I2C_Mem_Read/Write:
+ * Each FM24VN10-G is 1 Mbit = 128 KB, addressed with a 17-bit address
+ * (Infineon FM24V10 datasheet, "Slave Device Address" Fig. 6 and
+ * "Addressing Overview"): the slave byte is 1 0 1 0 A2 A1 A16 R/W, i.e.
  *
- *   FM24VN_CHIP_SIZE = 16 * 1024 B  = 16 KB  per device select
- *   FRAM_SIZE        = 4 * 16 KB    = 64 KB  usable, and 64 KB is the number
- *                                            the ICD, the cyclic buffer and
+ *   - bits 7..4 : slave ID 1010b,
+ *   - bits 3..2 : device select A2/A1 (pins; the 4 chips),
+ *   - bit 1     : PAGE SELECT = A16, the MSB of the memory address,
+ *   - bit 0     : R/W,
+ *
+ * followed by the remaining 16 address bits (A15..A0) as the two
+ * memory-address bytes of HAL_I2C_Mem_Read/Write. One chip is therefore
+ * TWO 64 KB device selects (pages); the bank is 8 selects on the bus:
+ *
+ *   7-bit 0x50/0x51 = chip 0 pages 0/1, 0x52/0x53 = chip 1 pages 0/1,
+ *   0x54/0x55 = chip 2, 0x56/0x57 = chip 3.
+ *
+ *   FM24VN_CHIP_SIZE = 128 * 1024 B = 128 KB per chip
+ *   FRAM_SIZE        = 4 * 128 KB   = 512 KB usable, and 512 KB is the
+ *                                            number the cyclic buffer and
  *                                            the unit tests all agree on.
  *
- * DO NOT write `#define FM24VN_CHIP_SIZE 16`: that is a byte count, not a
- * kilobyte count, and it collapses FRAM_SIZE from 65536 to 64 bytes. Every
+ * DO NOT write `#define FM24VN_CHIP_SIZE 128`: that is a byte count, not a
+ * kilobyte count, and it collapses FRAM_SIZE from 524288 to 512 bytes. Every
  * fram_read()/fram_write()/cyclic_buffer_*() bound check below is expressed
- * against FRAM_SIZE, so the whole FRAM would silently shrink to 64 usable
+ * against FRAM_SIZE, so the whole FRAM would silently shrink to 512 usable
  * bytes and every telemetry record past the first would be rejected with -1
  * (Kilo review of PR #9, finding C1). The _Static_assert on FRAM_SIZE below
  * turns that typo into a compile error instead of a silent loss of storage.
@@ -50,14 +62,21 @@
 
 #define FM24VN_I2C_ADDR_BASE  0x50
 #define FM24VN_PAGE_SIZE      16
-#define FM24VN_CHIP_SIZE      (16UL * 1024UL)
-#define FM24VN_CHIP_SIZE_LOG2 14U    /* 16 KB = 2^14 */
+#define FM24VN_CHIP_SIZE      (128UL * 1024UL)
+#define FM24VN_CHIP_SIZE_LOG2 17U    /* 128 KB = 2^17 */
+/* One A16 page: the most a single device select (and a single 16-bit
+ * memory-address field) spans. A transfer may stream across the page
+ * boundary inside a chip - the part latches the full 17-bit address and
+ * auto-increments it (datasheet "Addressing Overview": rollover only at
+ * 1FFFFh -> 00000h) - but never across chips (different slave). */
+#define FM24VN_PAGE_BYTES     (64UL * 1024UL)
+#define FM24VN_PAGE_LOG2      16U    /* 64 KB = 2^16 */
 #define FM24VN_NUM_CHIPS      4
 #define FRAM_SIZE             (FM24VN_NUM_CHIPS * FM24VN_CHIP_SIZE)
 
-/* FRAM layout (64 KB total):
+/* FRAM layout (512 KB total):
  *   [0 .. cyclic_buffer_head)   : cyclic science-data buffer (wraps the device)
- *   [SEU_FRAM_BASE .. 0x10000)  : SEU golden records (W2-5), one fixed
+ *   [SEU_FRAM_BASE .. FRAM_SIZE)  : SEU golden records (W2-5), one fixed
  *                                 CRC-32-protected slot per region id,
  *                                 reserved at the TOP and grown downward; see
  *                                 Core/Inc/seu_mitigation.h SEU_FRAM_*.
@@ -69,32 +88,39 @@
  *
  * Compile-time guards: a zero (or non-power-of-two) chip size would make the
  * shift/mask decode below wrong and is the divide-by-zero class M1 guards
- * against; the size/geometry asserts pin the 64 KB total from the ICD so a
+ * against; the size/geometry asserts pin the 512 KB total from the ICD so a
  * mistyped literal cannot silently shrink the store (finding C1). */
 _Static_assert(FM24VN_CHIP_SIZE > 0U, "FM24VN_CHIP_SIZE must be > 0");
 _Static_assert((FM24VN_CHIP_SIZE & (FM24VN_CHIP_SIZE - 1U)) == 0U,
                "FM24VN_CHIP_SIZE must be a power of two");
 _Static_assert(FM24VN_CHIP_SIZE == (1UL << FM24VN_CHIP_SIZE_LOG2),
                "FM24VN_CHIP_SIZE_LOG2 must match FM24VN_CHIP_SIZE");
-_Static_assert(FRAM_SIZE == (64UL * 1024UL),
-               "FRAM_SIZE must be 64 KB (4 x 16 KB) per RED_DES_ElectronicArchitecture_V1");
+_Static_assert(FM24VN_PAGE_BYTES == (1UL << FM24VN_PAGE_LOG2),
+               "FM24VN_PAGE_LOG2 must match FM24VN_PAGE_BYTES");
+_Static_assert(FM24VN_CHIP_SIZE == 2U * FM24VN_PAGE_BYTES,
+               "one chip is two A16 pages");
+_Static_assert(FRAM_SIZE == (512UL * 1024UL),
+               "FRAM_SIZE must be 512 KB (4 x 128 KB) per RED_DES_ElectronicArchitecture_V1");
 
 extern I2C_HandleTypeDef hi2c1;
 
 /* The STM32 HAL I2C entry points take the device address ALREADY shifted left
- * by one (the 8-bit device-select byte, R/W bit clear). The FM24VN10-G parts
- * are 7-bit 0x50..0x53, so the bytes that must reach HAL_I2C_Mem_Read/Write
- * are 0xA0/0xA2/0xA4/0xA6. Passing the raw 7-bit value puts 0x28 on the bus
- * and addresses nothing. */
-static uint16_t fram_addr_to_chip(uint32_t addr)
+ * by one (the 8-bit device-select byte, R/W bit clear). The FM24VN10-G bank
+ * answers on 7-bit 0x50..0x57 (chip in bits 3..2, A16 page select in bit 1),
+ * so the bytes that must reach HAL_I2C_Mem_Read/Write are
+ * 0xA0/0xA2/0xA4/0xA6/0xA8/0xAA/0xAC/0xAE. Passing a raw 7-bit value puts
+ * 0x28 on the bus and addresses nothing. */
+static uint16_t fram_addr_to_dev(uint32_t addr)
 {
-    uint16_t addr7 = (uint16_t)((addr >> FM24VN_CHIP_SIZE_LOG2) + FM24VN_I2C_ADDR_BASE);
-    return (uint16_t)(addr7 << 1);
+    uint16_t chip = (uint16_t)(addr >> FM24VN_CHIP_SIZE_LOG2);
+    uint16_t page = (uint16_t)((addr >> FM24VN_PAGE_LOG2) & 1U);
+    uint16_t dev7 = (uint16_t)(FM24VN_I2C_ADDR_BASE + (chip << 1) + page);
+    return (uint16_t)(dev7 << 1);
 }
 
 static uint16_t fram_addr_to_offset(uint32_t addr)
 {
-    return (uint16_t)(addr & (FM24VN_CHIP_SIZE - 1U));
+    return (uint16_t)(addr & (FM24VN_PAGE_BYTES - 1U));
 }
 
 void fram_init(void)
@@ -106,7 +132,7 @@ int fram_read(uint32_t addr, uint8_t *buf, size_t len)
 {
     if (addr + len > FRAM_SIZE) return -1;
 
-    uint16_t dev_addr = fram_addr_to_chip(addr);
+    uint16_t dev_addr = fram_addr_to_dev(addr);
     uint16_t offset = fram_addr_to_offset(addr);
 
     if (HAL_I2C_Mem_Read(&hi2c1, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
@@ -119,7 +145,7 @@ int fram_write(uint32_t addr, const uint8_t *buf, size_t len)
 {
     if (addr + len > FRAM_SIZE) return -1;
 
-    uint16_t dev_addr = fram_addr_to_chip(addr);
+    uint16_t dev_addr = fram_addr_to_dev(addr);
     uint16_t offset = fram_addr_to_offset(addr);
 
     if (HAL_I2C_Mem_Write(&hi2c1, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
@@ -129,7 +155,7 @@ int fram_write(uint32_t addr, const uint8_t *buf, size_t len)
 }
 
 /* ========== Cyclic buffer ========== */
-/* 4x FM24VN10-G = 64 KB FRAM used as circular buffer */
+/* 4x FM24VN10-G = 512 KB FRAM used as circular buffer */
 
 static uint32_t cb_head = 0;   /* next write position */
 
@@ -140,7 +166,9 @@ void cyclic_buffer_init(void)
 }
 
 /* Write one contiguous range without handing HAL_I2C_Mem_Write() a
- * cross-chip transfer: each FM24VN10-G owns only its 16 KB window. */
+ * cross-chip transfer: each FM24VN10-G owns only its 128 KB window, and a
+ * transfer past it would address a different slave. (The A16 page boundary
+ * inside a chip needs no split: the part streams across it.) */
 static int cyclic_buffer_write_range(uint32_t addr, const uint8_t *data, size_t len)
 {
     while (len > 0U) {

@@ -7,7 +7,7 @@
  *
  *   - an I2C transfer the FM24VN10-G cannot serve (a chip-boundary crossing)
  *     must be reported, not silently truncated;
- *   - the 64 KB FRAM cyclic buffer must wrap correctly, splitting the record
+ *   - the 512 KB FRAM cyclic buffer must wrap correctly, splitting the record
  *     across the end of the bank;
  *   - a reboot must rebuild the ring cursor and the entry count from Flash;
  *   - a second writer of the same pool (Core/Src/dual_bank.c appends 'DBNK'
@@ -33,7 +33,7 @@
 #include <string.h>
 
 /* Geometry of the FRAM bank, mirrored from memory.c (4 x FM24VN10-G). */
-#define FRAM_CHIP_SIZE   (16u * 1024u)
+#define FRAM_CHIP_SIZE   (128u * 1024u)
 #define FRAM_TOTAL_SIZE  (4u * FRAM_CHIP_SIZE)
 
 static laststates_entry_t make_entry(uint32_t timestamp, uint8_t from, uint8_t to,
@@ -129,7 +129,7 @@ void test_fram_write_reports_a_transfer_crossing_a_chip_boundary(void)
     fram_init();
 
     TEST_ASSERT_EQUAL_INT(-1, fram_write(FRAM_CHIP_SIZE - 4u, payload, sizeof(payload)));
-    TEST_ASSERT_EQUAL_HEX16(0xA0u, host_flash_last_i2c_addr());  /* chip 0, shifted */
+    TEST_ASSERT_EQUAL_HEX16(0xA2u, host_flash_last_i2c_addr());  /* chip 0 page 1, shifted */
 }
 
 void test_fram_read_reports_a_transfer_crossing_a_chip_boundary(void)
@@ -140,7 +140,7 @@ void test_fram_read_reports_a_transfer_crossing_a_chip_boundary(void)
     memset(buf, 0xC3, sizeof(buf));
 
     TEST_ASSERT_EQUAL_INT(-1, fram_read(FRAM_CHIP_SIZE - 4u, buf, sizeof(buf)));
-    TEST_ASSERT_EQUAL_HEX16(0xA0u, host_flash_last_i2c_addr());
+    TEST_ASSERT_EQUAL_HEX16(0xA2u, host_flash_last_i2c_addr());
     TEST_ASSERT_EQUAL_HEX8(0xC3u, buf[0]);   /* nothing was handed back */
 }
 
@@ -148,7 +148,7 @@ void test_fram_read_reports_a_transfer_crossing_a_chip_boundary(void)
  * Cyclic buffer wrap-around
  * ===================================================================== */
 
-/* The 64 KB FRAM bank is a ring: a record that does not fit in the tail is
+/* The 512 KB FRAM bank is a ring: a record that does not fit in the tail is
  * split, the remainder goes to offset 0 and the head follows it. Losing the
  * split (or wrapping the head without writing the remainder) silently drops
  * the oldest half of every record written at the end of the bank. */
@@ -169,7 +169,7 @@ void test_cyclic_buffer_write_wraps_and_splits_the_record(void)
     cyclic_buffer_init();
 
     /* Fill the bank up to 8 bytes short of the end. */
-    for (i = 0u; i < 15u; i++) {
+    for (i = 0u; i < 127u; i++) {
         TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(chunk, sizeof(chunk)));
     }
     TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(chunk, sizeof(chunk) - 8u));
@@ -183,6 +183,52 @@ void test_cyclic_buffer_write_wraps_and_splits_the_record(void)
     memset(head, 0, sizeof(head));
     TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_read(FRAM_TOTAL_SIZE - 8u, tail, sizeof(tail)));
     TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_read(0u, head, sizeof(head)));
+
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(record, tail, sizeof(tail));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(record + 8, head, sizeof(head));
+}
+
+/* The same split, but at a 128 KB chip boundary instead of the end of the
+ * bank: the record tail must land on chip 0's upper page (slave 0xA2) and the
+ * remainder on chip 1 (slave 0xA4), proving the cyclic writer splits at every
+ * physical chip boundary and the A16 page decode follows. A writer that only
+ * split at the ring end would hand the HAL one cross-chip transfer, which the
+ * part cannot serve. */
+void test_cyclic_buffer_write_splits_at_the_128kb_chip_boundary(void)
+{
+    static uint8_t chunk[4096];
+    const uint8_t  record[16] = {
+        0x10u, 0x11u, 0x12u, 0x13u, 0x14u, 0x15u, 0x16u, 0x17u,
+        0x20u, 0x21u, 0x22u, 0x23u, 0x24u, 0x25u, 0x26u, 0x27u,
+    };
+    uint8_t  tail[8];
+    uint8_t  head[8];
+    uint32_t i;
+
+    memset(chunk, 0xA5u, sizeof(chunk));
+
+    fram_init();
+    cyclic_buffer_init();
+
+    /* Fill chip 0 up to 8 bytes short of its end. */
+    for (i = 0u; i < 31u; i++) {
+        TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(chunk, sizeof(chunk)));
+    }
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(chunk, sizeof(chunk) - 8u));
+    TEST_ASSERT_EQUAL_UINT32(FRAM_CHIP_SIZE - 8u, cyclic_buffer_head());
+
+    /* 16 B into an 8 B tail: 8 bytes at the end of chip 0, 8 bytes at the
+     * start of chip 1. */
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(record, sizeof(record)));
+    TEST_ASSERT_EQUAL_UINT32(FRAM_CHIP_SIZE + 8u, cyclic_buffer_head());
+    TEST_ASSERT_EQUAL_HEX16(0xA4u, host_flash_last_i2c_addr());  /* chip 1, shifted */
+
+    memset(tail, 0, sizeof(tail));
+    memset(head, 0, sizeof(head));
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_read(FRAM_CHIP_SIZE - 8u, tail, sizeof(tail)));
+    TEST_ASSERT_EQUAL_HEX16(0xA2u, host_flash_last_i2c_addr());  /* chip 0 page 1 */
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_read(FRAM_CHIP_SIZE, head, sizeof(head)));
+    TEST_ASSERT_EQUAL_HEX16(0xA4u, host_flash_last_i2c_addr());  /* chip 1 page 0 */
 
     TEST_ASSERT_EQUAL_UINT8_ARRAY(record, tail, sizeof(tail));
     TEST_ASSERT_EQUAL_UINT8_ARRAY(record + 8, head, sizeof(head));
@@ -422,8 +468,8 @@ void test_laststates_write_refuses_the_write_when_the_pool_lock_fails(void)
 }
 
 
-/* A cyclic record can cross a physical 16 KB chip boundary without crossing
- * the 64 KB ring boundary. The cyclic layer must split it into legal FRAM
+/* A cyclic record can cross a physical 128 KB chip boundary without crossing
+ * the 512 KB ring boundary. The cyclic layer must split it into legal FRAM
  * transfers; exposing a single cross-chip request would make the driver reject
  * it and silently lose ordinary telemetry records. */
 void test_cyclic_buffer_write_splits_a_record_at_a_chip_boundary(void)
@@ -439,7 +485,7 @@ void test_cyclic_buffer_write_splits_a_record_at_a_chip_boundary(void)
     fram_init();
     cyclic_buffer_init();
 
-    for (i = 0u; i < 3u; i++) {
+    for (i = 0u; i < 31u; i++) {
         TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(filler, sizeof(filler)));
     }
     TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(filler, sizeof(filler) - 4u));

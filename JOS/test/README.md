@@ -117,9 +117,9 @@ Three things normally only exist after linking for the STM32L496VGTx:
 
 4. **The FM24VN10-G FRAM behind `hi2c1` (PB8/PB9)** — the doubles accept only the *8-bit*
    (already left-shifted) device addresses the STM32 HAL expects: `0xA0`,
-   `0xA2`, `0xA4`, `0xA6`. The raw 7-bit values `0x50..0x53` are rejected, so a
-   driver that forgets the shift fails the tests instead of silently addressing
-   the wrong device on the real bus.
+   `0xA2`, …, `0xAE` (4 chips × 2 A16 pages). The raw 7-bit values `0x50..0x57`
+   are rejected, so a driver that forgets the shift fails the tests instead of
+   silently addressing the wrong device on the real bus.
 
 ## References
 

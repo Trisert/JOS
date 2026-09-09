@@ -431,30 +431,31 @@ void test_fram_write_read_round_trip(void)
     TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, readback, sizeof(payload));
 }
 
-/* Access beyond the 64 KB FRAM bank must be refused, not wrapped silently. */
+/* Access beyond the 512 KB FRAM bank must be refused, not wrapped silently. */
 void test_fram_rejects_out_of_range_access(void)
 {
     uint8_t buf[4] = { 0 };
 
-    TEST_ASSERT_EQUAL_INT(-1, fram_write(64u * 1024u, buf, sizeof(buf)));
-    TEST_ASSERT_EQUAL_INT(-1, fram_read(64u * 1024u, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, fram_write(512u * 1024u, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, fram_read(512u * 1024u, buf, sizeof(buf)));
 }
 
 /* The STM32 HAL I2C API takes the device address already shifted left by one.
- * The four FM24VN10-G parts are 7-bit 0x50..0x53, so the bytes that must reach
- * HAL_I2C_Mem_Read/Write are 0xA0, 0xA2, 0xA4, 0xA6. Handing the HAL the raw
- * 7-bit value would address 0x28 on the real bus, and no host double is
+ * The bank answers on 7-bit 0x50..0x57 (chip in bits 3..2, A16 page select
+ * in bit 1), so the bytes that must reach HAL_I2C_Mem_Read/Write for the
+ * page-0 window of each chip are 0xA0, 0xA4, 0xA8, 0xAC. Handing the HAL the
+ * raw 7-bit value would address 0x28 on the real bus, and no host double is
  * allowed to paper over that. */
 void test_fram_uses_shifted_i2c_device_addresses(void)
 {
-    const uint16_t expected[4] = { 0xA0u, 0xA2u, 0xA4u, 0xA6u };
+    const uint16_t expected[4] = { 0xA0u, 0xA4u, 0xA8u, 0xACu };
     uint8_t        byte        = 0x5Au;
     uint32_t       chip;
 
     fram_init();
 
     for (chip = 0u; chip < 4u; chip++) {
-        uint32_t addr = chip * 16u * 1024u;
+        uint32_t addr = chip * 128u * 1024u;
 
         TEST_ASSERT_EQUAL_INT(0, fram_write(addr, &byte, 1u));
         TEST_ASSERT_EQUAL_HEX16(expected[chip], host_flash_last_i2c_addr());
@@ -464,7 +465,31 @@ void test_fram_uses_shifted_i2c_device_addresses(void)
     }
 }
 
-/* Each chip is a separate 16 KB address space: byte 0 of chip 1 must not alias
+/* The A16 page-select bit reaches the bus in the slave byte, not the address
+ * field: byte 0 of the upper 64 KB page of chip 0 must land on 0xA2 (7-bit
+ * 0x51) and must not alias byte 0 of the lower page (0xA0 / 7-bit 0x50). */
+void test_fram_page_select_bit_addresses_upper_64kb(void)
+{
+    const uint8_t marker_lo = 0x33u;
+    const uint8_t marker_hi = 0x77u;
+    uint8_t       readback  = 0u;
+
+    fram_init();
+
+    TEST_ASSERT_EQUAL_INT(0, fram_write(0u, &marker_lo, 1u));
+    TEST_ASSERT_EQUAL_HEX16(0xA0u, host_flash_last_i2c_addr());
+
+    TEST_ASSERT_EQUAL_INT(0, fram_write(64u * 1024u, &marker_hi, 1u));
+    TEST_ASSERT_EQUAL_HEX16(0xA2u, host_flash_last_i2c_addr());
+
+    TEST_ASSERT_EQUAL_INT(0, fram_read(0u, &readback, 1u));
+    TEST_ASSERT_EQUAL_HEX8(marker_lo, readback);
+
+    TEST_ASSERT_EQUAL_INT(0, fram_read(64u * 1024u, &readback, 1u));
+    TEST_ASSERT_EQUAL_HEX8(marker_hi, readback);
+}
+
+/* Each chip is a separate 128 KB address space: byte 0 of chip 1 must not alias
  * byte 0 of chip 0. This only holds if the chip-select arithmetic and the
  * address shift agree. */
 void test_fram_chips_do_not_alias_each_other(void)
@@ -476,12 +501,12 @@ void test_fram_chips_do_not_alias_each_other(void)
     fram_init();
 
     TEST_ASSERT_EQUAL_INT(0, fram_write(0u, &marker0, 1u));
-    TEST_ASSERT_EQUAL_INT(0, fram_write(16u * 1024u, &marker1, 1u));
+    TEST_ASSERT_EQUAL_INT(0, fram_write(128u * 1024u, &marker1, 1u));
 
     TEST_ASSERT_EQUAL_INT(0, fram_read(0u, &readback, 1u));
     TEST_ASSERT_EQUAL_HEX8(marker0, readback);
 
-    TEST_ASSERT_EQUAL_INT(0, fram_read(16u * 1024u, &readback, 1u));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(128u * 1024u, &readback, 1u));
     TEST_ASSERT_EQUAL_HEX8(marker1, readback);
 }
 
