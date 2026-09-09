@@ -10,12 +10,18 @@
   * that can be voted on so the upset is *corrected* instead of costing a
   * reboot.
   *
-  * Redundancy layout for a SEU_POLICY_GOLDEN region - three copies of the
-  * truth, in three different places, so no single upset can defeat the vote:
+  * Redundancy layout for a SEU_POLICY_GOLDEN region - three RAM copies of the
+  * truth vote every pass, plus one non-volatile leg that carries the last
+  * committed truth across a reboot (the SRAM2 shadow alone cannot: it is
+  * NOINIT and sram2_parity_init() erases it at every boot):
   *
   *     live object      SRAM2 or SRAM1, owned by the application
   *     shadow copy      SRAM2 shadow pool (parity covered, different address)
   *     reference CRC-32 SRAM1, inside this module's region table
+  *     golden record    FRAM (FeRAM, non-volatile): CRC-32-protected copy,
+  *                      written through by seu_mitigation_sync() after every
+  *                      task-context commit and restored at init. A record
+  *                      that fails magic / length / CRC is never restored.
   *
   * Standards: NASA-STD-8739.8 (fault tolerance, data integrity, no silent
   *            failure), ECSS-E-ST-40C, ECSS-Q-ST-80C Rev.2 (FDIR),
@@ -440,6 +446,148 @@ int seu_mitigation_commit(seu_region_id_t id)
     return 0;
 }
 
+/* ---------- Reboot-persistent golden copy (FRAM) ----------
+   The shadow pool is SRAM2 NOINIT: sram2_parity_init() erases it at every
+   boot, so a commit that only refreshed the shadow cannot carry a
+   containment (STATE_CRIT) across the reboot that the parity NMI is about
+   to cause. The FRAM golden is the leg that survives: task-context commits
+   are written through with seu_mitigation_sync(), and the next init
+   restores the CRC-valid records over the registration snapshots.
+
+   Split from commit() on purpose: commit() also runs on the parity-NMI /
+   fault path (laststates_write), where a blocking I2C transaction with a
+   1 s timeout must never happen. sync() is task context, outside the SEU
+   lock; a transport failure is counted and never rolls back the SRAM
+   commit that already landed.
+
+   Wire format matches the retired App/obsw/scrub.c pool byte for byte, so
+   FRAM dumps stay readable and a pre-unify golden is still a valid restore
+   candidate (both CRCs are IEEE 802.3 CRC-32). */
+
+/* Wire-format FRAM record (packed to match the byte layout below):
+     offset 0  : magic[4]      = "SCUR" (SEU_FRAM_MAGIC)
+     offset 4  : region_id     (1 byte)
+     offset 5  : reserved[3]
+     offset 8  : crc32         (4) over payload[0 .. payload_len-1]
+     offset 12 : payload_len   (4)
+     offset 16 : payload[payload_len] */
+typedef struct __attribute__((packed)) {
+    uint8_t  magic[4];                          /* SEU_FRAM_MAGIC          */
+    uint8_t  region_id;                         /* slot index / region id  */
+    uint8_t  reserved[3];
+    uint32_t crc32;                             /* CRC-32 over payload     */
+    uint32_t payload_len;                       /* bytes of valid payload  */
+    uint8_t  payload[SEU_FRAM_PAYLOAD_BYTES];
+} seu_fram_record_t;
+
+_Static_assert(sizeof(seu_fram_record_t) == SEU_FRAM_RECORD_SIZE,
+               "seu_fram_record_t must match SEU_FRAM_RECORD_SIZE");
+_Static_assert(SEU_FRAM_SLOTS >= (uint32_t)SEU_REGION_ID_COUNT,
+               "FRAM pool must cover every region id");
+
+static void seu_fram_put_magic(seu_fram_record_t *rec)
+{
+    rec->magic[0] = (uint8_t)(SEU_FRAM_MAGIC >> 24);
+    rec->magic[1] = (uint8_t)(SEU_FRAM_MAGIC >> 16);
+    rec->magic[2] = (uint8_t)(SEU_FRAM_MAGIC >> 8);
+    rec->magic[3] = (uint8_t)(SEU_FRAM_MAGIC);
+}
+
+static int seu_fram_check_magic(const seu_fram_record_t *rec)
+{
+    return (rec->magic[0] == (uint8_t)(SEU_FRAM_MAGIC >> 24)) &&
+           (rec->magic[1] == (uint8_t)(SEU_FRAM_MAGIC >> 16)) &&
+           (rec->magic[2] == (uint8_t)(SEU_FRAM_MAGIC >> 8)) &&
+           (rec->magic[3] == (uint8_t)(SEU_FRAM_MAGIC));
+}
+
+int seu_mitigation_sync(seu_region_id_t id)
+{
+    seu_region_t *r;
+    seu_fram_record_t rec;
+
+    if (seu_initialised == 0U) {
+        return -1;   /* same pre-init no-op contract as commit() */
+    }
+
+    r = seu_find(id);
+    if ((r == NULL) || (seu_region_valid(r) == 0) || (r->shadow == NULL)) {
+        return -1;
+    }
+    if (((seu_policy_t)r->policy != SEU_POLICY_GOLDEN) ||
+        (r->len > SEU_FRAM_PAYLOAD_BYTES) ||
+        ((uint32_t)id >= (uint32_t)SEU_FRAM_SLOTS)) {
+        seu_stats.fram_errors++;
+        return -1;
+    }
+
+    /* Snapshot the committed truth under the lock; the FRAM transaction
+       itself runs with interrupts enabled (task context only, enforced by
+       the contract in seu_mitigation.h). */
+    seu_mitigation_lock();
+    memset(&rec, 0, sizeof(rec));
+    seu_fram_put_magic(&rec);
+    rec.region_id   = (uint8_t)id;
+    rec.payload_len = (uint32_t)r->len;
+    memcpy(rec.payload, r->addr, r->len);
+    rec.crc32 = seu_crc32(rec.payload, r->len);
+    seu_mitigation_unlock();
+
+    if (fram_write(SEU_FRAM_SLOT_ADDR(id),
+                   (const uint8_t *)&rec, sizeof(rec)) != 0) {
+        seu_stats.fram_errors++;
+        return -1;
+    }
+    return 0;
+}
+
+/* Boot-time restore: for every golden region, read its FRAM slot and, only
+   if magic, region id, length AND CRC all agree, install the payload as the
+   live object, the shadow and the reference CRC - after which the first
+   scrub pass already votes on the pre-reboot truth. Anything else (erased
+   first boot, FRAM upset, wrapped cyclic write) leaves the registration
+   snapshot untouched: garbage is never restored, and the existing
+   triple-disagreement rule below still refuses to invent a truth when no
+   two legs agree. Runs pre-scheduler from seu_mitigation_init(). */
+static void seu_fram_restore_all(void)
+{
+    for (uint32_t i = 0U; i < SEU_MAX_REGIONS; i++) {
+        seu_region_t *r = &seu_regions[i];
+        seu_fram_record_t rec;
+        uint32_t crc;
+
+        if ((r->used == 0U) || ((seu_policy_t)r->policy != SEU_POLICY_GOLDEN)) {
+            continue;
+        }
+        if ((seu_region_valid(r) == 0) || (r->len > SEU_FRAM_PAYLOAD_BYTES) ||
+            ((uint32_t)r->id >= (uint32_t)SEU_FRAM_SLOTS)) {
+            continue;   /* descriptor fault: the scrub pass rejects + counts */
+        }
+        if (fram_read(SEU_FRAM_SLOT_ADDR(r->id),
+                      (uint8_t *)&rec, sizeof(rec)) != 0) {
+            seu_stats.fram_errors++;
+            continue;
+        }
+        if (seu_fram_check_magic(&rec) == 0) {
+            continue;   /* empty slot (first boot): not an error */
+        }
+        if ((rec.region_id != (uint8_t)r->id) ||
+            (rec.payload_len != (uint32_t)r->len)) {
+            continue;
+        }
+        crc = seu_crc32(rec.payload, r->len);
+        if (crc != rec.crc32) {
+            continue;   /* FRAM upset or clobbered slot: never restore */
+        }
+
+        seu_mitigation_lock();
+        memcpy(r->addr, rec.payload, r->len);
+        memcpy(r->shadow, rec.payload, r->len);
+        r->crc = crc;
+        seu_mitigation_unlock();
+    }
+}
+
 /* ---------- Scrubbing ---------- */
 
 /* Read every word of a region so the SRAM2 parity hardware gets the chance to
@@ -689,6 +837,15 @@ void seu_mitigation_init(void)
                                        SEU_POLICY_TOUCH) != 0) {
         seu_stats.registration_failures++;
     }
+
+    /* (b) Reboot persistence: the SRAM2 shadow was erased by
+       sram2_parity_init() and the snapshots above captured whatever the
+       owners left in live RAM after the reset - power-on content, not the
+       pre-reboot truth. Wherever a CRC-valid golden record exists in FRAM
+       it IS the last synced truth: restore it into live + shadow + CRC so
+       the first scrub pass already votes on it. Anything else leaves the
+       registration snapshot untouched (never restore garbage). */
+    seu_fram_restore_all();
 
     seu_stats.parity_events_boot  = sram2_parity_error_count();
     seu_stats.parity_events_total = seu_bkp_count();

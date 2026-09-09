@@ -7,8 +7,8 @@
   * test include path (it also holds the CubeMX main.h, which would shadow
   * test/fakes/main.h and drag the whole HAL/CMSIS tree into the host build),
   * and it includes cmsis_os2.h for osThreadId_t. The scrubber itself is
-  * target-only; App/memory/memory.c needs exactly the three entry points and
-  * the one region id declared below, so the host build gets this narrow fake
+  * target-only; App/memory/memory.c needs exactly the entry points and
+  * the region ids declared below, so the host build gets this narrow fake
   * instead of an #ifdef around every call site in the flight code.
   *
   * Signatures MUST stay byte-compatible with Core/Inc/seu_mitigation.h; the
@@ -41,6 +41,11 @@ void seu_mitigation_unlock(void);
 /** Re-take the snapshot of a region after a legitimate update.
  *  0 on success, -1 if the region is unknown / not initialised. */
 int seu_mitigation_commit(seu_region_id_t id);
+
+/** Host no-op for the FRAM write-through (Core/Inc/seu_mitigation.h): the
+ *  FRAM golden is target-only (needs the I2C bus), so on the host a sync
+ *  trivially succeeds. 0 on a known region, -1 otherwise. */
+int seu_mitigation_sync(seu_region_id_t id);
 
 /* ---------- host-only introspection (not present on the target) ---------- */
 

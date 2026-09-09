@@ -44,6 +44,14 @@ int seu_mitigation_commit(seu_region_id_t id)
     return 0;
 }
 
+int seu_mitigation_sync(seu_region_id_t id)
+{
+    if ((int)id < 0 || (int)id >= (int)SEU_REGION_ID_COUNT) {
+        return -1;
+    }
+    return 0;
+}
+
 int seu_stub_lock_depth(void)         { return lock_depth; }
 int seu_stub_commit_count(void)       { return commit_count; }
 int seu_stub_last_commit_region(void) { return last_commit_regid; }

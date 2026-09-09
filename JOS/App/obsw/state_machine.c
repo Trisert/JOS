@@ -8,7 +8,6 @@
 #include "memory.h"         /* laststates_write() prototype */
 #include "sram2_parity.h"   /* SRAM2_CRITICAL placement (W2-3) */
 #include "seu_mitigation.h" /* redundant snapshot + scrubbing (W2-5) */
-#include "scrub.h"          /* W2-5 SEU scrub of obsw_state (golden FRAM copy) */
 #include <string.h>
 
 /* ---------- Private variables ---------- */
@@ -97,10 +96,11 @@ void bms_set_soc_stub(uint8_t soc)
     obsw_state.bms.soc = soc;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
-    /* Same reason the RAM shadow is re-committed above: the FRAM golden copy
-       must follow every trusted mutation, or the next scrub pass would find
-       live != golden and "repair" this change away (W2-5). */
-    (void)scrub_sync(SCRUB_REGION_OBSW_STATE);
+    /* Write-through to the FRAM golden copy (W2-5): the SRAM2 shadow alone
+     * does not survive a reboot, so without this the next boot would
+     * re-snapshot the post-reset RAM instead of the truth committed here.
+     * Outside the SEU lock: blocking I2C, task context only. */
+    (void)seu_mitigation_sync(SEU_REGION_OBSW_STATE);
 }
 
 void *state_machine_critical_region(size_t *len)
@@ -213,15 +213,15 @@ static int try_transition(obw_state_t target, uint8_t trigger)
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
 
-    /* Write-through the new critical state to the CRC-protected FRAM golden
-       copy so the scrubber (W2-5) always has an authoritative backup after a
-       committed mutation, and so the state survives a parity-NMI reboot.
-       Deliberately OUTSIDE the SEU lock: scrub_sync() runs a blocking I2C
-       transaction to the FRAM and must not hold off the RAM-shadow scrubber
-       for the duration. A FRAM write failure is counted in
-       scrub_fram_error_count() but does not roll back the already-committed
-       transition. */
-    (void)scrub_sync(SCRUB_REGION_OBSW_STATE);
+    /* NOTE: no seu_mitigation_sync() here. The write-through to the FRAM
+     * golden copy (W2-5) runs a blocking I2C transaction (up to 1 s
+     * timeout) and every caller of try_transition() holds state_mutex, so
+     * syncing here would wedge the whole state-transition critical section
+     * on a sick bus. The commit above already moved the shadow/CRC pair, so
+     * the scrubber sees a consistent image; each caller performs the
+     * best-effort FRAM sync AFTER releasing state_mutex. A FRAM failure is
+     * counted in seu_stats_t.fram_errors but never rolls back the committed
+     * transition. */
     return 0;
 }
 
@@ -258,28 +258,47 @@ static int enter_safe_state(uint8_t trigger)
     obsw_state.current_state = STATE_CRIT;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
-    /* Containment must also survive a reboot: refresh the FRAM golden copy so
-       scrub_init() restores CRIT and not the pre-fault state (W2-5). */
-    (void)scrub_sync(SCRUB_REGION_OBSW_STATE);
+    /* Containment must survive a reboot, and the SRAM2 shadow provably does
+     * not (sram2_parity_init() erases it at every boot): the caller persists
+     * the forced CRIT through to the FRAM golden copy AFTER releasing
+     * state_mutex, so seu_mitigation_init() restores CRIT - not the
+     * pre-fault state - after a parity-NMI reset. Best effort: a FRAM
+     * failure is counted, never rolled back; the containment in RAM stands
+     * either way. (No sync here: blocking I2C must not run under
+     * state_mutex - see try_transition().) */
 
     /* Containment is in force either way - only the evidence is missing. */
     return SAFE_STATE_FORCED;
 }
 
-/* ---------- Autonomous battery check ---------- */
-static void check_battery_autonomous(void)
+/* ---------- FRAM write-through ----------
+   Best-effort persistence of the committed OBSW state to the FRAM golden
+   copy (W2-5). Runs a blocking I2C transaction (up to 1 s timeout): task
+   context only, and NEVER while holding state_mutex or the SEU lock - a
+   sick bus must stall one write-through, never the state-transition
+   critical section. Call only after the mutex is released. */
+static void state_fram_sync(void)
+{
+    (void)seu_mitigation_sync(SEU_REGION_OBSW_STATE);
+}
+
+/* ---------- Autonomous battery check ----------
+   Returns 1 when a transition was committed (caller must run
+   state_fram_sync() after releasing state_mutex), 0 otherwise. */
+static int check_battery_autonomous(void)
 {
     bms_status_t bms = bms_get_status();
 
     if (bms.soc <= default_thresholds.b_scrit) {
-        try_transition(STATE_CRIT, TRIGGER_BATTERY_LOW);
+        return (try_transition(STATE_CRIT, TRIGGER_BATTERY_LOW) == 0);
     } else if (obsw_state.current_state == STATE_CRIT &&
                bms.soc >= default_thresholds.b_opok) {
         /* No parity check here any more: it lives in try_transition(), which
            covers this caller and every other one (Kilo #23, id 3740885216).
            A refused recovery simply leaves the OBSW in CRIT. */
-        try_transition(STATE_READY, TRIGGER_BATTERY_OK);
+        return (try_transition(STATE_READY, TRIGGER_BATTERY_OK) == 0);
     }
+    return 0;
 }
 
 /* ---------- Main task loop ---------- */
@@ -291,6 +310,11 @@ static void state_machine_task(void *arg)
        CRIT under a different trigger. */
     int parity_safe_entered = 0;
     int parity_safe_rc = SAFE_STATE_FORCED;
+    /* Set when a boot transition committed: the FRAM write-through runs
+     * AFTER the matching osMutexRelease (blocking I2C under state_mutex
+     * would wedge the transition critical section). */
+    int boot_dirty = 0;
+    int init_committed;
 
     (void)arg;
 
@@ -298,8 +322,11 @@ static void state_machine_task(void *arg)
     osDelay(pdMS_TO_TICKS(100));   /* let peripherals settle */
 
     osMutexAcquire(state_mutex, osWaitForever);
-    try_transition(STATE_INIT, TRIGGER_BOOT);
+    init_committed = (try_transition(STATE_INIT, TRIGGER_BOOT) == 0);
     osMutexRelease(state_mutex);
+    if (init_committed) {
+        state_fram_sync();
+    }
 
     /* TODO: antenna deployment sequence + self-tests here */
     osDelay(pdMS_TO_TICKS(500));   /* placeholder for init work */
@@ -319,14 +346,16 @@ static void state_machine_task(void *arg)
         /* Image integrity fault survived the reset budget: enter the safe
            state instead of nominal ops (beacon-only, payloads inhibited). */
         (void)enter_safe_state(TRIGGER_IMAGE_CRC_FAIL);
+        boot_dirty = 1;
     } else if (parity_safe_latched != 0U) {
         /* SRAM2 reported a parity finding, or the boot erase never completed:
            come up in the safe state, not in READY on data whose integrity is
            not established. */
         parity_safe_rc = enter_safe_state(TRIGGER_SRAM2_PARITY);
         parity_safe_entered = 1;
+        boot_dirty = 1;
     } else {
-        try_transition(STATE_READY, TRIGGER_ANTENNA_DONE);
+        boot_dirty = (try_transition(STATE_READY, TRIGGER_ANTENNA_DONE) == 0);
     }
 
     if (parity_safe_latched != 0U) {
@@ -362,14 +391,23 @@ static void state_machine_task(void *arg)
     }
 
     osMutexRelease(state_mutex);
+    if (boot_dirty) {
+        /* FRAM write-through for the boot transition, outside state_mutex:
+           blocking I2C must not wedge the transition critical section. */
+        state_fram_sync();
+    }
 
     /* 10 Hz main loop */
     for (;;) {
+        int batt_dirty;
         watchdog_alive_self();
 
         osMutexAcquire(state_mutex, osWaitForever);
-        check_battery_autonomous();
+        batt_dirty = check_battery_autonomous();
         osMutexRelease(state_mutex);
+        if (batt_dirty) {
+            state_fram_sync();
+        }
 
         osDelay(pdMS_TO_TICKS(100));
     }
@@ -396,15 +434,10 @@ void state_machine_init(void)
     obsw_state.current_state            = STATE_OFF;
     obsw_state.beacon_interval_override = 0U;
 
-    /* Register the critical state struct with the FRAM golden-copy scrubber
-       (W2-5, App/obsw/scrub.c). Registration only records the address/length;
-       the golden record in FRAM is empty on the very first boot
-       (SCRUB_ERR_MAGIC), which is expected. main() calls scrub_init() right
-       after this function to restore the region from a valid backup, and
-       write-through on every committed mutation keeps the golden copy
-       authoritative (see scrub_sync() in try_transition()). */
-    (void)scrub_register(&obsw_state, sizeof(obsw_state),
-                         SCRUB_REGION_OBSW_STATE);
+    /* (T1.6 scrub-unify) The retired parallel scrubber was removed in favour
+     * of seu_mitigation, which auto-registers obsw_state in its own init via
+     * state_machine_critical_region(). No manual region registration is
+     * needed here any more. */
 
     /* seu_mitigation_init() runs after this function and takes the first
        snapshot; the commit here is a no-op before that point and keeps the
@@ -436,6 +469,12 @@ int state_machine_request_transition(obw_state_t target, uint8_t trigger)
     osMutexAcquire(state_mutex, osWaitForever);
     rc = try_transition(target, trigger);
     osMutexRelease(state_mutex);
+    if (rc == 0) {
+        /* FRAM write-through for the committed transition, outside
+           state_mutex: the sync runs a blocking I2C transaction (up to 1 s
+           timeout) that must not stall the transition critical section. */
+        state_fram_sync();
+    }
     return rc;
 }
 
@@ -478,9 +517,12 @@ int state_machine_set_beacon_interval(uint32_t interval_ms)
     obsw_state.beacon_interval_override = interval_ms;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
-    /* Write-through to the FRAM golden copy (W2-5) so a commanded cadence
-       change is not scrubbed back to the previous value. */
-    (void)scrub_sync(SCRUB_REGION_OBSW_STATE);
     osMutexRelease(state_mutex);
+    /* Write-through to the FRAM golden copy (W2-5): without it a reboot
+     * would re-snapshot the previous cadence and the scrubber would repair
+     * this commanded change away. Outside the SEU lock AND outside
+     * state_mutex: blocking I2C (up to 1 s timeout) must never wedge the
+     * OBSW main thread. Best effort, never rolls back. */
+    (void)seu_mitigation_sync(SEU_REGION_OBSW_STATE);
     return 0;
 }

@@ -54,12 +54,13 @@
   *      LastStates summary record.
   *
   * Parity vs. voting - which correction is reachable when:
-  *   - The shadow pool and the region table live in SRAM1, *not* in the
-  *     parity-protected block. With the shadow in SRAM2 and the parity check
-  *     enabled, reading a flipped shadow byte would raise an NMI and reboot
-  *     the OBSW, so the "shadow was hit, rebuild it" branch could never run:
-  *     a free correction would have been turned into a reset. In SRAM1 the
-  *     shadow leg and the CRC leg are always correctable by the vote.
+  *   - The shadow pool lives in SRAM2 under hardware parity (.sram2_noinit,
+  *     see seu_mitigation.c); only the region table (the reference CRCs)
+  *     lives in SRAM1. A single-bit flip in the shadow is therefore
+  *     *detected* by the parity hardware on the next read (NMI, recorded
+  *     reset, W2-3), and the reboot restores the last-good image from the
+  *     FRAM golden (see "Reboot persistence" below) instead of
+  *     re-snapshotting whatever the reset left behind.
   *   - For a live object inside SRAM2 the parity hardware still wins the race
   *     on any odd number of flipped bits in a byte (recorded reset, W2-3).
   *     The vote covers what parity is blind to - an even number of flips
@@ -72,6 +73,20 @@
   * plus the commit MUST be atomic with respect to the scrub task - wrap them
   * in seu_mitigation_lock() / seu_mitigation_unlock(). Missing a commit makes
   * the scrubber revert a legitimate update at the next cycle.
+  *
+  * Reboot persistence: the SRAM2 shadow does not survive a reset
+  * (sram2_parity_init() erases it), so a commit alone cannot carry a
+  * containment (STATE_CRIT) across a reboot. Every commit of a golden region
+  * performed in task context MUST therefore be followed by
+  * seu_mitigation_sync(), which writes the same snapshot through to a
+  * CRC-32-protected golden record in FRAM (non-volatile FeRAM); the next
+  * seu_mitigation_init() restores agreed golden records into live RAM before
+  * the mission logic runs. A golden record that fails its magic / length /
+  * CRC check is never restored (first boot, FRAM upset, or a wrapped cyclic
+  * telemetry write): the registration snapshot stands. seu_mitigation_sync()
+  * runs a blocking I2C transaction, so it is for task context OUTSIDE the
+  * SEU lock only - never on the NMI / fault path (laststates_write()
+  * commits from there, and commit itself stays short and lock-safe).
   *
   * Standards: NASA-STD-8739.8 (fault tolerance, data integrity, no silent
   *            failure), ECSS-E-ST-40C (recorded failure context),
@@ -157,6 +172,23 @@ extern "C" {
 #define SEU_SCRUB_TASK_STACK    (384U * 4U)
 #endif
 
+/* ---------- FRAM golden pool (reboot persistence) ----------
+ * Top of the 64 KB FRAM (see App/memory/memory.c FRAM layout): one fixed
+ * slot per region id, reserved top-down so the cyclic telemetry buffer
+ * (which owns the bottom and wraps) needs no allocator handshake. The wire
+ * format is identical to the retired App/obsw/scrub.c golden record, so
+ * FRAM dumps - and any golden written before the T1.6 unify - stay
+ * readable. All slots sit in the last 16 KB chip, so one record is one
+ * single-chip I2C transaction. */
+#define SEU_FRAM_MAGIC            0x53435552U   /* "SCUR", as the retired pool */
+#define SEU_FRAM_PAYLOAD_BYTES    256U          /* max golden payload per slot */
+#define SEU_FRAM_RECORD_HEADER    16U           /* magic+id+reserved+crc+len   */
+#define SEU_FRAM_RECORD_SIZE      (SEU_FRAM_RECORD_HEADER + SEU_FRAM_PAYLOAD_BYTES)
+#define SEU_FRAM_SLOTS            8U            /* slots reserved at the top   */
+#define SEU_FRAM_BASE             (0x10000U - ((uint32_t)SEU_FRAM_SLOTS * (uint32_t)SEU_FRAM_RECORD_SIZE))
+/* FRAM byte address of a region id's golden record slot. */
+#define SEU_FRAM_SLOT_ADDR(id)    ((uint32_t)(SEU_FRAM_BASE) + (uint32_t)(id) * (uint32_t)(SEU_FRAM_RECORD_SIZE))
+
 /* ---------- Regions ---------- */
 
 /** Identifier of a protected region; also the index used by ground. */
@@ -236,6 +268,9 @@ typedef struct {
     uint32_t parity_events_total;  /* persistent counter (backup register)  */
     uint32_t parity_status;        /* sram2_parity_status_t at the last pass */
     uint32_t last_scrub_tick;      /* HAL_GetTick() of the last pass        */
+    uint32_t fram_errors;          /* FRAM golden transport failures (sync /
+                                    * restore); a failed write-through never
+                                    * rolls back the SRAM commit            */
 } seu_stats_t;
 
 /** Post-mortem record written to the LastStates pool (fits the 116 B blob). */
@@ -258,13 +293,16 @@ typedef struct {
 
 /**
   * @brief  Snapshot the critical structures and arm the scrubber.
-  * @note   MUST run after sram2_parity_init() (which erases SRAM2) and after
-  *         the owners of the critical structures are initialised
-  *         (state_machine_init(), laststates_init(), lora_init()), and before
-  *         osKernelStart(). Registers the built-in regions and enables access
-  *         to the backup-domain SEU counter. A registration that fails is
-  *         counted in seu_stats_t.registration_failures and recorded in the
-  *         LastStates pool - never silently ignored.
+  * @note   MUST run after sram2_parity_init() (which erases SRAM2), after the
+  *         FRAM bus is usable (fram_init()), and after the owners of the
+  *         critical structures are initialised (state_machine_init(),
+  *         laststates_init(), lora_init()), and before osKernelStart().
+  *         Registers the built-in regions, restores the CRC-valid FRAM
+  *         golden records over the registration snapshots (a record that
+  *         fails magic / length / CRC is never restored), and enables
+  *         access to the backup-domain SEU counter. A registration that
+  *         fails is counted in seu_stats_t.registration_failures and
+  *         recorded in the LastStates pool - never silently ignored.
   */
 void seu_mitigation_init(void);
 
@@ -292,10 +330,30 @@ int seu_mitigation_register_region(seu_region_id_t id, void *addr, size_t len,
   * @retval 0 on success, -1 if the region is unknown, not initialised or its
   *         descriptor fails the bounds check.
   * @note   Cheap (a memcpy plus a CRC over a few tens of bytes) and safe to
-  *         call before the RTOS starts. Call it inside the same
+  *         call before the RTOS starts, under the SEU lock, and on the
+  *         NMI / fault path (laststates_write() commits from there). SRAM
+  *         only: it does NOT touch FRAM, so it cannot carry anything across
+  *         a reboot - pair it with seu_mitigation_sync() in task context
+  *         (see the ownership contract above). Call it inside the same
   *         seu_mitigation_lock() section as the update itself.
   */
 int seu_mitigation_commit(seu_region_id_t id);
+
+/**
+  * @brief  Write the last-committed snapshot of a golden region through to
+  *         its CRC-32-protected FRAM golden record (write-through cache
+  *         semantics: the backup never lags the committed truth).
+  * @retval 0 on success, -1 if the region is unknown / not golden / oversize
+  *         or the FRAM transaction failed (counted in
+  *         seu_stats_t.fram_errors; the SRAM commit is never rolled back).
+  * @note   Task context, OUTSIDE seu_mitigation_lock(): it runs a blocking
+  *         I2C transaction and must not extend the irq-off window, and it is
+  *         never legal on the NMI / fault path. Call it after every task-
+  *         context commit of a golden region (transition, BMS stub, beacon
+  *         override, forced containment) so the next boot restores this
+  *         truth instead of the post-reset RAM content.
+  */
+int seu_mitigation_sync(seu_region_id_t id);
 
 /**
   * @brief  Run one scrub pass over every registered region.
