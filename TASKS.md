@@ -63,7 +63,7 @@ It replaces the old Hermes kanban board (SQLite), which was archived on
 | 33 | done | **FRAM full-size 128KB/chip (512KB)** → PR #73: rework `414ae83` APPROVE (reviewer ha riverificato build+147/147). | [#73](https://github.com/Trisert/JOS/pull/73) | Resta: strapping A2/A1 (Nicola) + Kilo. |
 | 34 | done | **TRIGGER_TASK_COMPLETE s4→s3** → PR #74: coverage fix `ab67c5a` (20 test, linee 92.2%, branch 82.8%). | [#74](https://github.com/Trisert/JOS/pull/74) | Subagent review + /review: APPROVE. CI re-run. |
 | 35 | done | **HMAC uplink (design upstream)** → PR #75: Kilo fix `12f6974` verificato (DBL gone, comment EN :33, bool+out, KAT). | [#75](https://github.com/Trisert/JOS/pull/75) | Verdetto: APPROVE (verifica diretta; subagent glitchati). CI: fw+ceedling verdi, static/Kilo pending. |
-| 36 | done | **Swarm review → fix**: #76 SPI robust, #77 RTOS safety, #78 I2C/CubeMX (aperte); #79 framing APPROVE, #80 coverage APPROVE (no gaming). | [#79](https://github.com/Trisert/JOS/pull/79) [#80](https://github.com/Trisert/JOS/pull/80) | Review #76/#77/#78 in corso. |
+| 36 | done | **Swarm review → fix**: #76 SPI robust (cppcheck fix `b211a56`), #77 RTOS safety APPROVE, #78 I2C/CubeMX (GPIO fix `28a75e1`), #79 framing APPROVE, #80 coverage APPROVE. | [#79](https://github.com/Trisert/JOS/pull/79) [#80](https://github.com/Trisert/JOS/pull/80) | Re-review #76/#78 in corso. |
 
 *Ultimo aggiornamento: 2026-09-08 — Verifica SPF V3 avanzata: T32 ✅, T33 ✅(PR #63), T34 ✅(gap report), T35 ✅, T-PAY ✅(11 gap), T-AOCS ✅(gap molto ampi), T-COMMS ✅(5 gap incluso bug CR=4/9), T-SM ✅( TRIGGER_TASK_COMPLETE mancante). Issues #68-#70 create. Bloccati su decisioni utente (FRAM bus), merge PR #63, fix CR=4/9, DMA IRQ.*
 
