@@ -257,6 +257,22 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
    OBC schematic maps GPIO_INT to a real EXTI-capable GPIO (see B0). */
 extern void lora_on_dio1_irq(void);
 
+/* SPI1 DMA handles (owned by stm32l4xx_hal_msp.c): the TC IRQs below drive
+   HAL completion callbacks, which return hspi1 to READY for the synchronous
+   RadioLib spiTransfer() (SPF V3 §3.6.4.2: DMA for all SPI transactions). */
+extern DMA_HandleTypeDef hdma_spi1_rx;
+extern DMA_HandleTypeDef hdma_spi1_tx;
+
+void DMA1_Channel2_IRQHandler(void)
+{
+    HAL_DMA_IRQHandler(&hdma_spi1_rx);
+}
+
+void DMA1_Channel3_IRQHandler(void)
+{
+    HAL_DMA_IRQHandler(&hdma_spi1_tx);
+}
+
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     /* GPIO_INT_Pin is defined in radiolib_hal.h (placeholder until B0 closes).

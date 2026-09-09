@@ -20,6 +20,8 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32l4xx_hal_dma.h"
+#include "stm32l4xx_hal_dma_ex.h"
 /* USER CODE BEGIN Includes */
 
 /* USER CODE END Includes */
@@ -41,7 +43,8 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
-
+DMA_HandleTypeDef hdma_spi1_tx;
+DMA_HandleTypeDef hdma_spi1_rx;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -303,7 +306,54 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef* hspi)
   if(hspi->Instance==SPI1)
   {
     /* USER CODE BEGIN SPI1_MspInit 0 */
-
+    /* DMA for SPI1 — SPF V3 §3.6.4.2. STM32L496 has NO DMAMUX: peripheral
+       mapping goes through the DMA_CSELR channel-selection register
+       (RM0351 Table 46 "DMA1 requests for each channel": Channel 2 +
+       C2S=0001 -> SPI1_RX, Channel 3 + C3S=0001 -> SPI1_TX). HAL_DMA_Init
+       programs CSELR from Init.Request on parts without DMAMUX1 (see
+       stm32l4xx_hal_dma.c, "#if !defined (DMAMUX1)" branch), so the CSELR
+       selection value DMA_REQUEST_1 is correct here — NOT the DMAMUX1 IDs
+       DMA_REQUEST_SPI1_RX=11 / DMA_REQUEST_SPI1_TX=12 (those only exist on
+       DMAMUX parts and would program a wrong peripheral into CSELR). */
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    hdma_spi1_tx.Instance = DMA1_Channel3;
+    hdma_spi1_tx.Init.Request = DMA_REQUEST_1;   /* CSELR C3S=0001 -> SPI1_TX */
+    hdma_spi1_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    hdma_spi1_tx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_spi1_tx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_spi1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_spi1_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_spi1_tx.Init.Mode = DMA_NORMAL;
+    hdma_spi1_tx.Init.Priority = DMA_PRIORITY_VERY_HIGH;
+    if (HAL_DMA_Init(&hdma_spi1_tx) != HAL_OK) {
+        Error_Handler();
+    }
+    __HAL_LINKDMA(hspi, hdmatx, hdma_spi1_tx);
+    /* SPI1 RX DMA: DMA1 Channel2, CSELR C2S=0001 (DMA_REQUEST_1) -> SPI1_RX
+       per RM0351 Table 46. */
+    hdma_spi1_rx.Instance = DMA1_Channel2;
+    hdma_spi1_rx.Init.Request = DMA_REQUEST_1;   /* CSELR C2S=0001 -> SPI1_RX */
+    hdma_spi1_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_spi1_rx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_spi1_rx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_spi1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_spi1_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_spi1_rx.Init.Mode = DMA_NORMAL;
+    hdma_spi1_rx.Init.Priority = DMA_PRIORITY_VERY_HIGH;
+    if (HAL_DMA_Init(&hdma_spi1_rx) != HAL_OK) {
+        Error_Handler();
+    }
+    __HAL_LINKDMA(hspi, hdmarx, hdma_spi1_rx);
+    /* DMA completion is IRQ-driven: the TC IRQs below feed HAL_DMA_IRQHandler,
+       which runs the SPI DMA callbacks that return the handle to READY.
+       radiolib_hal.cpp (real-DMA spiTransfer via HAL_SPI_TransmitReceive_DMA)
+       blocks on HAL_SPI_GetState() with a bounded timeout. Priority 5 =
+       configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY; the handler makes no
+       FreeRTOS calls, so this is safe under the kernel priority rules. */
+    HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+    HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
     /* USER CODE END SPI1_MspInit 0 */
     /* Peripheral clock enable */
     __HAL_RCC_SPI1_CLK_ENABLE();
@@ -364,7 +414,19 @@ void HAL_SPI_MspDeInit(SPI_HandleTypeDef* hspi)
   if(hspi->Instance==SPI1)
   {
     /* USER CODE BEGIN SPI1_MspDeInit 0 */
-
+    /* Release the SPI1 DMA channels: disable their IRQs first (no handler
+       may fire mid-teardown), then de-init the handles. NULL-guarded so a
+       DeInit without a prior Init is safe. */
+    HAL_NVIC_DisableIRQ(DMA1_Channel2_IRQn);
+    HAL_NVIC_DisableIRQ(DMA1_Channel3_IRQn);
+    if (hspi->hdmarx != NULL) {
+        HAL_DMA_DeInit(hspi->hdmarx);
+        hspi->hdmarx = NULL;
+    }
+    if (hspi->hdmatx != NULL) {
+        HAL_DMA_DeInit(hspi->hdmatx);
+        hspi->hdmatx = NULL;
+    }
     /* USER CODE END SPI1_MspDeInit 0 */
     /* Peripheral clock disable */
     __HAL_RCC_SPI1_CLK_DISABLE();
