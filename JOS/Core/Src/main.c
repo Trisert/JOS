@@ -184,6 +184,12 @@ int main(void)
      bounded — never from the MemManage handler itself. Done before the boot
      CRC policy below, which may reset and never return. */
   (void)mpu_fault_log_flush();
+  /* HIGH (RTOS safety): commit a heap-exhaustion record staged by
+     fault_log_malloc_failed() on the previous run. Task-level boot
+     context, where the pool mutex and Flash programming are legal -
+     never from vApplicationMallocFailedHook() itself. Before the boot
+     CRC policy below, which may reset and never return. */
+  (void)fault_malloc_flush();
   hw_watchdog_kick();
 
   /* Act on the integrity result now that the fault can be persisted.

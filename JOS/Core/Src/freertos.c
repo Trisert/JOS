@@ -44,7 +44,10 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-
+/* Anti-recursion latch for vApplicationMallocFailedHook(): with the heap
+exhausted, a second failure while handling the first must reset, not
+re-enter. .bss, re-zeroed by startup on the way back up. */
+static volatile uint32_t s_malloc_hook_active = 0U;
 /* USER CODE END Variables */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -106,11 +109,34 @@ void vApplicationMallocFailedHook(void)
    to query the size of free heap space that remains (although it does not
    provide information on how the remaining heap might be fragmented). */
 
-   /* Fault containment (NASA-STD-8739.8), same pattern as
-      vApplicationStackOverflowHook() above: a heap exhaustion is never
-      silent. fault_log_malloc_failed() records the heap watermarks in the
-      LastStates pool and reboots into a known-good state - this call does
-      not return. */
+   /* Fault containment (NASA-STD-8739.8): a heap exhaustion is never
+      silent. With the heap exhausted nothing here may block or allocate,
+      so every unsafe context resets immediately and the normal path
+      stages the heap watermarks in a reset-persistent slot and reboots
+      (fault_malloc_flush() persists the slot to LastStates at task
+      level on the next boot). None of the exits below return. */
+   if (s_malloc_hook_active != 0U)
+   {
+      /* Re-entry while handling the first failure: reset, do not recurse. */
+      NVIC_SystemReset();
+      for (;;) {}
+   }
+   s_malloc_hook_active = 1U;
+   if (__get_IPSR() != 0U)
+   {
+      /* ISR context: pvPortMalloc() never runs in handler mode, so the
+         heap watermarks may be mid-update and no hook contract holds. */
+      NVIC_SystemReset();
+      for (;;) {}
+   }
+   if (xTaskGetSchedulerState() == taskSCHEDULER_SUSPENDED)
+   {
+      /* Suspended scheduler: a mutex holder could never run to release
+         its lock, so even the deferred path is skipped - the reset is
+         the containment either way. */
+      NVIC_SystemReset();
+      for (;;) {}
+   }
    fault_log_malloc_failed();
 }
 /* USER CODE END 5 */
