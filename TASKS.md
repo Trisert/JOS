@@ -61,6 +61,8 @@ It replaces the old Hermes kanban board (SQLite), which was archived on
 | 31 | done | **TEMP 1-wire PB2 + DEPLOY/LoRa_NRST mux PB1 (SPF §3.7.5.3.1)** → PR #72 `fix/deploy-temp-pins`: driver temp.c/h, deploy_sense.c/h, .ioc+main.h, 161/161 test. | [#72](https://github.com/Trisert/JOS/pull/72) | Subagent review: APPROVE (timing AN187 ok, mux sicuro, GPIO liberi). Nit: break vs continue su CRC, poll ~100ms task-only. |
 | 32 | done | **Subagent reviews (criterio 3)**: #70 APPROVE, #63 APPROVE (rework 4711d61; Kilo pending), #72 APPROVE, #68 APPROVE, #69 REQUEST-CHANGES→fixato `cr=8` (`af29496`), #73 APPROVE (rework 414ae83 riverificato; Kilo pending). | — | #63 mergiabile (Kilo pending). |
 | 33 | done | **FRAM full-size 128KB/chip (512KB)** → PR #73: rework `414ae83` APPROVE (reviewer ha riverificato build+147/147). | [#73](https://github.com/Trisert/JOS/pull/73) | Resta: strapping A2/A1 (Nicola) + Kilo. |
+| 34 | doing | **TRIGGER_TASK_COMPLETE s4→s3** → PR #74: trigger esisteva (=5), aggiunto branch ACTIVE→READY + 6 test, 150/150. | [#74](https://github.com/Trisert/JOS/pull/74) | Review in corso. |
+| 35 | doing | **HMAC uplink (design upstream)** → PR #75: TAG32, enforce default, sha256 KAT, 168/168. Deferred: ECC, ACK/NACK, replay, provisioning. | [#75](https://github.com/Trisert/JOS/pull/75) | Review sicurezza in corso. |
 
 *Ultimo aggiornamento: 2026-09-08 — Verifica SPF V3 avanzata: T32 ✅, T33 ✅(PR #63), T34 ✅(gap report), T35 ✅, T-PAY ✅(11 gap), T-AOCS ✅(gap molto ampi), T-COMMS ✅(5 gap incluso bug CR=4/9), T-SM ✅( TRIGGER_TASK_COMPLETE mancante). Issues #68-#70 create. Bloccati su decisioni utente (FRAM bus), merge PR #63, fix CR=4/9, DMA IRQ.*
 
