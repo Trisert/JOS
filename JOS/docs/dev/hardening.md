@@ -3,7 +3,7 @@
 Goal: bring the RedPill (JOS) on-board software to a hardened, space-ready /
 QM-ready state for ESA Fly Your Satellite! 4. Target: STM32L496VGTx
 (Cortex-M4 @ 80 MHz, 1 MB dual-bank flash, 320 KB SRAM — 256 KB SRAM1 +
-64 KB SRAM2 with parity, 4× FM24VN10-G FRAM on I²C2 = 64 KB total (4 × 16 KB)).
+64 KB SRAM2 with parity, 4× FM24VN10-G FRAM on I²C1 (PB8/PB9) = 64 KB total (4 × 16 KB)).
 
 Every recommendation below cites the standard that motivates it:
 

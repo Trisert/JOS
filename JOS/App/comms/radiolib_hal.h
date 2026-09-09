@@ -15,10 +15,13 @@
  *
  * PIN MAPPING — JOS uses a SEPARATE COMMS board (LoRa1268F30 module) wired to the
  * OBC through a 20-pin connector. Signal names are from RED_SPF_V3 (pag 90/95).
- * LoRa_NRST is resolved from the OBC V2.0 netlist: PB1, shared with
- * DEPLOY_SENSE (SPF pag 95; canonical defines in Core/Inc/main.h). The three
- * bindings below are still PLACEHOLDERS waiting on the OBC schematic
- * (SharePoint J2050): CS_TTC, LoRa_Busy, GPIO_INT.
+ * OBC V2.0 netlist assignments (canonical defines in Core/Inc/main.h):
+ *   CS_TTC    = PA4 (SPI1 NSS, adjacent to PA5/6/7)
+ *   LoRa_Busy = PC4 (plain input, no EXTI)
+ *   GPIO_INT  = PB0 / EXTI0, rising (SX1268 DIO1: TX_DONE/RX_DONE)
+ *   LoRa_NRST = PB1, shared with DEPLOY_SENSE (SPF pag 95).
+ * PB6/PB7 are USART1_TX/RX and PD12/PD13 are I2C4_SCL/SDA per the netlist,
+ * so the radio pins must stay off those lines.
  *
  * Special constraint (SPF pag 95): LoRa_NRST shares ONE OBC GPIO with DEPLOY_SENSE
  * (antenna deployment switch). The OBC must toggle that pin between input+pull-up
@@ -43,12 +46,12 @@
  * LoRa_NRST is NOT defined here: it is LoRa_NRST_GPIO_Port/LoRa_NRST_Pin from
  * main.h (PB1, MULTIPLEXED w/ DEPLOY_SENSE, COMMS conn pin 4).
  */
-#define CS_TTC_GPIO_Port    GPIOA          /* TODO: real port from OBC schematic */
-#define CS_TTC_Pin          GPIO_PIN_4     /* TODO: real pin  from OBC schematic */
-#define LoRa_Busy_GPIO_Port GPIOB          /* TODO */
-#define LoRa_Busy_Pin       GPIO_PIN_6     /* TODO */
-#define GPIO_INT_GPIO_Port  GPIOD          /* TODO (must be an EXTI line) */
-#define GPIO_INT_Pin        GPIO_PIN_13    /* TODO (must be an EXTI line) */
+#define CS_TTC_GPIO_Port    GPIOA          /* SPI1 NSS, OBC V2.0 netlist */
+#define CS_TTC_Pin          GPIO_PIN_4
+#define LoRa_Busy_GPIO_Port GPIOC          /* SX1268 BUSY -> PC4 */
+#define LoRa_Busy_Pin       GPIO_PIN_4
+#define GPIO_INT_GPIO_Port  GPIOB          /* SX1268 DIO1 -> PB0 / EXTI0 */
+#define GPIO_INT_Pin        GPIO_PIN_0
 
 /* SPI instance used for the radio (SPF pag 77: OBC<->SX1268 on SPI1). */
 extern SPI_HandleTypeDef hspi1;

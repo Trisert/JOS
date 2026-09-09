@@ -112,6 +112,16 @@ void hw_watchdog_init(void)
 
 void hw_watchdog_kick(void)
 {
+    /* External watchdog (OBC V2.0 STWD100YNYWY3F, WDI <- PC15 / net WD_IN,
+       WDO -> NRST): the STWD100 resets the board via NRST unless WDI toggles
+       within tWD, so a steady level is not enough - every kick must produce
+       an edge. Direct ODR toggle keeps this HAL-free like the IWDG sequence
+       above (safe from task, ISR and exception context alike) and is harmless
+       before MX_GPIO_Init() enables the GPIOC clock. Enable/disable is the
+       JP1 hardware strap (A-C = on, B-C = off); see EXT_WD_* in main.h.
+       Kick budget: the monitor task kicks every 500 ms, within the STWD100-Y
+       tWD minimum (1.12 s), with ~2x margin on the worst case. */
+    GPIOC->ODR ^= GPIO_ODR_OD15;
     if (s_running != 0U) {
         /* A single store to a write-only key register: no read-modify-write,
            no poll, no HAL_GetTick(). Safe from task, ISR and exception context

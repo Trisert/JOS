@@ -251,18 +251,33 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   }
 }
 
-/* SX1268 DIO1 (GPIO_INT) ISR hook. The radio raises DIO1 on TX_DONE / RX_DONE;
-   we forward it to the RadioLib driver, which signals the waiting TX or RX task
-   via osThreadFlagsSet (ISR-safe). The pin/EXTI line is a placeholder until the
-   OBC schematic maps GPIO_INT to a real EXTI-capable GPIO (see B0). */
+/* SX1268 DIO1 ISR hook (OBC V2.0 netlist: PB0/EXTI0, rising).
+   The radio raises DIO1 on TX_DONE / RX_DONE; we forward it to the RadioLib
+   driver, which signals the waiting TX or RX task via osThreadFlagsSet.
+ *
+   FreeRTOS priority verification: lora_on_dio1_irq() calls osThreadFlagsSet(),
+   which is ISR-safe ONLY from interrupts at or below the syscall ceiling, i.e.
+   with a numeric priority >= configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY (5
+   in Core/Inc/FreeRTOSConfig.h, group 4). LORA_DIO1_IRQ_PRIO is set to 5 in
+   Core/Inc/main.h and programmed in MX_GPIO_Init(); the static assert below
+   fails the build if either side ever drifts above the ceiling.
+   (Higher urgency = lower number: 0..4 must NEVER call any FreeRTOS API.) */
+#include "FreeRTOSConfig.h"
+_Static_assert(LORA_DIO1_IRQ_PRIO >= configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY,
+               "LORA_DIO1_IRQ_PRIO must stay at/below the FreeRTOS syscall ceiling");
 extern void lora_on_dio1_irq(void);
+
+void EXTI0_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(LORA_DIO1_Pin);
+}
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    /* GPIO_INT_Pin is defined in radiolib_hal.h (placeholder until B0 closes).
-       Mirror its current value here to avoid pulling the RadioLib HAL into this
-       ISR translation unit. Keep the two in sync. */
-    if (GPIO_Pin == GPIO_PIN_13) {
+    /* LORA_DIO1_Pin is defined in main.h (mirrored from radiolib_hal.h
+       GPIO_INT_Pin to avoid pulling the C++ RadioLib HAL into this ISR
+       translation unit). Keep the two in sync. */
+    if (GPIO_Pin == LORA_DIO1_Pin) {
         lora_on_dio1_irq();
     }
 }

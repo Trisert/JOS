@@ -79,6 +79,30 @@ void Error_Handler(void);
 #define LoRa_NRST_GPIO_Port    GPIOB
 #define LoRa_NRST_Pin          GPIO_PIN_1
 
+/* OBC V2.0 netlist, COMMS/SX1268 side (see App/comms/radiolib_hal.h):
+ *   DIO1 (SX1268 IRQ, TX_DONE/RX_DONE) = PB0 on EXTI line 0. EXTI0 has a
+ *     dedicated vector (EXTI0_IRQHandler); no other pin numbered 0 is used,
+ *     so the line cannot collide by construction. Rising edge, NVIC priority
+ *     LORA_DIO1_IRQ_PRIO (see Core/Src/stm32l4xx_it.c for the FreeRTOS
+ *     ceiling verification).
+ *   LoRa_Busy (SX1268 BUSY) = PC4, plain input (no EXTI consumed). */
+#define LORA_DIO1_GPIO_Port    GPIOB
+#define LORA_DIO1_Pin          GPIO_PIN_0
+#define LORA_DIO1_EXTI_IRQn    EXTI0_IRQn
+#define LORA_DIO1_IRQ_PRIO     5
+#define LORA_BUSY_GPIO_Port    GPIOC
+#define LORA_BUSY_Pin          GPIO_PIN_4
+
+/* OBC V2.0 external watchdog STWD100 (WD1): WDI <- PC15 (net WD_IN),
+ * WDO -> NRST. hw_watchdog_kick() toggles PC15 on every kick (a steady level
+ * is NOT enough: the STWD100 needs an edge within tWD).
+ * WD_EN (WD1 pin ~EN) is a HARDWARE STRAP on JP1, not an MCU GPIO:
+ *   JP1 A-C (3.3V) = watchdog enabled, JP1 B-C (GND) = watchdog disabled.
+ * LSE is OFF in this build (MSI+PLL clock tree), so PC15 (OSC32_OUT) is
+ * usable as plain GPIO. */
+#define EXT_WD_GPIO_Port       GPIOC
+#define EXT_WD_Pin             GPIO_PIN_15
+
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

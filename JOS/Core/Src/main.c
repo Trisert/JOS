@@ -36,6 +36,7 @@
 #include "hw_watchdog.h"
 #include "sram2_parity.h"
 #include "seu_mitigation.h"
+#include "usart1_dbg.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -58,6 +59,7 @@ ADC_HandleTypeDef hadc1;
 
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
+I2C_HandleTypeDef hi2c4;
 
 SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
@@ -81,6 +83,7 @@ static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
+static void MX_I2C4_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_TIM1_Init(void);
@@ -141,6 +144,8 @@ int main(void)
   MX_ADC1_Init();
   MX_I2C1_Init();
   MX_I2C2_Init();
+  MX_I2C4_Init();
+  usart1_dbg_init();
   MX_SPI1_Init();
   MX_SPI2_Init();
   MX_TIM1_Init();
@@ -193,8 +198,9 @@ int main(void)
      call does not return in that case. When the budget is exhausted we keep
      booting with the image marked untrusted, which confines the state machine
      to STATE_CRIT (beacon-only, payloads inhibited) so ground can re-upload.
-     Deliberately never Error_Handler(): with no IWDG configured its
-     __disable_irq(); while(1) would be an unrecoverable brick. */
+     Deliberately never Error_Handler(): its __disable_irq(); while(1) would
+     strand the boot until the IWDG backstop fires instead of recovering
+     promptly under the bounded boot-CRC policy. */
   boot_crc_apply_policy();
 
   /* SPF 3.7.5.3.1 p.95 pins: PB1 mux to reset-idle, then enumerate the 4x
@@ -374,7 +380,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.DMAContinuousRequests = DISABLE;
-  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
   hadc1.Init.OversamplingMode = DISABLE;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
@@ -393,7 +399,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_4;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
@@ -503,6 +509,58 @@ static void MX_I2C2_Init(void)
 
 }
 
+/* OBC V2.0 netlist: I2C4 on PD12 (SCL) / PD13 (SDA) is the external
+   * bus to J6 pins 6/7. No App driver claims it yet; the CubeMX init keeps
+   * pins/clocks owned so a future driver cannot collide with USART1/I2C1. */
+static void MX_I2C4_Init(void)
+{
+
+  /* USER CODE BEGIN I2C4_Init 0 */
+
+  /* USER CODE END I2C4_Init 0 */
+
+  /* USER CODE BEGIN I2C4_Init 1 */
+
+  /* USER CODE END I2C4_Init 1 */
+  hi2c4.Instance = I2C4;
+  hi2c4.Init.Timing = 0x10D19CE4;
+  hi2c4.Init.OwnAddress1 = 0;
+  hi2c4.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c4.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c4.Init.OwnAddress2 = 0;
+  hi2c4.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c4.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c4.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c4, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c4, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C4_Init 2 */
+
+  /* USER CODE END I2C4_Init 2 */
+
+}
+
+/**
+  * OBC V2.0 netlist: USART1 on PB6 (TX) / PB7 (RX) to J6 pins 17/18
+  * (umbilical debug/telemetry, 115200-8-N-1). Initialised by
+  * usart1_dbg_init() (Core/Src/usart1_dbg.c, register-level: the HAL
+  * UART/USART drivers are not vendored) — see the call in main().
+  */
 /**
   * @brief SPI1 Initialization Function
   * @param None

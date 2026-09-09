@@ -26,12 +26,14 @@
  * forensics and for re-upload from ground.
  *
  * ---------------------------------------------------------------------------
- * HOW A FAILING BOOT ACTUALLY REACHES THE THRESHOLD  (no IWDG in this build)
+ * HOW A FAILING BOOT ACTUALLY REACHES THE THRESHOLD
  *
- * RedPill has no independent watchdog running yet (HAL_IWDG_MODULE_ENABLED is
- * off and the software watchdog only monitors task liveness), so nothing
- * external can reset a spinning fault handler. The fault handlers therefore
- * drive the reset themselves:
+ * Two independent backstops bound a failing boot (see Core/Inc/hw_watchdog.h):
+ * the IWDG (~31 s, started in main() before HAL_Init()) and the external
+ * STWD100 on PC15/WD_IN (WDO -> NRST, JP1 strap). Either resets a spinning
+ * fault handler on its own. The fault handlers still drive the reset
+ * themselves instead of waiting ~31 s per boot, so the threshold is reached
+ * promptly rather than after half a minute of silence per iteration:
  *
  *   fault -> dual_bank_handle_boot_fault()
  *              -> dual_bank_mark_boot_fault()   (RAM scratch, ISR-safe)
@@ -240,7 +242,8 @@ void dual_bank_mark_boot_fault(void);
 /* Full fault-handler action: record the fault and reset the device so the
  * next boot can persist and act on the evidence. Does not return (it either
  * resets or, with -DDUAL_BANK_FAULT_NO_RESET, spins for the debugger).
- * This is what makes the boot-fault threshold reachable without an IWDG. */
+ * Prompt self-reset is what makes the boot-fault threshold reachable without
+ * waiting out the ~31 s IWDG backstop on every failing boot. */
 void dual_bank_handle_boot_fault(void);
 
 /* Declare this boot successful: clears the RAM scratch and, if faults had

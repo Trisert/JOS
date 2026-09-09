@@ -407,14 +407,14 @@ void dual_bank_handle_boot_fault(void)
         __NOP();
     }
 #else
-    /* Flight behaviour. There is no IWDG in this build, so a fault handler
-     * that spins is a permanently silent spacecraft: nothing would ever reset
-     * us, dual_bank_init() would never run again, the evidence would never be
-     * persisted and the threshold could never be reached. Reset ourselves
-     * instead — the RAM scratch survives NVIC_SystemReset(), the next boot
-     * writes it to LastStates, and DUAL_BANK_BOOT_FAULT_THRESHOLD failed boots
-     * arm the golden-image fallback. A reset loop is recoverable (and visible
-     * from ground through the LastStates log); a frozen OBSW is not. */
+    /* Flight behaviour. The IWDG (~31 s) and the external STWD100 would reset
+     * a spinning fault handler on their own (see Core/Inc/hw_watchdog.h), but
+     * waiting out that backstop on every failing boot would reach the threshold
+     * only after minutes of silence per iteration. Reset ourselves instead —
+     * the RAM scratch survives NVIC_SystemReset(), the next boot writes it to
+     * LastStates, and DUAL_BANK_BOOT_FAULT_THRESHOLD failed boots arm the
+     * golden-image fallback. A reset loop is recoverable (and visible from
+     * ground through the LastStates log); a frozen OBSW is not. */
     __DSB();
     __ISB();
     NVIC_SystemReset();

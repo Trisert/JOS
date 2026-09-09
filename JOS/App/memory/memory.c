@@ -21,8 +21,9 @@
 #include <stdint.h>
 
 /* ========== FRAM driver (I2C) ==========
- * Per RED_DES_ElectronicArchitecture_V1:
- *   4x FM24VN10-G on the OBC PCB, on I2C2.
+ * Per OBC V2.0 netlist:
+ *   4x FM24VN10-G on the OBC PCB, on I2C1 (PB8/PB9, I2C1_SCL/SDA_FRAM);
+ *   I2C2 (PB10/PB11) is the CAM bus.
  *
  * Device-select (7-bit) addresses: 0x50, 0x51, 0x52, 0x53 (A0/A1 pins).
  * The driver addresses ONE 16 KB window per device select, using the 16-bit
@@ -77,7 +78,7 @@ _Static_assert(FM24VN_CHIP_SIZE == (1UL << FM24VN_CHIP_SIZE_LOG2),
 _Static_assert(FRAM_SIZE == (64UL * 1024UL),
                "FRAM_SIZE must be 64 KB (4 x 16 KB) per RED_DES_ElectronicArchitecture_V1");
 
-extern I2C_HandleTypeDef hi2c2;
+extern I2C_HandleTypeDef hi2c1;
 
 /* The STM32 HAL I2C entry points take the device address ALREADY shifted left
  * by one (the 8-bit device-select byte, R/W bit clear). The FM24VN10-G parts
@@ -107,7 +108,7 @@ int fram_read(uint32_t addr, uint8_t *buf, size_t len)
     uint16_t dev_addr = fram_addr_to_chip(addr);
     uint16_t offset = fram_addr_to_offset(addr);
 
-    if (HAL_I2C_Mem_Read(&hi2c2, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
+    if (HAL_I2C_Mem_Read(&hi2c1, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
                          buf, (uint16_t)len, 1000) != HAL_OK)
         return -1;
     return 0;
@@ -120,7 +121,7 @@ int fram_write(uint32_t addr, const uint8_t *buf, size_t len)
     uint16_t dev_addr = fram_addr_to_chip(addr);
     uint16_t offset = fram_addr_to_offset(addr);
 
-    if (HAL_I2C_Mem_Write(&hi2c2, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
+    if (HAL_I2C_Mem_Write(&hi2c1, dev_addr, offset, I2C_MEMADD_SIZE_16BIT,
                           (uint8_t *)buf, (uint16_t)len, 1000) != HAL_OK)
         return -1;
     return 0;
