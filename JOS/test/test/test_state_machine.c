@@ -37,6 +37,11 @@
  * this typedef fails the build if the value ever drifts. */
 typedef char trigger_task_complete_value_is_5[(TRIGGER_TASK_COMPLETE == 5) ? 1 : -1];
 
+/* bms_set_soc_stub() lives in state_machine.c but is not part of the public
+ * header (flight code never calls it); declared here for the CRIT-recovery
+ * tests below. */
+extern void bms_set_soc_stub(uint8_t soc);
+
 /* ---------- Minimal RTOS double (no scheduler on the host) ---------- */
 static uint8_t  fake_mutex_obj;
 static uint8_t  fake_thread_obj;
@@ -269,4 +274,224 @@ void test_task_create_registers_with_watchdog(void)
     TEST_ASSERT_EQUAL_INT(1, wdg_reg_calls);
     TEST_ASSERT_EQUAL_PTR(h, wdg_handle);
     TEST_ASSERT_EQUAL_UINT32(100u, wdg_period_ms);
+}
+
+/* ---------- INIT / OFF target rules ---------- */
+
+/* INIT is boot bookkeeping only: reachable from OFF, refused anywhere else. */
+void test_init_from_non_off_is_refused(void)
+{
+    boot_to_ready();
+
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_INIT,
+                                                               TRIGGER_BOOT));
+    TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
+}
+
+/* OFF can never be a transition target in flight. */
+void test_off_target_is_refused(void)
+{
+    boot_to_ready();
+
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_OFF,
+                                                      TRIGGER_BATTERY_LOW));
+    TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
+}
+
+/* ---------- CRIT recovery paths ---------- */
+
+/* Walk to CRIT (safe mode) from an active payload operation. */
+static void boot_to_crit(void)
+{
+    boot_to_active();
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_CRIT,
+                                                      TRIGGER_BATTERY_LOW));
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
+}
+
+/* s2->s3: battery recovered (default stub SoC 100 >= b_opok 80). */
+void test_crit_recovery_to_ready_when_soc_ok(void)
+{
+    boot_to_crit();
+
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_READY,
+                                                        TRIGGER_BATTERY_OK));
+    TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
+}
+
+/* s2->s3 stays refused while the battery is still low, and opens once the
+ * SoC recovers. Also exercises bms_set_soc_stub(). */
+void test_crit_recovery_to_ready_refused_when_soc_low(void)
+{
+    boot_to_crit();
+
+    bms_set_soc_stub(50u);
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_READY,
+                                                        TRIGGER_BATTERY_OK));
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
+
+    bms_set_soc_stub(100u);
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_READY,
+                                                        TRIGGER_BATTERY_OK));
+    TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
+}
+
+/* s2->s4: a ground command resumes ops once the battery is stable. */
+void test_crit_to_active_on_ground_cmd_when_soc_ok(void)
+{
+    boot_to_crit();
+
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_ACTIVE,
+                                                       TRIGGER_GROUND_CMD));
+    TEST_ASSERT_EQUAL_INT(STATE_ACTIVE, (int)state_machine_get_state());
+}
+
+/* s2->s4 needs BOTH a stable battery AND the ground-command trigger. */
+void test_crit_to_active_refused_when_soc_low_or_wrong_trigger(void)
+{
+    boot_to_crit();
+
+    bms_set_soc_stub(10u);
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_ACTIVE,
+                                                       TRIGGER_GROUND_CMD));
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
+
+    bms_set_soc_stub(100u);
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_ACTIVE,
+                                                   TRIGGER_TASK_COMPLETE));
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
+}
+
+/* ---------- Confinement gates ---------- */
+
+/* While the running image is untrusted, nominal targets are refused; only
+ * the INIT boot bookkeeping and the CRIT safe state stay reachable. */
+void test_untrusted_image_confines_to_crit_and_init(void)
+{
+    host_fw_crc_stamp(HOST_FW_IMAGE_CRC ^ 0xDEADBEEFu);
+    TEST_ASSERT_EQUAL_INT(BOOT_CRC_MISMATCH, boot_crc_verify());
+    TEST_ASSERT_EQUAL_INT(0, boot_crc_image_trusted());
+
+    /* Nominal ops refused from OFF. */
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_READY,
+                                                      TRIGGER_ANTENNA_DONE));
+    TEST_ASSERT_EQUAL_INT(STATE_OFF, (int)state_machine_get_state());
+
+    /* Boot bookkeeping still allowed ... */
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_INIT,
+                                                              TRIGGER_BOOT));
+    /* ... but boot cannot proceed to nominal ops either. */
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_READY,
+                                                      TRIGGER_ANTENNA_DONE));
+    TEST_ASSERT_EQUAL_INT(STATE_INIT, (int)state_machine_get_state());
+
+    /* Safe state always reachable. */
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_CRIT,
+                                                 TRIGGER_IMAGE_CRC_FAIL));
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
+
+    /* Re-trust the image: the confined OBSW recovers nominally. */
+    host_fw_crc_stamp(HOST_FW_IMAGE_CRC);
+    TEST_ASSERT_EQUAL_INT(BOOT_CRC_OK, boot_crc_verify());
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_READY,
+                                                        TRIGGER_BATTERY_OK));
+    TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
+}
+
+/* A Flash failure under the LastStates write refuses the transition WITHOUT
+ * moving state: the record is the evidence, not a side effect. */
+void test_transition_fails_when_laststates_persistence_fails(void)
+{
+    boot_to_ready();
+
+    host_flash_fail_program_after(0u);
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_ACTIVE,
+                                                       TRIGGER_GROUND_CMD));
+    TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
+}
+
+/* ---------- Beacon cadence ---------- */
+
+/* Per-state default beacon intervals, including the fail-safe default arm. */
+void test_beacon_interval_defaults_per_state(void)
+{
+    /* OFF hits the default arm (fail-safe: beacon like CRIT). */
+    TEST_ASSERT_EQUAL_UINT32(BEACON_INTERVAL_CRIT,
+                             state_machine_get_beacon_interval());
+
+    boot_to_ready();
+    TEST_ASSERT_EQUAL_UINT32(BEACON_INTERVAL_READY,
+                             state_machine_get_beacon_interval());
+
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_ACTIVE,
+                                                       TRIGGER_GROUND_CMD));
+    TEST_ASSERT_EQUAL_UINT32(BEACON_INTERVAL_ACTIVE,
+                             state_machine_get_beacon_interval());
+
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_CRIT,
+                                                      TRIGGER_BATTERY_LOW));
+    TEST_ASSERT_EQUAL_UINT32(BEACON_INTERVAL_CRIT,
+                             state_machine_get_beacon_interval());
+}
+
+/* Ground-commanded override: accepted in-band, 0 clears it, out-of-band is
+ * rejected with the cadence left intact (fail-safe). */
+void test_beacon_interval_override_accept_reject(void)
+{
+    boot_to_ready();
+
+    TEST_ASSERT_EQUAL_INT(0, state_machine_set_beacon_interval(60000u));
+    TEST_ASSERT_EQUAL_UINT32(60000u, state_machine_get_beacon_interval());
+
+    TEST_ASSERT_EQUAL_INT(0, state_machine_set_beacon_interval(0u));
+    TEST_ASSERT_EQUAL_UINT32(BEACON_INTERVAL_READY,
+                             state_machine_get_beacon_interval());
+
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_set_beacon_interval(
+                                  (uint32_t)(BEACON_INTERVAL_MIN - 1u)));
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_set_beacon_interval(
+                                  (uint32_t)(BEACON_INTERVAL_MAX + 1u)));
+    TEST_ASSERT_EQUAL_UINT32(BEACON_INTERVAL_READY,
+                             state_machine_get_beacon_interval());
+}
+
+/* The SEU-scrub hook publishes the critical struct extent; a NULL len is
+ * accepted (size unknown, address still valid). */
+void test_critical_region_reports_extent(void)
+{
+    size_t len = 0u;
+    void  *p   = state_machine_critical_region(&len);
+
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_TRUE(len > 0u);
+    TEST_ASSERT_NOT_NULL(state_machine_critical_region(NULL));
+}
+
+/* ---------- Scrub write-through seams (same binary, same FRAM model) --- */
+
+/* Fresh boot, golden copy never synced: scrub_init() reports the missing
+ * backup instead of restoring garbage. */
+void test_scrub_init_reports_empty_fram(void)
+{
+    TEST_ASSERT_EQUAL(SCRUB_ERR_MAGIC, scrub_init());
+}
+
+/* Unknown or unregistered region ids are rejected, never touching FRAM. */
+void test_scrub_rejects_unknown_region(void)
+{
+    TEST_ASSERT_EQUAL(SCRUB_ERR_INVALID, scrub_sync(SCRUB_MAX_REGIONS));
+    TEST_ASSERT_EQUAL(SCRUB_ERR_INVALID, scrub_sync(1u));
+    TEST_ASSERT_EQUAL(SCRUB_ERR_INVALID, scrub_refresh(SCRUB_MAX_REGIONS));
+    TEST_ASSERT_EQUAL(SCRUB_ERR_INVALID, scrub_refresh(1u));
+}
+
+/* An unbound FRAM transport is reported, not dereferenced. */
+void test_scrub_reports_unbound_fram_backend(void)
+{
+    scrub_bind_fram(NULL, NULL);
+    TEST_ASSERT_EQUAL(SCRUB_ERR_FRAM,
+                      scrub_sync(SCRUB_REGION_OBSW_STATE));
+    TEST_ASSERT_EQUAL(SCRUB_ERR_FRAM,
+                      scrub_refresh(SCRUB_REGION_OBSW_STATE));
+    scrub_bind_fram(fake_fram_read, fake_fram_write);
 }
