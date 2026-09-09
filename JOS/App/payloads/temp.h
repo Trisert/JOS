@@ -69,8 +69,8 @@ typedef struct {
 void temp_inject_ops(const temp_bus_ops_t *ops);
 
 /* Unit-test seam: bind the flight PB2 backend back after temp_inject_ops().
- * Lets a test drive pb2_reset()/pb2_write_bit()/pb2_read_bit() through the
- * HAL GPIO doubles (fakes/main.h + support/hal_stubs.c). */
+ * Lets a test exercise the flight PB2 backend (via temp_init/read) through
+ * the HAL GPIO doubles (fakes/main.h + support/hal_stubs.c). */
 void temp_restore_flight_ops(void);
 #endif
 

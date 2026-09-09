@@ -416,15 +416,16 @@ void test_read_stuck_conversion_times_out(void)
 
 /* ---------- Flight PB2 backend (via the HAL GPIO doubles) ---------- */
 
-/* The flight backend (pb2_reset/write_bit/read_bit) runs the same
- * SEARCHADDR exchange through the real HAL GPIO doubles: presence forced
- * LOW traces the all-zero ROM path, which the family check then rejects.
+/* The flight backend (pb2_reset/write_bit/read_bit) runs the same SEARCHADDR
+ * exchange through the real HAL GPIO doubles with PB2 forced to a constant 0
+ * (no slave, no pulse): the forced LOW reads as presence, then constant-0
+ * levels trace the all-zero ROM path which the family check rejects.
  * What this pins is that the backend runs end to end without a slave. */
 void test_flight_backend_search_runs_on_gpio_doubles(void)
 {
     temp_restore_flight_ops();
     host_gpio_reset();
-    host_gpio_force_input(2, 0);   /* PB2: presence pulse, then all-zero */
+    host_gpio_force_input(2, 0);   /* PB2 constant 0: presence + all-zero ROM */
     TEST_ASSERT_EQUAL_INT(0, temp_init());
     TEST_ASSERT_EQUAL_INT(0, temp_sensor_count());
 }

@@ -121,6 +121,9 @@ static comms_tc_result_t validate_auth(const uint8_t *f, size_t len)
     return comms_validate_tc_auth(f, len, &opcode, &payload, &plen);
 }
 
+/* host_lora_reset() resets the lora failure-INJECTION state (call counters +
+ * armed one-shot failures), not the radio model itself: a leftover armed
+ * failure must never leak into the next test. */
 void setUp(void)   { memset(frame_buf, 0, sizeof(frame_buf)); host_lora_reset(); }
 /* Safety net: the hang ceiling must NEVER survive past its own test case.
    The early-return path inside run_task_until_escape() longjmps into Unity
@@ -1004,9 +1007,7 @@ void test_lora_send_chunked_reports_failure_on_later_chunk(void)
                           lora_send_chunked(payload, chunk_max + 7U));
 }
 
-/* SET_CONFIG and SEND_DATA dispatch to the (still TODO) handlers: accepted
- * by the gate, no state-machine call, no reset. No mock expectations are
- * queued, so CMock fails if either frame reaches the wrong action. */
+/* SET_CONFIG and SEND_DATA are accepted by the gate (validation only). Handlers are TODO (no-op), so no mock expectations are queued. */
 void test_rx_gate_dispatches_set_config_and_send_data(void)
 {
     uint8_t payload[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };

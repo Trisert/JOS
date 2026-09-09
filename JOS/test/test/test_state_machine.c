@@ -17,7 +17,9 @@
  * public, and the RTOS double captures the entry point so a test can invoke
  * it on the host. osDelay() escapes via longjmp after N delays (boot needs
  * exactly two, the third ends the first main-loop iteration), behind a
- * SIGALRM hang ceiling shared with the test_comms.c task-loop pattern.
+ * SIGALRM hang ceiling shared with the test_comms.c task-loop pattern. The
+ * ceiling longjmps back and fails only the hanging test (never _exit: one
+ * hung test must not kill the rest of the suite).
  *
  * Refs: ECSS-E-ST-40C 5.5, NASA-STD-8739.8 (unit test evidence).
  * ------------------------------------------------------------------------- */
@@ -33,7 +35,7 @@
 #include <string.h>
 #include <setjmp.h>
 #include <signal.h>
-#include <unistd.h>             /* alarm(), STDERR_FILENO, _exit() */
+#include <unistd.h>             /* alarm(), STDERR_FILENO */
 
 /* bms_set_soc_stub() lives in state_machine.c but is not part of the public
  * header (flight code never calls it); declared here for the CRIT-recovery
@@ -41,11 +43,21 @@
 extern void bms_set_soc_stub(uint8_t soc);
 
 /* ---------- Minimal RTOS double (no scheduler on the host) ---------- */
-static uint8_t  fake_mutex_obj;
-static uint8_t  fake_thread_obj;
+/* Opaque RTOS handles are pointers: back them with pointer-sized, aligned
+ * storage so the address-to-handle conversion is well-defined on 64-bit
+ * hosts (a uint8_t backing object would invite truncation/alignment bugs
+ * the moment anyone dereferences a handle or does arithmetic on one). */
+static uintptr_t fake_mutex_obj;
+static uintptr_t fake_thread_obj;
 static uint32_t fake_tick;
 
-/* Task-body escape hatch (see the task tests at the end of this file). */
+/* Task-body escape hatch (see the task tests at the end of this file).
+ * Escape codes: the osDelay() hatch exits the task body normally, the
+ * SIGALRM hang handler aborts only the hanging test. */
+#define TASK_ESCAPE_DELAY 1
+#define TASK_ESCAPE_HANG  2
+
+static volatile sig_atomic_t task_hang_fired;
 static jmp_buf        task_escape;
 static osThreadFunc_t captured_task;
 static void          *captured_arg;
@@ -88,7 +100,7 @@ osStatus_t osDelay(uint32_t ticks)
     (void)ticks;
     delay_calls++;
     if ((delay_escape_at > 0) && (delay_calls >= delay_escape_at)) {
-        longjmp(task_escape, 1);
+        longjmp(task_escape, TASK_ESCAPE_DELAY);
     }
     return osOK;
 }
@@ -177,8 +189,9 @@ void tearDown(void)
  * of, any more than a battery recovery may). */
 
 /* Hang ceiling for the task tests: if the osDelay() escape never fires the
- * task loops forever, so SIGALRM fails loudly instead of spinning to CI's
- * job timeout (same pattern as test_comms.c). */
+ * task loops forever, so SIGALRM aborts just that test via longjmp instead
+ * of spinning to CI's job timeout (same pattern as test_comms.c, but scoped
+ * to the failing test — never _exit()). */
 #define TASK_HANG_SECS 30
 
 static void task_hang_handler(int sig)
@@ -188,7 +201,11 @@ static void task_hang_handler(int sig)
                        "osDelay() escape never fired?\n";
     ssize_t ignored = write(STDERR_FILENO, msg, sizeof(msg) - 1);
     (void)ignored;
-    _exit(2);
+    /* Fail just this test: longjmp back to run_task_until_delay(), which
+     * reports via TEST_FAIL_MESSAGE. Never _exit() here — one hung test
+     * must not kill the rest of the suite. */
+    task_hang_fired = 1;
+    longjmp(task_escape, TASK_ESCAPE_HANG);
 }
 
 /* Create the task (public API, captures the entry point) and run its body
@@ -198,22 +215,29 @@ static void task_hang_handler(int sig)
 static void run_task_until_delay(int escape_at)
 {
     osThreadId_t h = state_machine_task_create();
+    int esc;
 
     TEST_ASSERT_NOT_NULL(h);
     TEST_ASSERT_NOT_NULL(captured_task);
 
     delay_calls     = 0;
     delay_escape_at = escape_at;
+    task_hang_fired = 0;
     (void)signal(SIGALRM, task_hang_handler);
     alarm(TASK_HANG_SECS);
 
-    if (setjmp(task_escape) == 0) {
+    esc = setjmp(task_escape);
+    if (esc == 0) {
         captured_task(captured_arg);
         TEST_FAIL_MESSAGE("state-machine task returned - it must not exit");
     }
 
     alarm(0);
     delay_escape_at = -1;
+    if ((esc == TASK_ESCAPE_HANG) || (task_hang_fired != 0)) {
+        TEST_FAIL_MESSAGE("state-machine task hung - osDelay() escape never "
+                          "fired (hang ceiling)");
+    }
     TEST_ASSERT_EQUAL_INT(escape_at, delay_calls);
 }
 

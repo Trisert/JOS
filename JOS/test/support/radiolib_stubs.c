@@ -70,7 +70,9 @@ int  lora_tx_wait_done(uint32_t timeout_ms)
     return 0;
 }
 
-/* Fail the n-th upcoming call (1 = the very next one); n <= 0 disarms. */
+/* Arm a one-shot failure on a RELATIVE call count: n = 1 fails the very next
+ * lora_tx()/lora_tx_wait_done() call ("next call", not absolute call #n);
+ * n = 2 the one after that. n <= 0 disarms. */
 void host_lora_fail_tx_on_call(int n)
 {
     tx_fail_at = (n > 0) ? tx_calls + n : -1;
