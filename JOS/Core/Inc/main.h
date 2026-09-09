@@ -64,6 +64,21 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN Private defines */
 
+/* OBC V2.0 netlist assignments (SPF v3 3.7.5.3.1 p.95):
+ *   TEMP_GPIO_IN  = 4x TMP1827 SDQ on ONE 1-wire bus -> PB2 (pin 37)
+ *   DEPLOY_SENSE / LoRa_NRST multiplexed on ONE GPIO -> PB1
+ * PB4 is NJTRST (excluded), PA4 is FRAM CS, NRST is the MCU hardware reset
+ * (not a GPIO — do not touch). */
+#define TEMP_1WIRE_GPIO_Port   GPIOB
+#define TEMP_1WIRE_Pin         GPIO_PIN_2
+#define DEPLOY_SENSE_GPIO_Port GPIOB
+#define DEPLOY_SENSE_Pin       GPIO_PIN_1
+/* LoRa_NRST shares the PB1 GPIO with DEPLOY_SENSE: output for the SX1268
+ * reset (active low) vs input + pull-up for the deploy-switch read.
+ * Never both at once — see App/comms/deploy_sense.h ownership rule. */
+#define LoRa_NRST_GPIO_Port    GPIOB
+#define LoRa_NRST_Pin          GPIO_PIN_1
+
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

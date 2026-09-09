@@ -29,6 +29,8 @@
 #include "bms.h"
 #include "memory.h"
 #include "comms.h"
+#include "deploy_sense.h"
+#include "temp.h"
 #include "faults.h"
 #include "mpu.h"
 #include "hw_watchdog.h"
@@ -195,6 +197,11 @@ int main(void)
      __disable_irq(); while(1) would be an unrecoverable brick. */
   boot_crc_apply_policy();
 
+  /* SPF 3.7.5.3.1 p.95 pins: PB1 mux to reset-idle, then enumerate the 4x
+     TMP1827 on PB2. temp_init() never fails the boot (no sensors on a
+     proto board just means no temperature data). */
+  deploy_mux_init();
+  (void)temp_init();
   lora_init();
   state_machine_init();
   watchdog_monitor_init();
@@ -681,6 +688,10 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_10|GPIO_PIN_12|GPIO_PIN_14, GPIO_PIN_RESET);
 
+  /*Configure GPIO pins Output Level : PB1 = DEPLOY_SENSE/LoRa_NRST mux idle
+    HIGH (radio NOT in reset); PB2 = TEMP 1-wire bus idle HIGH */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1|GPIO_PIN_2, GPIO_PIN_SET);
+
   /*Configure GPIO pins : PC0 PC1 PC2 */
   GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -701,6 +712,21 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB1 — DEPLOY_SENSE/LoRa_NRST mux, output idle HIGH */
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PB2 — TEMP 1-wire bus, open-drain with pull-up so
+    the TMP1827 devices can pull LOW; released = HIGH */
+  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PB4 PB5 */
   GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5;

@@ -89,3 +89,137 @@ void NVIC_SystemReset(void)
     TEST_FAIL_MESSAGE("NVIC_SystemReset() called: the code under test asked "
                       "for a reboot");
 }
+
+/* ---------------------------------------------------------------------------
+ * GPIO doubles — PB1 deploy mux + PB2 1-wire bus (see fakes/main.h)
+ * ------------------------------------------------------------------------- */
+
+GPIO_TypeDef fake_GPIOB = {0};
+
+/* 16 pins of port B: last init mode/pull, output latch mirror, and an input
+ * override driven by the test (-1 = no override, reads follow ODR). */
+static uint32_t gpio_mode[16];
+static uint32_t gpio_pull[16];
+static int      gpio_force[16];
+/* Latch: did this pin ever see Mode==INPUT && Pull==PULLUP since reset?
+ * Lets tests assert the deploy-read transient (input+pull-up) even though
+ * the pin is restored to output before the call returns. */
+static int      gpio_saw_in_pu[16];
+static int      gpio_initialised;
+
+static void gpio_lazy_init(void)
+{
+    if (!gpio_initialised) {
+        for (int i = 0; i < 16; i++) {
+            gpio_force[i] = -1;
+        }
+        gpio_initialised = 1;
+    }
+}
+
+static int gpio_bit_index(uint16_t pin)
+{
+    for (int i = 0; i < 16; i++) {
+        if (pin == (uint16_t)(1u << i)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void HAL_GPIO_Init(GPIO_TypeDef *port, GPIO_InitTypeDef *cfg)
+{
+    uint16_t mask;
+    (void)port;   /* single-port (GPIOB) double */
+    gpio_lazy_init();
+    if (cfg == NULL) {
+        return;
+    }
+    mask = cfg->Pin;
+    for (int i = 0; i < 16; i++) {
+        if ((mask & (uint16_t)(1u << i)) != 0u) {
+            gpio_mode[i] = cfg->Mode;
+            gpio_pull[i] = cfg->Pull;
+            if ((cfg->Mode == GPIO_MODE_INPUT) && (cfg->Pull == GPIO_PULLUP)) {
+                gpio_saw_in_pu[i] = 1;
+            }
+        }
+    }
+}
+
+void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, GPIO_PinState s)
+{
+    if (s == GPIO_PIN_SET) {
+        port->ODR |= pin;
+    } else {
+        port->ODR &= (uint32_t)(~((uint32_t)pin));
+    }
+}
+
+GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *port, uint16_t pin)
+{
+    int idx;
+    gpio_lazy_init();
+    idx = gpio_bit_index(pin);
+    if ((idx >= 0) && (gpio_force[idx] >= 0)) {
+        return (gpio_force[idx] != 0) ? GPIO_PIN_SET : GPIO_PIN_RESET;
+    }
+    return ((port->ODR & pin) != 0u) ? GPIO_PIN_SET : GPIO_PIN_RESET;
+}
+
+void host_gpio_force_input(int pin_index, int level)
+{
+    gpio_lazy_init();
+    if ((pin_index >= 0) && (pin_index < 16)) {
+        gpio_force[pin_index] = level;
+    }
+}
+
+uint32_t host_gpio_last_mode(int pin_index)
+{
+    gpio_lazy_init();
+    if ((pin_index >= 0) && (pin_index < 16)) {
+        return gpio_mode[pin_index];
+    }
+    return 0u;
+}
+
+uint32_t host_gpio_last_pull(int pin_index)
+{
+    gpio_lazy_init();
+    if ((pin_index >= 0) && (pin_index < 16)) {
+        return gpio_pull[pin_index];
+    }
+    return 0u;
+}
+
+int host_gpio_odr(int pin_index)
+{
+    if ((pin_index >= 0) && (pin_index < 16)) {
+        return ((fake_GPIOB.ODR & (1u << pin_index)) != 0u) ? 1 : 0;
+    }
+    return 0;
+}
+
+/* 1 if the pin was ever programmed as input+pull-up since host_gpio_reset. */
+int host_gpio_saw_input_pullup(int pin_index)
+{
+    gpio_lazy_init();
+    if ((pin_index >= 0) && (pin_index < 16)) {
+        return gpio_saw_in_pu[pin_index];
+    }
+    return 0;
+}
+
+void host_gpio_reset(void)
+{
+    gpio_lazy_init();
+    for (int i = 0; i < 16; i++) {
+        gpio_mode[i]  = 0u;
+        gpio_pull[i]  = 0u;
+        gpio_force[i] = -1;
+        gpio_saw_in_pu[i] = 0;
+    }
+    fake_GPIOB.ODR = 0u;
+    fake_GPIOB.IDR = 0u;
+}

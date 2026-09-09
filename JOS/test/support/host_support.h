@@ -58,6 +58,28 @@ uint32_t host_nvic_reset_count(void);   /* total reset requests seen */
     } while (0)
 
 /* ==========================================================================
+ * GPIO doubles (support/hal_stubs.c) — PB1 deploy mux + PB2 1-wire bus
+ * ========================================================================== */
+
+/* Force the level a pin reads when configured as input (0/1), e.g. the
+ * deploy-switch state on PB1. Pass -1 to release back to following ODR. */
+void host_gpio_force_input(int pin_index, int level);
+
+/* Last mode/pull passed to HAL_GPIO_Init() for a pin (GPIO_MODE_*,
+ * GPIO_NOPULL/GPIO_PULLUP above). Lets tests assert the mux sequencing. */
+uint32_t host_gpio_last_mode(int pin_index);
+uint32_t host_gpio_last_pull(int pin_index);
+
+/* Output latch bit for a pin (what HAL_GPIO_WritePin last drove). */
+int host_gpio_odr(int pin_index);
+
+/* 1 if the pin was ever programmed as input+pull-up since host_gpio_reset. */
+int host_gpio_saw_input_pullup(int pin_index);
+
+/* Forget all recorded modes and overrides (call from setUp). */
+void host_gpio_reset(void);
+
+/* ==========================================================================
  * Firmware image doubles (support/stubs.c)
  * ========================================================================== */
 

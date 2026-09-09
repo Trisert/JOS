@@ -120,6 +120,62 @@ void    NVIC_SystemReset(void);
  * spinning like the flight implementation does. */
 void Error_Handler(void);
 
+/* ---------- GPIO (fakes for the PB1 deploy mux + PB2 1-wire bus) ----------
+ * Minimal mirror of the stm32l4xx_hal_gpio surface used by App/comms/
+ * deploy_sense.c and App/payloads/temp.c. Behaviour lives in
+ * support/hal_stubs.c: a per-pin record of the last init mode/pull, an ODR
+ * bit set by HAL_GPIO_WritePin, and an input override forced by the test
+ * (-1 = follow ODR, else the driven level). This lets tests assert the mux
+ * sequencing (deploy read must restore output-HIGH) without hardware. */
+typedef struct {
+    volatile uint32_t MODER;
+    volatile uint32_t OTYPER;
+    volatile uint32_t OSPEEDR;
+    volatile uint32_t PUPDR;
+    volatile uint32_t IDR;
+    volatile uint32_t ODR;
+} GPIO_TypeDef;
+
+extern GPIO_TypeDef fake_GPIOB;
+#define GPIOB (&fake_GPIOB)
+
+#define GPIO_PIN_1 (0x0002u)
+#define GPIO_PIN_2 (0x0004u)
+
+typedef enum {
+    GPIO_PIN_RESET = 0,
+    GPIO_PIN_SET   = 1
+} GPIO_PinState;
+
+#define GPIO_MODE_INPUT     (0x00000000u)
+#define GPIO_MODE_OUTPUT_PP (0x00000001u)
+#define GPIO_MODE_OUTPUT_OD (0x00000011u)
+#define GPIO_NOPULL         (0x00000000u)
+#define GPIO_PULLUP         (0x00000001u)
+#define GPIO_SPEED_FREQ_LOW (0x00000000u)
+#define GPIO_SPEED_FREQ_HIGH (0x00000003u)
+
+typedef struct {
+    uint32_t Pin;
+    uint32_t Mode;
+    uint32_t Pull;
+    uint32_t Speed;
+} GPIO_InitTypeDef;
+
+void          HAL_GPIO_Init(GPIO_TypeDef *port, GPIO_InitTypeDef *cfg);
+void          HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, GPIO_PinState s);
+GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *port, uint16_t pin);
+
+/* Pin map mirror — canonical definitions are the CubeMX user defines in
+ * Core/Inc/main.h (PB2 = TEMP 1-wire bus, PB1 = DEPLOY_SENSE/LoRa_NRST mux).
+ * Keep in sync with that file. */
+#define TEMP_1WIRE_GPIO_Port   GPIOB
+#define TEMP_1WIRE_Pin         GPIO_PIN_2
+#define DEPLOY_SENSE_GPIO_Port GPIOB
+#define DEPLOY_SENSE_Pin       GPIO_PIN_1
+#define LoRa_NRST_GPIO_Port    GPIOB
+#define LoRa_NRST_Pin          GPIO_PIN_1
+
 /* Error-flag clearing is a register write on target; a no-op on the host. */
 #define __HAL_FLASH_CLEAR_FLAG(__FLAG__)  do { (void)(__FLAG__); } while (0)
 
