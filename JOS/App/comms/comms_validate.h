@@ -165,7 +165,6 @@ typedef enum {
                                      accounted by the RX task via
                                      comms_rx_account() so PHY drops are not a
                                      stat blind spot. */
->>>>>>> 3dab375 (fix(comms): hunt findings on framing — msg id, abort counting, PHY stats)
 } comms_tc_result_t;
 
 /** RX acceptance/rejection counters (telemetry + ground diagnostics). */
