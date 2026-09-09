@@ -28,7 +28,7 @@
  * mid-transaction). On any failure (bus busy, HAL error/timeout) CS is still
  * de-asserted, the bus released, and rx left untouched; callers degrade to a
  * best-effort miss (0). */
-// cppcheck-suppress constParameterPointer  // tx cannot be const: HAL takes uint8_t*
+// cppcheck-suppress constParameter  // tx cannot be const: HAL takes uint8_t*
 static bool max11128_frame(MAX11128_t *adc, uint8_t tx[2], uint8_t rx[2])
 {
 	if ((adc == NULL) || (adc->spiHandle == NULL) || (tx == NULL) || (rx == NULL)) {

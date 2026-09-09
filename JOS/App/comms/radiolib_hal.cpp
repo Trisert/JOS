@@ -125,7 +125,6 @@ void STM32Hal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
         /* On start failure — e.g. HAL_BUSY — stop the stream, leave the rest
            of in[] untouched. */
         if (HAL_SPI_TransmitReceive_DMA(_spi, out, in, chunk) != HAL_OK) {
-            stream_ok = false;
             break;
         }
         /* Synchronous RadioLib contract: block until the DMA TC IRQ drives
