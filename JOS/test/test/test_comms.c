@@ -44,6 +44,7 @@
 #include "unity.h"
 #include "comms.h"
 #include "comms_validate.h"
+#include "tec.h"                    /* the task table behind the TT&C dispatch */
 #include "sha256.h"                /* wrong-key forgery test only           */
 #include "host_support.h"      /* HOST_EXPECT_NVIC_RESET()                    */
 #include "mock_state_machine.h"
@@ -930,7 +931,7 @@ void test_comms_buffers_report_their_declared_capacity(void)
 
     p = comms_beacon_buffer(&len);
     TEST_ASSERT_NOT_NULL(p);
-    TEST_ASSERT_EQUAL_size_t(COMMS_BEACON_SIZE, len);
+    TEST_ASSERT_EQUAL_size_t(COMMS_LORA_BEACON_SIZE, len);
 
     p = comms_rx_buffer(&len);
     TEST_ASSERT_NOT_NULL(p);
@@ -1047,7 +1048,7 @@ void test_lora_send_chunked_fragments_128B_beacon_within_budget(void)
     size_t chunk_max = 0U;
     (void)comms_tx_buffer(&chunk_max);
 
-    uint8_t beacon[COMMS_BEACON_SIZE];
+    uint8_t beacon[COMMS_LORA_BEACON_SIZE];
     for (size_t i = 0U; i < sizeof(beacon); i++) {
         beacon[i] = (uint8_t)(i & 0xFFU);
     }
@@ -1162,7 +1163,7 @@ void test_tx_stats_tolerates_null_out(void)
    reports the error, and the abort is counted exactly once. */
 void test_lora_send_chunked_aborts_on_mid_sequence_tx_failure(void)
 {
-    uint8_t beacon[COMMS_BEACON_SIZE];
+    uint8_t beacon[COMMS_LORA_BEACON_SIZE];
     for (size_t i = 0U; i < sizeof(beacon); i++) {
         beacon[i] = (uint8_t)(i & 0xFFU);
     }
@@ -1186,7 +1187,7 @@ void test_lora_send_chunked_aborts_on_mid_sequence_tx_failure(void)
    go on air (it counts as sent) but the sequence still stops and fails. */
 void test_lora_send_chunked_aborts_on_mid_sequence_wait_failure(void)
 {
-    uint8_t beacon[COMMS_BEACON_SIZE];
+    uint8_t beacon[COMMS_LORA_BEACON_SIZE];
     for (size_t i = 0U; i < sizeof(beacon); i++) {
         beacon[i] = (uint8_t)(0x80U + (i & 0x7FU));
     }
@@ -1319,7 +1320,7 @@ static void fill_beacon_pattern(uint8_t *beacon, size_t len, uint8_t base)
 /* A lost chunk is detectable: 2 of 3 chunks (n != total) refuse to reassemble. */
 void test_ground_model_detects_lost_chunk(void)
 {
-    uint8_t beacon[COMMS_BEACON_SIZE];
+    uint8_t beacon[COMMS_LORA_BEACON_SIZE];
     fill_beacon_pattern(beacon, sizeof(beacon), 0U);
 
     radiolib_stub_tx_reset();
@@ -1328,7 +1329,7 @@ void test_ground_model_detects_lost_chunk(void)
 
     const uint8_t *got[2] = { radiolib_stub_tx_data(0), radiolib_stub_tx_data(2) };
     const size_t   lens[2] = { radiolib_stub_tx_len(0), radiolib_stub_tx_len(2) };
-    uint8_t out[COMMS_BEACON_SIZE];
+    uint8_t out[COMMS_LORA_BEACON_SIZE];
     size_t  out_len = 0U;
     TEST_ASSERT_EQUAL_INT(-1, ground_reassemble(got, lens, 2U, out, sizeof(out), &out_len));
 }
@@ -1337,7 +1338,7 @@ void test_ground_model_detects_lost_chunk(void)
    arrival order. */
 void test_ground_model_reassembles_reordered_chunks(void)
 {
-    uint8_t beacon[COMMS_BEACON_SIZE];
+    uint8_t beacon[COMMS_LORA_BEACON_SIZE];
     fill_beacon_pattern(beacon, sizeof(beacon), 0x20U);
 
     radiolib_stub_tx_reset();
@@ -1351,7 +1352,7 @@ void test_ground_model_reassembles_reordered_chunks(void)
     const size_t lens[3] = {
         radiolib_stub_tx_len(2), radiolib_stub_tx_len(0), radiolib_stub_tx_len(1)
     };
-    uint8_t out[COMMS_BEACON_SIZE];
+    uint8_t out[COMMS_LORA_BEACON_SIZE];
     size_t  out_len = 0U;
     TEST_ASSERT_EQUAL_INT(0, ground_reassemble(got, lens, 3U, out, sizeof(out), &out_len));
     TEST_ASSERT_EQUAL_size_t(sizeof(beacon), out_len);
@@ -1361,7 +1362,7 @@ void test_ground_model_reassembles_reordered_chunks(void)
 /* A duplicate chunk (same msg + seq twice, one seq missing) is refused. */
 void test_ground_model_detects_duplicate_chunk(void)
 {
-    uint8_t beacon[COMMS_BEACON_SIZE];
+    uint8_t beacon[COMMS_LORA_BEACON_SIZE];
     fill_beacon_pattern(beacon, sizeof(beacon), 0x40U);
 
     radiolib_stub_tx_reset();
@@ -1374,7 +1375,7 @@ void test_ground_model_detects_duplicate_chunk(void)
     const size_t lens[3] = {
         radiolib_stub_tx_len(0), radiolib_stub_tx_len(1), radiolib_stub_tx_len(1)
     };
-    uint8_t out[COMMS_BEACON_SIZE];
+    uint8_t out[COMMS_LORA_BEACON_SIZE];
     size_t  out_len = 0U;
     TEST_ASSERT_EQUAL_INT(-1, ground_reassemble(got, lens, 3U, out, sizeof(out), &out_len));
 }
@@ -1383,7 +1384,7 @@ void test_ground_model_detects_duplicate_chunk(void)
    and the two ids are consecutive. */
 void test_ground_model_refuses_chunks_from_two_messages(void)
 {
-    uint8_t beacon[COMMS_BEACON_SIZE];
+    uint8_t beacon[COMMS_LORA_BEACON_SIZE];
     fill_beacon_pattern(beacon, sizeof(beacon), 0x60U);
 
     radiolib_stub_tx_reset();
@@ -1398,7 +1399,7 @@ void test_ground_model_refuses_chunks_from_two_messages(void)
 
     const uint8_t *got[2] = { first, second };
     const size_t   lens[2] = { radiolib_stub_tx_len(0), radiolib_stub_tx_len(3) };
-    uint8_t out[COMMS_BEACON_SIZE];
+    uint8_t out[COMMS_LORA_BEACON_SIZE];
     size_t  out_len = 0U;
     TEST_ASSERT_EQUAL_INT(-1, ground_reassemble(got, lens, 2U, out, sizeof(out), &out_len));
 }
@@ -2530,8 +2531,69 @@ void test_rx_ttc_exit_state_rejects_bad_payload(void)
 
 /* Unsupported commands must be REJECTED, not counted as accepted (the
    comms.c:412 defect). A non-HK TEC type and an unimplemented HK task both
-   return COMMS_TC_ERR_OPCODE and take no action. */
+   return COMMS_TC_ERR_OPCODE and take no action.
+ *
+ * The task definition, the payload SHAPE and the handler lookup now all come
+ * from tec_dispatch() (#86), in that order (tec.h): a task that is DEFINED but
+ * unimplemented is reported as unsupported only once its payload has the length
+ * the spec declares for it, and a payload of the wrong shape is rejected one
+ * layer earlier. Both are explicit rejections in different counter buckets;
+ * neither is ever accepted. */
 void test_rx_ttc_unsupported_type_and_task_are_rejected(void)
+{
+    comms_rx_stats_t before, after;
+    comms_ttc_info_t info;
+    uint8_t          tle[43];
+    size_t           n = 0U;
+
+    memset(tle, 0, sizeof(tle));
+
+    comms_ttc_set_mac_verifier(ttc_mac_recording);
+    ttc_mac_seen_calls  = 0;
+    ttc_mac_seen_accept = 1;
+
+    comms_rx_get_stats(&before);
+
+    /* DAQ (Bin ID 01, 'Task types'!C5) is not a command carrier: the type
+       exists on the wire but carries no task definition, so every task under
+       it is an empty spec slot. */
+    ttc_info_init(&info, 5U, 0x55U, 1U, 0x01U, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_OPCODE, comms_rx_handle_ttc_frame(ttc_buf, n));
+
+    /* HK task 0x11 (TLE, 'Task details'!E21) is defined in the spec but has no
+       handler in this build: with its declared 43-byte payload it is an
+       unsupported command. */
+    ttc_info_init(&info, 5U, 0x55U, 0U, 0x11U, 43U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL,
+                              tle, sizeof(tle), &n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_OPCODE, comms_rx_handle_ttc_frame(ttc_buf, n));
+
+    /* The same unsupported TLE command with a payload of the WRONG shape is
+       refused by the dispatcher's length check, as a payload-length error —
+       still a rejection, in the range bucket. */
+    ttc_info_init(&info, 5U, 0x55U, 0U, 0x11U, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PAYLOAD_LEN, comms_rx_handle_ttc_frame(ttc_buf, n));
+
+    comms_rx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.accepted, after.accepted);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected + 3U, after.rejected);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_opcode + 2U, after.rejected_opcode);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_range + 1U, after.rejected_range);
+}
+
+/* The TT&C dispatch is tec.c-driven: it consults the spec table in tec.c, so an
+   EMPTY
+   spec slot must be rejected from the dispatcher's table and not silently
+   ignored (a dropped command is indistinguishable from a lost uplink on the
+   ground). Task id 0x05 is a hole in the source's HK command table: tec.h's
+   TEC_TASKS has no row for it. This test reads the table directly, so it fails
+   if comms.c ever goes back to deciding the task set on its own. */
+void test_rx_ttc_undefined_spec_slot_is_rejected(void)
 {
     comms_rx_stats_t before, after;
     comms_ttc_info_t info;
@@ -2541,24 +2603,20 @@ void test_rx_ttc_unsupported_type_and_task_are_rejected(void)
     ttc_mac_seen_calls  = 0;
     ttc_mac_seen_accept = 1;
 
+    /* The hole is real: it is absent from the dispatcher's table. */
+    TEST_ASSERT_NULL(tec_task_lookup(TEC_TYPE_HK, 0x05U));
+
     comms_rx_get_stats(&before);
 
-    /* DAQ (Bin ID 01, 'Task types'!C5) is not a command carrier. */
-    ttc_info_init(&info, 5U, 0x55U, 1U, 0x01U, 0U);
-    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
-        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
-    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_OPCODE, comms_rx_handle_ttc_frame(ttc_buf, n));
-
-    /* HK task 0x11 (TLE, 'Task details'!E21) is not implemented here. */
-    ttc_info_init(&info, 5U, 0x55U, 0U, 0x11U, 0U);
+    ttc_info_init(&info, 5U, 0x55U, COMMS_TTC_TEC_HK, 0x05U, 0U);
     TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
         comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
     TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_OPCODE, comms_rx_handle_ttc_frame(ttc_buf, n));
 
     comms_rx_get_stats(&after);
     TEST_ASSERT_EQUAL_UINT32(before.accepted, after.accepted);
-    TEST_ASSERT_EQUAL_UINT32(before.rejected + 2U, after.rejected);
-    TEST_ASSERT_EQUAL_UINT32(before.rejected_opcode + 2U, after.rejected_opcode);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected + 1U, after.rejected);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_opcode + 1U, after.rejected_opcode);
 }
 
 /* Freshness / anti-replay is deliberately NOT implemented (system-level

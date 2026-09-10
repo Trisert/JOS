@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "cmsis_os.h"
+#include "aocs_status.h"   /* aocs_state_t + AOCS_STATUS_*: the ONE definition */
 
 /* ---------------------------------------------------------------------------
  * OBC-side AOCS contract (SPF V3 §3.3; subsystem data dictionary
@@ -38,28 +39,14 @@
 
 /* --- AOCS_STATUS: the subsystem state (4 values) --------------------------
  *
- * Source: SW_DATA_TYPES.xlsx, sheet "Data Types", row "AOCS_STATUS":
- *   Type=Digital, Size available/requirement = 2 bit, Read By=AOCS,
- *   Read BUS=INTERNAL, HB?=Yes, Notes="OFF, DET, POINTING, FAULT".
- * The sheet "HB" places the two bits in the beacon STATUS byte at bit 3 and
- * bit 4 (1-indexed), next to BAT_STATUS/LINES_FAULT and OBC_STATUS.
+ * The 2-bit field, its four states (OFF, DET, POINTING, FAULT) and the beacon
+ * STATUS byte bit positions are defined ONCE, in aocs_status.h, which this
+ * header includes. aocs_state_t therefore keeps its name and its values for
+ * every existing user of aocs.h; there is no second copy of the enum.
  *
- * ASSUMPTION, declared and not hidden: the xlsx lists the four names in the
- * order OFF, DET, POINTING, FAULT but gives no explicit numeric codes. The
- * enumerator values below follow that listing order (0..3). If the AOCS team
- * assigns different codes, only this enum changes; the telemetry conversion
- * below is written against the NAMES, not the numbers.
+ * The header split is what lets App/obsw/beacon.[ch] use aocs_state_t without
+ * acquiring this file's "cmsis_os.h" dependency (see aocs_status.h).
  */
-#define AOCS_STATUS_BITS            2U
-#define AOCS_STATUS_HB_BIT_FIRST    3U
-#define AOCS_STATUS_HB_BIT_LAST     4U
-
-typedef enum {
-    AOCS_STATE_OFF      = 0,  /* AOCS unpowered / not executing   */
-    AOCS_STATE_DET      = 1,  /* Detumbling (B-dot)               */
-    AOCS_STATE_POINTING = 2,  /* Nadir-pointing (EKF)             */
-    AOCS_STATE_FAULT    = 3,  /* AOCS declared FAULT              */
-} aocs_state_t;
 
 /* --- T_AOCS_MODE: the 1-byte telemetry projection (2 values) -------------
  *

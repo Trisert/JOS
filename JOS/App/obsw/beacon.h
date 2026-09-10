@@ -4,6 +4,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* The AOCS state enum (aocs_state_t). NOT aocs.h: that header includes
+ * "cmsis_os.h" for the AOCS polling task, and this frame layer is deliberately
+ * free of HAL/RTOS headers (see the geometry note below and the beacon.c
+ * header). aocs_status.h carries the one definition of the type. */
+#include "aocs_status.h"
+
 /* ---------------------------------------------------------------------------
  * Housekeeping (HB) beacon - byte-exact wire layout
  *
@@ -208,18 +214,29 @@
 #define BEACON_PAYLOADS_HEATER_CRY_MASK   0x01u
 
 /* ---------------------------------------------------------------------------
- * AOCS_STATUS - 4 states
+ * AOCS_STATUS - 4 states, SHARED TYPE (no local enum)
  *
  * Sheet "Data Types" row AOCS_STATUS: size available/required 2 bit, notes
  * "OFF, DET, POINTING, FAULT". The 2-bit field has four values (this is the
  * correction to the earlier two-state SPF model, TROVATO.md §1).
+ *
+ * The values are NOT defined here. The single definition is aocs_state_t in
+ * App/aocs/aocs_status.h, included above: the AOCS module owns the field, and
+ * the 2-bit AOCS_STATUS field is the same object in the beacon STATUS byte and
+ * in the subsystem contract. Before this, beacon.h defined a second enum with
+ * the same four values (beacon_aocs_status_t) — one field, two types.
+ *
+ * BEACON_AOCS_* and beacon_aocs_status_t are thin ALIASES of it, kept so the
+ * beacon's own call sites and tests keep reading in beacon terms. An alias is
+ * not a second definition: there is exactly one enum type and one set of
+ * values. test_beacon.c pins the four values as 0..3.
  * ------------------------------------------------------------------------- */
-typedef enum {
-    BEACON_AOCS_OFF      = 0,
-    BEACON_AOCS_DET      = 1,
-    BEACON_AOCS_POINTING = 2,
-    BEACON_AOCS_FAULT    = 3,
-} beacon_aocs_status_t;
+typedef aocs_state_t beacon_aocs_status_t;   /* alias, not a second type */
+
+#define BEACON_AOCS_OFF      AOCS_STATE_OFF
+#define BEACON_AOCS_DET      AOCS_STATE_DET
+#define BEACON_AOCS_POINTING AOCS_STATE_POINTING
+#define BEACON_AOCS_FAULT    AOCS_STATE_FAULT
 
 /* ---------------------------------------------------------------------------
  * Input state

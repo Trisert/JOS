@@ -1,5 +1,6 @@
 #include "comms.h"
 #include "comms_validate.h"
+#include "tec.h"             /* the TEC task table / tec_dispatch() (see #86) */
 #include "state_machine.h"
 #include "watchdog.h"
 #include "cmsis_os.h"
@@ -11,7 +12,7 @@
    PR #47): lora_*() entry points are declared below with C linkage. */
 
 /* Packet buffer sizes now live in comms.h as COMMS_MAX_PACKET /
-   COMMS_BEACON_SIZE — the parity-protected SRAM2 buffers below are sized
+   COMMS_LORA_BEACON_SIZE — the parity-protected SRAM2 buffers below are sized
    from them, and callers need the same sizes. */
 
 extern SPI_HandleTypeDef hspi1;
@@ -37,7 +38,7 @@ extern void lora_rx_task_register(osThreadId_t handle);
    Flash. A single-event upset in a frame being assembled or decoded now
    raises an NMI (recorded + reset) instead of transmitting or executing
    corrupted data. */
-static SRAM2_CRITICAL_NOINIT uint8_t comms_beacon_buf[COMMS_BEACON_SIZE];
+static SRAM2_CRITICAL_NOINIT uint8_t comms_beacon_buf[COMMS_LORA_BEACON_SIZE];
 static SRAM2_CRITICAL_NOINIT uint8_t comms_rx_buf[COMMS_MAX_PACKET];
 static SRAM2_CRITICAL_NOINIT uint8_t comms_tx_buf[COMMS_MAX_PACKET];
 
@@ -561,53 +562,191 @@ bool comms_frame_is_ttc_layout(const uint8_t *frame, size_t len)
     return false;
 }
 
-/* Deliver an already-parsed, already-authenticated TT&C command by TEC type
- * and task. File-static: the only legal caller is comms_rx_handle_ttc_frame()
- * after the MAC seam has accepted the frame.
+/* -------------------------------------------------------------------------- */
+/* TT&C -> TEC seam (integration of #86 and #89)                              */
+/* -------------------------------------------------------------------------- */
+/*
+ * There is ONE command dispatcher in this build: tec_dispatch() in tec.c,
+ * which owns the spec task table, the payload-length shapes and the handler
+ * registry. This section is the ONLY place where the TT&C frame layer is
+ * allowed to decide WHAT a command IS; everything below is either a conversion
+ * of the frame's wire fields into tec_dispatch()'s terms, or a subsystem
+ * binding for a task the TT&C table implements.
+ *
+ * What deliberately stays here and not in tec.c:
+ *   - the wire<->tec type conversion. The frame carries the 2-bit Bin ID
+ *     (0..3); tec_type_t is the human-facing ID column (1..4) and tec.h says
+ *     in so many words DO NOT use it as a wire value. The conversion is
+ *     explicit and exhaustive, never a cast.
+ *   - the subsystem calls (NVIC_SystemReset(), the OBSW state request). tec.c
+ *     is dependency-free by design: the "what a command does" decision lives
+ *     with the subsystem that owns it, wired in as a handler.
+ *   - the accounting of the verdict (comms_rx_account) and the mac/parse
+ *     checks, which are frame-layer concerns.
+ */
+
+/** Map the 2-bit on-wire TEC type (Bin ID) onto tec_dispatch()'s tec_type_t.
+ *  Exhaustive over the four documented types; false for anything else, so an
+ *  unmapped wire value is rejected instead of being cast into a wrong type. */
+static bool comms_ttc_wire_tec_type(uint8_t wire_type, tec_type_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+    switch (wire_type) {
+    case COMMS_TTC_TEC_HK:  *out = TEC_TYPE_HK;  return true;
+    case COMMS_TTC_TEC_DAQ: *out = TEC_TYPE_DAQ; return true;
+    case COMMS_TTC_TEC_PE:  *out = TEC_TYPE_PE;  return true;
+    case COMMS_TTC_TEC_DT:  *out = TEC_TYPE_DT;  return true;
+    default:                return false;
+    }
+}
+
+/** Map a tec_result_t onto the TT&C verdict enum.
+ *
+ *  Every non-OK code maps to an EXPLICIT rejection: an unsupported/undefined
+ *  task and an incoherent payload are different diagnostics but neither is
+ *  ever COMMS_TTC_OK, so the RX entry point can never count them as accepted.
+ *
+ *  TEC_ERR_BAD_LENGTH and TEC_ERR_BAD_VALUE both become COMMS_TTC_ERR_PAYLOAD
+ *  (the command's payload is wrong) and therefore keep the rejected_range
+ *  accounting the inline dispatcher produced before the unification.
+ *  TEC_ERR_UNDEFINED_TASK / TEC_ERR_NO_HANDLER / TEC_ERR_UNKNOWN_TYPE all
+ *  become COMMS_TTC_ERR_UNSUPPORTED (the command is not one this build
+ *  implements) and therefore COMMS_TC_ERR_OPCODE.
+ *
+ *  The default arm is deliberately a rejection as well: an unforeseen code
+ *  must never fall through to "accepted". */
+static comms_ttc_result_t comms_ttc_map_tec_result(tec_result_t rc)
+{
+    switch (rc) {
+    case TEC_OK:
+        return COMMS_TTC_OK;
+    case TEC_ERR_BAD_LENGTH:
+    case TEC_ERR_BAD_VALUE:
+        return COMMS_TTC_ERR_PAYLOAD;
+    case TEC_ERR_UNKNOWN_TYPE:
+    case TEC_ERR_UNDEFINED_TASK:
+    case TEC_ERR_NO_HANDLER:
+    default:
+        return COMMS_TTC_ERR_UNSUPPORTED;
+    }
+}
+
+/* ---- Subsystem bindings for the tasks this build implements ----------------
+ *
+ * Only the two HK commands the TT&C table implements are bound. The remaining
+ * spec tasks (variable change, set time, TLE, EPS/ADCS reboot, LoRa state/
+ * config/ping, ACK/NACK) are deliberately LEFT UNBOUND: tec_dispatch() reports
+ * them as TEC_ERR_NO_HANDLER and they are rejected as unsupported. Binding the
+ * generic variable-change handler (tec_register_default_handlers()) is NOT
+ * done here because no tec_var_ops_t is installed yet — that is the subsystem
+ * wiring, still out of scope, and pretending otherwise would turn a rejection
+ * into a silent no-op.
+ *
+ * Registration is idempotent and lazy: tec_register_handler() writes one slot,
+ * the RX path is single-threaded (see comms_ttc_parse_frame()'s ownership
+ * note), and there is no init hook on this path to hang a one-shot call on.
+ * The flag keeps the common case to a single load. */
+
+static tec_result_t comms_ttc_hk_obc_reboot(tec_type_t type, uint8_t task,
+                                            const uint8_t *payload, size_t len,
+                                            void *arg)
+{
+    (void)type;
+    (void)task;
+    (void)payload;
+    (void)arg;
+    /* tec_dispatch() has already enforced PL = 0 ('Task details'!G5). */
+    (void)len;
+    NVIC_SystemReset();
+    return TEC_OK;
+}
+
+static tec_result_t comms_ttc_hk_exit_state(tec_type_t type, uint8_t task,
+                                            const uint8_t *payload, size_t len,
+                                            void *arg)
+{
+    uint8_t old_state;
+    uint8_t new_state;
+
+    (void)type;
+    (void)task;
+    (void)arg;
+    /* tec_dispatch() has already enforced PL = 2 ('HK tasks'!D13:D14 + G6):
+     * byte 1 = old state, byte 2 = new state. */
+    if ((payload == NULL) || (len != 2U)) {
+        return TEC_ERR_BAD_LENGTH;   /* defensive; unreachable by contract */
+    }
+    old_state = payload[0];
+    new_state = payload[1];
+
+    /* Value-level validation is the handler's job, not the table's: the table
+     * can only state the 2-byte SHAPE. An out-of-range state or a no-op
+     * old == new request is refused with the explicit TEC_ERR_BAD_VALUE rather
+     * than silently forcing STATE_READY (the comms.c:407 defect). */
+    if ((old_state >= (uint8_t)OBW_STATE_COUNT) ||
+        (new_state >= (uint8_t)OBW_STATE_COUNT) ||
+        (old_state == new_state)) {
+        return TEC_ERR_BAD_VALUE;
+    }
+    (void)state_machine_request_transition((obw_state_t)new_state,
+                                           TRIGGER_GROUND_CMD);
+    return TEC_OK;
+}
+
+static bool s_ttc_handlers_bound = false;
+
+static void comms_ttc_bind_handlers(void)
+{
+    if (s_ttc_handlers_bound) {
+        return;
+    }
+    (void)tec_register_handler(TEC_TYPE_HK, TEC_TASK_HK_OBC_REBOOT,
+                               comms_ttc_hk_obc_reboot, NULL);
+    (void)tec_register_handler(TEC_TYPE_HK, TEC_TASK_HK_EXIT_STATE,
+                               comms_ttc_hk_exit_state, NULL);
+    s_ttc_handlers_bound = true;
+}
+
+/* Deliver an already-parsed, already-authenticated TT&C command. File-static:
+ * the only legal caller is comms_rx_handle_ttc_frame() after the MAC seam has
+ * accepted the frame.
+ *
+ * This is a thin adapter, not a dispatcher: it converts the wire fields and
+ * hands them to tec_dispatch(), then maps the TEC verdict back. The decision
+ * table, the length shapes and the handler lookup all live in tec.c — there is
+ * no second copy of the task list here (integration of #86 and #89).
  *
  * Returns COMMS_TTC_OK only when the command was actually executed/accepted;
  * COMMS_TTC_ERR_UNSUPPORTED for a TEC type/task this build does not implement
  * (or a non-HK type, which is not a command carrier) and
- * COMMS_TTC_ERR_PAYLOAD for a command whose payload is short or incoherent.
- * The RX entry point accounts the returned verdict, so neither class is ever
- * counted as accepted (CodeRabbit orange, comms.c:412). */
+ * COMMS_TTC_ERR_PAYLOAD for a command whose payload is of the wrong shape or
+ * incoherent. The RX entry point accounts the returned verdict, so neither
+ * class is ever counted as accepted (CodeRabbit orange, comms.c:412). */
 static comms_ttc_result_t comms_ttc_dispatch_unchecked(const comms_ttc_frame_t *f)
 {
-    if (f->info.tec_type != COMMS_TTC_TEC_HK) {
-        /* DAQ / PE / DT are not command carriers in the source's HK table. */
+    tec_type_t           type;
+    const uint8_t       *payload;
+    size_t               pl_len;
+
+    if (f == NULL) {
+        return COMMS_TTC_ERR_NULL;
+    }
+    comms_ttc_bind_handlers();
+
+    if (!comms_ttc_wire_tec_type(f->info.tec_type, &type)) {
+        /* Not one of the four documented Bin IDs: no such command. */
         return COMMS_TTC_ERR_UNSUPPORTED;
     }
-    switch (f->info.tec_task) {
-    case COMMS_TTC_TASK_OBC_REBOOT:
-        if (f->info.pl_len != 0U) {
-            return COMMS_TTC_ERR_PAYLOAD;   /* 'Task details'!G5: PL = 0 */
-        }
-        NVIC_SystemReset();
-        break;
-    case COMMS_TTC_TASK_EXIT_STATE: {
-        /* 'HK tasks'!D13:D14 + G6: payload = 1 byte old state, 1 byte new
-         * state (PL = 2). Apply the REQUESTED new state; the empty-payload
-         * path is rejected instead of silently forcing STATE_READY. */
-        if (f->info.pl_len != 2U) {
-            return COMMS_TTC_ERR_PAYLOAD;
-        }
-        const uint8_t old_state = f->payload[0];
-        const uint8_t new_state = f->payload[1];
-        if ((old_state >= (uint8_t)OBW_STATE_COUNT) ||
-            (new_state >= (uint8_t)OBW_STATE_COUNT) ||
-            (old_state == new_state)) {
-            return COMMS_TTC_ERR_PAYLOAD;   /* out of range / no-op request */
-        }
-        (void)state_machine_request_transition((obw_state_t)new_state,
-                                               TRIGGER_GROUND_CMD);
-        break;
-    }
-    default:
-        /* TODO: remaining HK commands (variable change, set time, TLE,
-         * EPS/ADCS reboot, LoRa state/config/ping, ACK/NACK). */
-        return COMMS_TTC_ERR_UNSUPPORTED;
-    }
-    return COMMS_TTC_OK;
+
+    /* pl_len == 0 means "no payload": pass NULL, which is what tec_dispatch()
+     * expects for a zero-length task. */
+    pl_len  = (size_t)f->info.pl_len;
+    payload = (pl_len > 0U) ? f->payload : NULL;
+
+    return comms_ttc_map_tec_result(tec_dispatch(type, f->info.tec_task,
+                                                 payload, pl_len));
 }
 
 comms_tc_result_t comms_rx_handle_ttc_frame(const uint8_t *frame, size_t len)

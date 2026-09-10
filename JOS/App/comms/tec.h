@@ -139,6 +139,10 @@ typedef enum {
  * Every dispatch / variable access returns one of these. The codes are kept
  * distinct on purpose: "the task does not exist in the spec" and "the task
  * exists but nothing is wired to it" are different ground diagnostics.
+ *
+ * APPEND-ONLY: values are part of the module's published contract (comms.c
+ * maps them onto COMMS_TTC_ERR_* / COMMS_TC_ERR_*), so new codes go at the
+ * end and existing ones are never renumbered or removed.
  */
 typedef enum {
     TEC_OK = 0,                 /**< accepted and handed to the handler   */
@@ -150,6 +154,9 @@ typedef enum {
     TEC_ERR_UNKNOWN_VAR,        /**< VarAddr not in the table             */
     TEC_ERR_READ_ONLY,          /**< write attempted on an R variable     */
     TEC_ERR_NO_VAR_OPS,         /**< var access with no ops installed     */
+    TEC_ERR_BAD_VALUE,          /**< payload length OK, its CONTENT is
+                                     refused by the handler (value out of
+                                     range, incoherent or no-op request)   */
 } tec_result_t;
 
 /* ---------- Task table ---------- */
@@ -189,7 +196,10 @@ typedef struct {
  *
  * The handler receives the SAME (type, task) it was registered for plus the
  * raw payload; it returns TEC_OK on success or any tec_result_t to report the
- * refusal upstream. It is the handler's job to talk to the subsystem; tec.c
+ * refusal upstream. A refusal of the payload CONTENT (a value out of range, an
+ * incoherent or no-op request) is reported as TEC_ERR_BAD_VALUE — distinct from
+ * TEC_ERR_BAD_LENGTH, which tec_dispatch() has already ruled out by the time
+ * the handler runs. It is the handler's job to talk to the subsystem; tec.c
  * never does.
  */
 typedef tec_result_t (*tec_handler_fn)(tec_type_t type, uint8_t task,

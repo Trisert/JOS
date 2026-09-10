@@ -270,6 +270,29 @@ void test_handler_return_code_is_propagated(void)
                           tec_dispatch(TEC_TYPE_HK, 0x04U, (const uint8_t *)"", 4U));
 }
 
+/* A refusal of the payload CONTENT is its own verdict: TEC_ERR_BAD_VALUE was
+ * added for the TT&C seam, where a handler (the Exit-state command) can only
+ * judge the two state bytes after tec_dispatch() has accepted the 2-byte
+ * SHAPE. It must be distinct from TEC_ERR_BAD_LENGTH (a different ground
+ * diagnostic) and it must be propagated like any other handler refusal. */
+void test_handler_bad_value_is_distinct_and_propagated(void)
+{
+    static const uint8_t payload[2] = { 0x03U, 0x03U };   /* a no-op request */
+
+    TEST_ASSERT_TRUE(TEC_ERR_BAD_VALUE != TEC_OK);
+    TEST_ASSERT_TRUE(TEC_ERR_BAD_VALUE != TEC_ERR_BAD_LENGTH);
+    TEST_ASSERT_TRUE(TEC_ERR_BAD_VALUE != TEC_ERR_READ_ONLY);
+
+    TEST_ASSERT_EQUAL_INT(TEC_OK, tec_register_handler(TEC_TYPE_HK, 0x02U,
+                                                       recording_handler, NULL));
+    g_handler_rc = TEC_ERR_BAD_VALUE;
+    /* The length is right (2 B), so the handler RUNS and only its verdict is
+     * refused — not a length rejection. */
+    TEST_ASSERT_EQUAL_INT(TEC_ERR_BAD_VALUE,
+                          tec_dispatch(TEC_TYPE_HK, 0x02U, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_INT(1, g_handler_calls);
+}
+
 /* A defined task with nothing bound is NOT the same as an undefined task. */
 void test_defined_task_without_handler_is_reported(void)
 {

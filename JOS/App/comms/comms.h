@@ -6,10 +6,17 @@
 #include <stdbool.h>
 #include "cmsis_os2.h"
 #include "comms_validate.h"
+#include "tec.h"          /* single source of truth for the TEC type/task ids */
 
 /* Sizes of the parity-protected comms buffers (SRAM2, see comms.c). */
 #define COMMS_MAX_PACKET   64U    /* LoRa payload chunk */
-#define COMMS_BEACON_SIZE  128U   /* 96 B telemetry + 32 B system */
+
+/* LoRa telemetry beacon BUFFER size: 96 B telemetry + 32 B system = 128 B,
+ * transmitted in COMMS_MAX_PACKET-sized chunks. NOT the housekeeping (HB)
+ * beacon frame of App/obsw/beacon.[ch], which is a different object: a 64-byte
+ * (BEACON_HB_LEN) byte-exact housekeeping frame. The two were both called
+ * "beacon size" and are not interchangeable, hence the explicit LORA name. */
+#define COMMS_LORA_BEACON_SIZE 128U
 
 /* Chunk framing header (see lora_send_chunked): byte 0 = message id, byte 1 =
    0-based sequence number, byte 2 = total chunk count. Payload per chunk is
@@ -206,28 +213,54 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len);
  * point O5. The full 6-bit width is accepted here. */
 #define COMMS_TTC_TEC_TASK_MAX  63U
 
-/** TEC task types: the 2-bit Bin IDs from 'Task types'!C4:C7 (NOT the
- *  human-facing Name IDs 1..4 in column B). The packed INFO byte is
- *  (COMMS_TTC_TEC_* << 6) | task, so these must be the Bin IDs. */
-#define COMMS_TTC_TEC_HK        0U   /* Bin ID 00 — housekeeping        */
-#define COMMS_TTC_TEC_DAQ       1U   /* Bin ID 01 — data acquisition    */
-#define COMMS_TTC_TEC_PE        2U   /* Bin ID 10 — payload execution   */
-#define COMMS_TTC_TEC_DT        3U   /* Bin ID 11 — data transfer       */
+/* SINGLE SOURCE OF TRUTH — the TEC type and task ids are OWNED by tec.h
+ * (TEC_WIRE_TYPE_* and TEC_TASK_HK_*); the COMMS_TTC_* names below are thin
+ * aliases, never a second definition of the same value. They are kept because
+ * the frame codec and docs/api/ttc-frame.md speak in COMMS_TTC_* terms and
+ * because a rename there would silently change what "the task id" means.
+ * Changing a value means changing it in tec.h, once. */
 
-/** Telecommand task ids from the source's HK command table. */
-#define COMMS_TTC_TASK_OBC_REBOOT   0x01U
-#define COMMS_TTC_TASK_EXIT_STATE   0x02U
-#define COMMS_TTC_TASK_VAR_CHANGE   0x03U
-#define COMMS_TTC_TASK_SET_TIME     0x04U
-#define COMMS_TTC_TASK_EPS_REBOOT   0x08U
-#define COMMS_TTC_TASK_ADCS_REBOOT  0x10U
-#define COMMS_TTC_TASK_TLE          0x11U
-#define COMMS_TTC_TASK_LORA_STATE   0x18U
-#define COMMS_TTC_TASK_LORA_CONFIG  0x19U
-#define COMMS_TTC_TASK_LORA_PING    0x1AU
-#define COMMS_TTC_TASK_ACK          0x31U
-#define COMMS_TTC_TASK_NACK         0x32U
-#define COMMS_TTC_TASK_LORA_LINK    0x33U
+/** TEC task types: the 2-bit Bin IDs from 'Task types'!C4:C7 (NOT the
+ *  human-facing Name IDs 1..4 in column B, which are tec.h's tec_type_t).
+ *  The packed INFO byte is (COMMS_TTC_TEC_* << 6) | task, so the wire value —
+ *  not tec_type_t — is what belongs here; see tec.h "DO NOT use the enum value
+ *  as a wire value". Source: tec.h TEC_WIRE_TYPE_*. */
+#define COMMS_TTC_TEC_HK        TEC_WIRE_TYPE_HK    /* Bin ID 00 — housekeeping      */
+#define COMMS_TTC_TEC_DAQ       TEC_WIRE_TYPE_DAQ   /* Bin ID 01 — data acquisition  */
+#define COMMS_TTC_TEC_PE        TEC_WIRE_TYPE_PE    /* Bin ID 10 — payload execution */
+#define COMMS_TTC_TEC_DT        TEC_WIRE_TYPE_DT    /* Bin ID 11 — data transfer     */
+
+/** Telecommand task ids from the source's HK command table. Source: tec.h
+ *  TEC_TASK_HK_* (one row per defined spec task). */
+#define COMMS_TTC_TASK_OBC_REBOOT   TEC_TASK_HK_OBC_REBOOT
+#define COMMS_TTC_TASK_EXIT_STATE   TEC_TASK_HK_EXIT_STATE
+#define COMMS_TTC_TASK_VAR_CHANGE   TEC_TASK_HK_VAR_CHANGE
+#define COMMS_TTC_TASK_SET_TIME     TEC_TASK_HK_SET_TIME
+#define COMMS_TTC_TASK_EPS_REBOOT   TEC_TASK_HK_EPS_REBOOT
+#define COMMS_TTC_TASK_ADCS_REBOOT  TEC_TASK_HK_ADCS_REBOOT
+#define COMMS_TTC_TASK_TLE          TEC_TASK_HK_TLE
+#define COMMS_TTC_TASK_LORA_STATE   TEC_TASK_HK_LORA_STATE
+#define COMMS_TTC_TASK_LORA_CONFIG  TEC_TASK_HK_LORA_CONFIG
+#define COMMS_TTC_TASK_LORA_PING    TEC_TASK_HK_LORA_PING
+#define COMMS_TTC_TASK_ACK          TEC_TASK_HK_ACK
+#define COMMS_TTC_TASK_NACK         TEC_TASK_HK_NACK
+#define COMMS_TTC_TASK_LORA_LINK    TEC_TASK_HK_LORA_LINK
+
+/* The alias expansion above is the contract, and a silently drifting alias is
+ * worse than a duplicated literal: these pin it at compile time against the
+ * literals of the source table so a change in tec.h that moves a value is a
+ * build error here, not a runtime surprise. */
+_Static_assert(TEC_WIRE_TYPE_HK == 0U && TEC_WIRE_TYPE_DAQ == 1U &&
+               TEC_WIRE_TYPE_PE == 2U && TEC_WIRE_TYPE_DT == 3U,
+               "TEC wire Bin IDs must stay 00/01/10/11");
+_Static_assert(TEC_TASK_HK_OBC_REBOOT  == 0x01U && TEC_TASK_HK_EXIT_STATE == 0x02U &&
+               TEC_TASK_HK_VAR_CHANGE  == 0x03U && TEC_TASK_HK_SET_TIME   == 0x04U &&
+               TEC_TASK_HK_EPS_REBOOT  == 0x08U && TEC_TASK_HK_ADCS_REBOOT == 0x10U &&
+               TEC_TASK_HK_TLE         == 0x11U && TEC_TASK_HK_LORA_STATE  == 0x18U &&
+               TEC_TASK_HK_LORA_CONFIG == 0x19U && TEC_TASK_HK_LORA_PING   == 0x1AU &&
+               TEC_TASK_HK_ACK         == 0x31U && TEC_TASK_HK_NACK        == 0x32U &&
+               TEC_TASK_HK_LORA_LINK   == 0x33U,
+               "TEC task ids must keep the HK command-table values");
 
 /** TT&C frame codec verdicts. Kept separate from comms_tc_result_t so the
  *  alignment and INFO-field classes stay distinguishable in telemetry;
