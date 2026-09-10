@@ -150,6 +150,290 @@ void comms_tx_get_stats(comms_tx_stats_t *out)
 _Static_assert(COMMS_MAX_PACKET > COMMS_CHUNK_HDR_LEN,
                "TX buffer must hold the chunk header plus payload");
 
+/* ======================================================================
+ * TT&C command frame codec (see comms.h for the layout and the MAC seam)
+ * ====================================================================== */
+
+/* MAC verification hook. NULL = semantics undefined => fail closed: the RX
+ * path parses the frame but never dispatches it. See docs/api/ttc-frame.md. */
+static comms_ttc_mac_verify_fn ttc_mac_verifier = NULL;
+
+void comms_ttc_set_mac_verifier(comms_ttc_mac_verify_fn fn)
+{
+    ttc_mac_verifier = fn;
+}
+
+bool comms_ttc_mac_verify(const uint8_t *frame, size_t len,
+                          const uint8_t mac[4])
+{
+    if (ttc_mac_verifier == NULL) {
+        return false;   /* no definition installed -> reject (fail closed) */
+    }
+    return ttc_mac_verifier(frame, len, mac);
+}
+
+size_t comms_ttc_padded_len(size_t content_len, bool ecc_on)
+{
+    if (content_len == 0U) {
+        return 0U;
+    }
+    const size_t blocks = (content_len + (COMMS_TTC_BLOCK - 1U)) / COMMS_TTC_BLOCK;
+    size_t       total  = blocks * COMMS_TTC_BLOCK;
+    if (ecc_on) {
+        total += (size_t)COMMS_TTC_ECC_TAIL_LEN;
+    }
+    return total;
+}
+
+uint8_t comms_ttc_info_pack(uint8_t tec_type, uint8_t tec_task)
+{
+    return (uint8_t)((tec_type & COMMS_TTC_TEC_TYPE_MASK) |
+                     ((tec_task << 2) & COMMS_TTC_TEC_TASK_MASK));
+}
+
+void comms_ttc_info_unpack(uint8_t byte2, uint8_t *tec_type, uint8_t *tec_task)
+{
+    if (tec_type != NULL) {
+        *tec_type = (uint8_t)(byte2 & COMMS_TTC_TEC_TYPE_MASK);
+    }
+    if (tec_task != NULL) {
+        *tec_task = (uint8_t)((byte2 & COMMS_TTC_TEC_TASK_MASK) >> 2);
+    }
+}
+
+comms_ttc_result_t comms_ttc_build_frame(uint8_t                *out,
+                                         size_t                  cap,
+                                         const comms_ttc_info_t *info,
+                                         uint32_t                unix_time,
+                                         const uint8_t          *mac,
+                                         const uint8_t          *payload,
+                                         size_t                  pl_len,
+                                         size_t                 *out_len)
+{
+    if ((out == NULL) || (info == NULL)) {
+        return COMMS_TTC_ERR_NULL;
+    }
+    if ((payload == NULL) && (pl_len != 0U)) {
+        return COMMS_TTC_ERR_NULL;
+    }
+    if (pl_len > (size_t)COMMS_TTC_MAX_PL) {
+        return COMMS_TTC_ERR_PL_LEN;
+    }
+    if ((size_t)info->pl_len != pl_len) {
+        return COMMS_TTC_ERR_PL_LEN;   /* INFO must agree with the payload */
+    }
+    if (info->station_id < COMMS_TTC_STATION_MIN) {
+        return COMMS_TTC_ERR_STATION_ID;
+    }
+    if ((info->ecc_flag != COMMS_TTC_ECC_OFF) &&
+        (info->ecc_flag != COMMS_TTC_ECC_ON)) {
+        return COMMS_TTC_ERR_ECC_FLAG;
+    }
+    if (info->tec_type > COMMS_TTC_TEC_TYPE_MAX) {
+        return COMMS_TTC_ERR_TEC_TYPE;
+    }
+    if (info->tec_task > COMMS_TTC_TEC_TASK_MAX) {
+        return COMMS_TTC_ERR_TEC_TASK;
+    }
+
+    const bool   ecc_on  = (info->ecc_flag == COMMS_TTC_ECC_ON);
+    const size_t content = (size_t)COMMS_TTC_HDR_LEN + pl_len;
+    const size_t total   = comms_ttc_padded_len(content, ecc_on);
+
+    if (out_len != NULL) {
+        *out_len = total;   /* filled even on ERR_BUF, to size a retry */
+    }
+    if (cap < total) {
+        return COMMS_TTC_ERR_BUF;
+    }
+
+    out[0] = info->station_id;
+    out[1] = info->ecc_flag;
+    out[2] = comms_ttc_info_pack(info->tec_type, info->tec_task);
+    out[3] = (uint8_t)pl_len;
+    out[COMMS_TTC_INFO_LEN]      = (uint8_t)(unix_time >> 24);
+    out[COMMS_TTC_INFO_LEN + 1U] = (uint8_t)(unix_time >> 16);
+    out[COMMS_TTC_INFO_LEN + 2U] = (uint8_t)(unix_time >> 8);
+    out[COMMS_TTC_INFO_LEN + 3U] = (uint8_t)unix_time;
+    if (mac != NULL) {
+        memcpy(&out[COMMS_TTC_INFO_LEN + COMMS_TTC_TIME_LEN], mac,
+               (size_t)COMMS_TTC_MAC_LEN);
+    } else {
+        memset(&out[COMMS_TTC_INFO_LEN + COMMS_TTC_TIME_LEN], 0,
+               (size_t)COMMS_TTC_MAC_LEN);
+    }
+    if (pl_len > 0U) {
+        memcpy(&out[COMMS_TTC_HDR_LEN], payload, pl_len);
+    }
+    /* Zero padding to the 16-byte block, plus a zeroed RS ECC tail when on:
+     * both are application-layer responsibilities per the source document. */
+    memset(&out[content], 0, total - content);
+    return COMMS_TTC_OK;
+}
+
+comms_ttc_result_t comms_ttc_parse_frame(const uint8_t     *frame,
+                                         size_t             len,
+                                         comms_ttc_frame_t *out)
+{
+    if ((frame == NULL) || (out == NULL)) {
+        return COMMS_TTC_ERR_NULL;
+    }
+    if (len < (size_t)COMMS_TTC_MIN_FRAME) {
+        return COMMS_TTC_ERR_TOO_SHORT;
+    }
+    if (len > (size_t)COMMS_TTC_MAX_FRAME) {
+        return COMMS_TTC_ERR_TOO_LONG;
+    }
+    if ((len % COMMS_TTC_BLOCK) != 0U) {
+        return COMMS_TTC_ERR_ALIGN;      /* not an interleaving block count */
+    }
+
+    const uint8_t station = frame[0];
+    const uint8_t ecc     = frame[1];
+    const uint8_t pl_len  = frame[3];
+    uint8_t       tec_type = 0U;
+    uint8_t       tec_task = 0U;
+
+    if (station < COMMS_TTC_STATION_MIN) {
+        return COMMS_TTC_ERR_STATION_ID;
+    }
+    if ((ecc != COMMS_TTC_ECC_OFF) && (ecc != COMMS_TTC_ECC_ON)) {
+        return COMMS_TTC_ERR_ECC_FLAG;
+    }
+    comms_ttc_info_unpack(frame[2], &tec_type, &tec_task);
+    /* No TEC type/task range check here: comms_ttc_info_unpack() masks the
+     * fields to their widths (type 2 bits -> 0..3, task 6 bits -> 0..63), so
+     * an out-of-range value cannot be produced from the wire. The checks in
+     * comms_ttc_build_frame() guard the caller-supplied struct instead. */
+    if (pl_len > COMMS_TTC_MAX_PL) {
+        return COMMS_TTC_ERR_PL_LEN;
+    }
+
+    const bool   ecc_on   = (ecc == COMMS_TTC_ECC_ON);
+    const size_t data_len = len - (ecc_on ? (size_t)COMMS_TTC_ECC_TAIL_LEN : 0U);
+    if ((data_len % COMMS_TTC_BLOCK) != 0U) {
+        return COMMS_TTC_ERR_ALIGN;      /* ECC tail split a data block */
+    }
+    if (((size_t)COMMS_TTC_HDR_LEN + pl_len) > data_len) {
+        return COMMS_TTC_ERR_PL_LEN;     /* payload truncated by the padding */
+    }
+
+    out->info.station_id = station;
+    out->info.ecc_flag   = ecc;
+    out->info.tec_type   = tec_type;
+    out->info.tec_task   = tec_task;
+    out->info.pl_len     = pl_len;
+    out->unix_time = ((uint32_t)frame[COMMS_TTC_INFO_LEN] << 24) |
+                     ((uint32_t)frame[COMMS_TTC_INFO_LEN + 1U] << 16) |
+                     ((uint32_t)frame[COMMS_TTC_INFO_LEN + 2U] << 8) |
+                      (uint32_t)frame[COMMS_TTC_INFO_LEN + 3U];
+    out->mac       = &frame[COMMS_TTC_INFO_LEN + COMMS_TTC_TIME_LEN];
+    out->payload   = (pl_len > 0U) ? &frame[COMMS_TTC_HDR_LEN] : NULL;
+    out->frame_len = len;
+    out->data_len  = data_len;
+    return COMMS_TTC_OK;
+}
+
+const char *comms_ttc_result_str(comms_ttc_result_t result)
+{
+    switch (result) {
+    case COMMS_TTC_OK:              return "OK";
+    case COMMS_TTC_ERR_NULL:        return "NULL";
+    case COMMS_TTC_ERR_TOO_SHORT:   return "TOO_SHORT";
+    case COMMS_TTC_ERR_TOO_LONG:    return "TOO_LONG";
+    case COMMS_TTC_ERR_ALIGN:       return "ALIGN";
+    case COMMS_TTC_ERR_PL_LEN:      return "PL_LEN";
+    case COMMS_TTC_ERR_STATION_ID:  return "STATION_ID";
+    case COMMS_TTC_ERR_ECC_FLAG:    return "ECC_FLAG";
+    case COMMS_TTC_ERR_TEC_TYPE:    return "TEC_TYPE";
+    case COMMS_TTC_ERR_TEC_TASK:    return "TEC_TASK";
+    case COMMS_TTC_ERR_MAC:         return "MAC";
+    case COMMS_TTC_ERR_BUF:         return "BUF";
+    default:                        return "UNKNOWN";
+    }
+}
+
+comms_tc_result_t comms_ttc_to_tc_result(comms_ttc_result_t result)
+{
+    switch (result) {
+    case COMMS_TTC_OK:             return COMMS_TC_OK;
+    case COMMS_TTC_ERR_NULL:       return COMMS_TC_ERR_NULL;
+    case COMMS_TTC_ERR_TOO_SHORT:  return COMMS_TC_ERR_TOO_SHORT;
+    case COMMS_TTC_ERR_TOO_LONG:   return COMMS_TC_ERR_TOO_LONG;
+    case COMMS_TTC_ERR_PL_LEN:     return COMMS_TC_ERR_PAYLOAD_LEN;
+    case COMMS_TTC_ERR_STATION_ID:
+    case COMMS_TTC_ERR_ECC_FLAG:
+    case COMMS_TTC_ERR_TEC_TYPE:
+    case COMMS_TTC_ERR_TEC_TASK:   return COMMS_TC_ERR_PARAM_RANGE;
+    case COMMS_TTC_ERR_MAC:        return COMMS_TC_ERR_MAC;
+    case COMMS_TTC_ERR_ALIGN:
+    case COMMS_TTC_ERR_BUF:
+    default:                       return COMMS_TC_ERR_LEN_MISMATCH;
+    }
+}
+
+bool comms_frame_is_ttc_layout(const uint8_t *frame, size_t len)
+{
+    if (frame == NULL) {
+        return false;
+    }
+    if ((len < (size_t)COMMS_TTC_MIN_FRAME) || (len > (size_t)COMMS_TTC_MAX_FRAME)) {
+        return false;
+    }
+    if ((len % COMMS_TTC_BLOCK) != 0U) {
+        return false;
+    }
+    /* INFO byte 1 = ECC flag (0x55/0xAA). A legacy/auth frame carries its
+     * payload length there (0..60), so the two can never collide. */
+    return (frame[1] == COMMS_TTC_ECC_OFF) || (frame[1] == COMMS_TTC_ECC_ON);
+}
+
+/* Deliver an already-parsed, already-authenticated TT&C command by TEC type
+ * and task. File-static: the only legal caller is comms_rx_handle_ttc_frame()
+ * after the MAC seam has accepted the frame. */
+static void comms_ttc_dispatch_unchecked(const comms_ttc_frame_t *f)
+{
+    if (f->info.tec_type != COMMS_TTC_TEC_HK) {
+        /* DAQ / PE / DT are not command carriers in the source's HK table. */
+        return;
+    }
+    switch (f->info.tec_task) {
+    case COMMS_TTC_TASK_OBC_REBOOT:
+        NVIC_SystemReset();
+        break;
+    case COMMS_TTC_TASK_EXIT_STATE:
+        /* Spec carries old+new state in the payload; the pair is not consumed
+         * yet — same placeholder behaviour as COMMS_TC_EXIT_STATE below. */
+        state_machine_request_transition(STATE_READY, TRIGGER_GROUND_CMD);
+        break;
+    default:
+        /* TODO: remaining HK commands (variable change, set time, TLE,
+         * EPS/ADCS reboot, LoRa state/config/ping, ACK/NACK). */
+        break;
+    }
+}
+
+comms_tc_result_t comms_rx_handle_ttc_frame(const uint8_t *frame, size_t len)
+{
+    comms_ttc_frame_t  parsed;
+    comms_ttc_result_t verdict = comms_ttc_parse_frame(frame, len, &parsed);
+
+    if (verdict == COMMS_TTC_OK) {
+        if (!comms_ttc_mac_verify(frame, len, parsed.mac)) {
+            verdict = COMMS_TTC_ERR_MAC;   /* fail closed until MAC defined */
+        }
+    }
+
+    comms_rx_account(comms_ttc_to_tc_result(verdict));
+
+    if (verdict != COMMS_TTC_OK) {
+        return comms_ttc_to_tc_result(verdict);   /* rejected — do NOT dispatch */
+    }
+
+    comms_ttc_dispatch_unchecked(&parsed);
+    return COMMS_TC_OK;
+}
+
 /* ---------- Telecommand dispatcher (private) ---------- */
 
 /**
@@ -232,6 +516,13 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len)
     const uint8_t *payload     = NULL;
     size_t         payload_len = 0U;
     comms_tc_result_t result;
+
+    if (comms_frame_is_ttc_layout(frame, len)) {
+        /* Spec TT&C command frame — a different layout from opcode|len|... .
+         * Parsed, MAC-seam checked and dispatched by TEC type/task; the
+         * legacy/authenticated layouts below are never reached for it. */
+        return comms_rx_handle_ttc_frame(frame, len);
+    }
 
     if (comms_frame_is_auth_layout(frame, len)) {
         result = comms_validate_tc_auth(frame, len,
