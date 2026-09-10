@@ -5,9 +5,10 @@
  * FRAM round trips). This file covers what happens when something goes
  * wrong, which is the half that matters in flight:
  *
- *   - an I2C transfer the FM24VN10-G cannot serve (a chip-boundary crossing)
- *     must be reported, not silently truncated;
- *   - the 64 KB FRAM cyclic buffer must wrap correctly, splitting the record
+ *   - a transfer crossing a 128 KB chip boundary must be split by the driver
+ *     into one I2C transfer per chip, never handed to HAL as a single
+ *     cross-chip range (on HW it would wrap in-chip and corrupt data);
+ *   - the 512 KB FRAM cyclic buffer must wrap correctly, splitting the record
  *     across the end of the bank;
  *   - a reboot must rebuild the ring cursor and the entry count from Flash;
  *   - a second writer of the same pool (Core/Src/dual_bank.c appends 'DBNK'
@@ -33,7 +34,7 @@
 #include <string.h>
 
 /* Geometry of the FRAM bank, mirrored from memory.c (4 x FM24VN10-G). */
-#define FRAM_CHIP_SIZE   (16u * 1024u)
+#define FRAM_CHIP_SIZE   (128u * 1024u)
 #define FRAM_TOTAL_SIZE  (4u * FRAM_CHIP_SIZE)
 
 static laststates_entry_t make_entry(uint32_t timestamp, uint8_t from, uint8_t to,
@@ -114,41 +115,170 @@ void tearDown(void)
  * FRAM error propagation
  * ===================================================================== */
 
-/* Each FM24VN10-G is its own 16 KB address space: the device does not roll
- * over into the next chip, so a transfer that starts in chip 0 and runs past
- * its last byte is rejected by the part. The driver must return the failure
- * instead of reporting a partial write as success - a silently truncated
- * write is how a telemetry record ends up half-written in FRAM.
+/* Each FM24VN10-G latches the slave byte (chip + A16 page) at the START of a
+ * transfer: one I2C transfer cannot span two chips, and on real hardware a
+ * range past the end of the chip wraps to offset 0 of the SAME chip instead
+ * of reaching the next one. The driver must therefore split a
+ * boundary-crossing range into one HAL call per chip - a single cross-chip
+ * HAL transfer would corrupt the start of the chip while reporting success.
  *
- * The chip that was addressed is asserted too, so the failure is the
- * boundary crossing and not a mis-computed device address. */
-void test_fram_write_reports_a_transfer_crossing_a_chip_boundary(void)
+ * The last slave seen on the bus is asserted too, proving the tail of the
+ * range really went to the next chip and not back into the first one. */
+void test_fram_write_splits_a_transfer_crossing_a_chip_boundary(void)
 {
     const uint8_t payload[8] = { 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u };
+    uint8_t       readback[8];
 
     fram_init();
 
-    TEST_ASSERT_EQUAL_INT(-1, fram_write(FRAM_CHIP_SIZE - 4u, payload, sizeof(payload)));
-    TEST_ASSERT_EQUAL_HEX16(0xA0u, host_flash_last_i2c_addr());  /* chip 0, shifted */
+    TEST_ASSERT_EQUAL_INT(0, fram_write(FRAM_CHIP_SIZE - 4u, payload, sizeof(payload)));
+    TEST_ASSERT_EQUAL_HEX16(0xA4u, host_flash_last_i2c_addr());  /* tail went to chip 1 page 0, shifted */
+
+    memset(readback, 0, sizeof(readback));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(FRAM_CHIP_SIZE - 4u, readback, sizeof(readback)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, readback, sizeof(payload));
 }
 
-void test_fram_read_reports_a_transfer_crossing_a_chip_boundary(void)
+void test_fram_read_splits_a_transfer_crossing_a_chip_boundary(void)
 {
-    uint8_t buf[8];
+    const uint8_t payload[8] = { 0xA1u, 0xA2u, 0xA3u, 0xA4u, 0xB1u, 0xB2u, 0xB3u, 0xB4u };
+    uint8_t       buf[8];
 
     fram_init();
-    memset(buf, 0xC3, sizeof(buf));
 
-    TEST_ASSERT_EQUAL_INT(-1, fram_read(FRAM_CHIP_SIZE - 4u, buf, sizeof(buf)));
-    TEST_ASSERT_EQUAL_HEX16(0xA0u, host_flash_last_i2c_addr());
-    TEST_ASSERT_EQUAL_HEX8(0xC3u, buf[0]);   /* nothing was handed back */
+    /* Seed both sides with single-chip writes, then read back across. */
+    TEST_ASSERT_EQUAL_INT(0, fram_write(FRAM_CHIP_SIZE - 4u, payload, 4u));
+    TEST_ASSERT_EQUAL_INT(0, fram_write(FRAM_CHIP_SIZE, payload + 4u, 4u));
+
+    memset(buf, 0xC3, sizeof(buf));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(FRAM_CHIP_SIZE - 4u, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_HEX16(0xA4u, host_flash_last_i2c_addr());  /* tail came from chip 1 page 0, shifted */
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, buf, sizeof(buf));
+}
+
+/* A transfer that stays inside one 128 KB chip but crosses the 64 KB A16
+ * page (slave 0xA0 -> 0xA2) must be split by the driver into one HAL call
+ * per device select: a single cross-select HAL transfer would wrap to
+ * offset 0 of the first select on HW. The last slave on the bus proves the
+ * tail really went to page 1. */
+void test_fram_write_splits_at_a16_page_inside_one_chip(void)
+{
+    uint8_t payload[4096];
+    uint8_t readback[4096];
+
+    fram_init();
+    for (size_t i = 0u; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)((i * 31u + 7u) & 0xFFu);
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, fram_write(62u * 1024u, payload, sizeof(payload)));
+    TEST_ASSERT_EQUAL_HEX16(0xA2u, host_flash_last_i2c_addr());
+
+    memset(readback, 0, sizeof(readback));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(62u * 1024u, readback, sizeof(readback)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, readback, sizeof(payload));
+}
+
+/* 70 KB at bank start stays inside chip 0 but crosses the A16 page AND
+ * exceeds the 0xFFFF HAL chunk cap, so this covers page-split + chunking
+ * together. The tail lands on select 1 (slave 0xA2). */
+static uint8_t page70k_write[70u * 1024u];
+static uint8_t page70k_read[70u * 1024u];
+
+void test_fram_write_above_hal_chunk_cap_splits(void)
+{
+    fram_init();
+    for (size_t i = 0u; i < sizeof(page70k_write); i++) {
+        page70k_write[i] = (uint8_t)((i * 31u + 7u) & 0xFFu);
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, fram_write(0u, page70k_write,
+                                        sizeof(page70k_write)));
+    TEST_ASSERT_EQUAL_HEX16(0xA2u, host_flash_last_i2c_addr());
+
+    memset(page70k_read, 0, sizeof(page70k_read));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(0u, page70k_read,
+                                       sizeof(page70k_read)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(page70k_write, page70k_read,
+                                  sizeof(page70k_write));
+}
+
+/* Whole-bank round trip: 512 KB across all 8 selects and 4 chips must come
+ * back byte-exact. The index-dependent pattern catches any misrouting. */
+static uint8_t bank_write[4u * 128u * 1024u];
+static uint8_t bank_read[4u * 128u * 1024u];
+
+void test_fram_full_bank_round_trip(void)
+{
+    fram_init();
+    for (size_t i = 0u; i < sizeof(bank_write); i++) {
+        bank_write[i] = (uint8_t)(((i * 131u) ^ (i >> 8)) & 0xFFu);
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, fram_write(0u, bank_write, sizeof(bank_write)));
+
+    memset(bank_read, 0, sizeof(bank_read));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(0u, bank_read, sizeof(bank_read)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(bank_write, bank_read, sizeof(bank_write));
+}
+
+/* fram_init() must see all 8 selects answer on a healthy bank. */
+void test_fram_init_reports_all_selects_present(void)
+{
+    fram_init();
+    TEST_ASSERT_EQUAL_HEX8(0x00u, fram_missing_selects());
+}
+
+/* A silent select is latched into the bitmap and consumed at boot: the
+ * report persists a TRIGGER_FRAM_MISSING record (no reset). */
+void test_fram_missing_select_is_reported_at_boot(void)
+{
+    static uint8_t out[2 * LASTSTATES_ENTRY_SIZE];
+    size_t         len = sizeof(out);
+    laststates_entry_t e;
+
+    laststates_init();
+    host_i2c_set_silent(0xA6u);   /* chip 1 page 0, shifted slave byte */
+    fram_init();
+    TEST_ASSERT_EQUAL_HEX8(0x08u, fram_missing_selects());
+    TEST_ASSERT_EQUAL_INT(0, fram_report_boot());
+
+    /* The record made it into the pool with the bitmap in context[0]. */
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(out, &len));
+    TEST_ASSERT_EQUAL_size_t((size_t)LASTSTATES_ENTRY_SIZE, len);
+    memcpy(&e, out, sizeof(e));
+    TEST_ASSERT_EQUAL_UINT8(TRIGGER_FRAM_MISSING, e.trigger);
+    TEST_ASSERT_EQUAL_HEX8(0x08u, e.context[0]);
+}
+
+/* Healthy bank: the boot report is a no-op returning success. */
+void test_fram_report_boot_is_silent_on_healthy_bank(void)
+{
+    fram_init();
+    TEST_ASSERT_EQUAL_INT(0, fram_report_boot());
+}
+
+/* addr + len must not wrap in 32-bit arithmetic: 0xFFFFFFF0 + 32 is 0x10,
+ * which would pass a naive `addr + len > FRAM_SIZE` bound check and hand the
+ * HAL a wild range. The driver must reject it before touching the bus. */
+void test_fram_rejects_an_address_length_combination_that_wraps(void)
+{
+    uint8_t buf[32];
+
+    fram_init();
+    memset(buf, 0x5Au, sizeof(buf));
+
+    TEST_ASSERT_EQUAL_INT(-1, fram_write(0xFFFFFFF0u, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, fram_read(0xFFFFFFF0u, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(-1, cyclic_buffer_read(0xFFFFFFF0u, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_HEX16(0xFFFFu, host_flash_last_i2c_addr());  /* rejected: bus untouched */
 }
 
 /* =====================================================================
  * Cyclic buffer wrap-around
  * ===================================================================== */
 
-/* The 64 KB FRAM bank is a ring: a record that does not fit in the tail is
+/* The 512 KB FRAM bank is a ring: a record that does not fit in the tail is
  * split, the remainder goes to offset 0 and the head follows it. Losing the
  * split (or wrapping the head without writing the remainder) silently drops
  * the oldest half of every record written at the end of the bank. */
@@ -169,7 +299,7 @@ void test_cyclic_buffer_write_wraps_and_splits_the_record(void)
     cyclic_buffer_init();
 
     /* Fill the bank up to 8 bytes short of the end. */
-    for (i = 0u; i < 15u; i++) {
+    for (i = 0u; i < 127u; i++) {
         TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(chunk, sizeof(chunk)));
     }
     TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(chunk, sizeof(chunk) - 8u));
@@ -183,6 +313,52 @@ void test_cyclic_buffer_write_wraps_and_splits_the_record(void)
     memset(head, 0, sizeof(head));
     TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_read(FRAM_TOTAL_SIZE - 8u, tail, sizeof(tail)));
     TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_read(0u, head, sizeof(head)));
+
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(record, tail, sizeof(tail));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(record + 8, head, sizeof(head));
+}
+
+/* The same split, but at a 128 KB chip boundary instead of the end of the
+ * bank: the record tail must land on chip 0's upper page (slave 0xA2) and the
+ * remainder on chip 1 (slave 0xA4), proving the cyclic writer splits at every
+ * physical chip boundary and the A16 page decode follows. A writer that only
+ * split at the ring end would hand the HAL one cross-chip transfer, which the
+ * part cannot serve. */
+void test_cyclic_buffer_write_splits_at_the_128kb_chip_boundary(void)
+{
+    static uint8_t chunk[4096];
+    const uint8_t  record[16] = {
+        0x10u, 0x11u, 0x12u, 0x13u, 0x14u, 0x15u, 0x16u, 0x17u,
+        0x20u, 0x21u, 0x22u, 0x23u, 0x24u, 0x25u, 0x26u, 0x27u,
+    };
+    uint8_t  tail[8];
+    uint8_t  head[8];
+    uint32_t i;
+
+    memset(chunk, 0xA5u, sizeof(chunk));
+
+    fram_init();
+    cyclic_buffer_init();
+
+    /* Fill chip 0 up to 8 bytes short of its end. */
+    for (i = 0u; i < 31u; i++) {
+        TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(chunk, sizeof(chunk)));
+    }
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(chunk, sizeof(chunk) - 8u));
+    TEST_ASSERT_EQUAL_UINT32(FRAM_CHIP_SIZE - 8u, cyclic_buffer_head());
+
+    /* 16 B into an 8 B tail: 8 bytes at the end of chip 0, 8 bytes at the
+     * start of chip 1. */
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(record, sizeof(record)));
+    TEST_ASSERT_EQUAL_UINT32(FRAM_CHIP_SIZE + 8u, cyclic_buffer_head());
+    TEST_ASSERT_EQUAL_HEX16(0xA4u, host_flash_last_i2c_addr());  /* chip 1, shifted */
+
+    memset(tail, 0, sizeof(tail));
+    memset(head, 0, sizeof(head));
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_read(FRAM_CHIP_SIZE - 8u, tail, sizeof(tail)));
+    TEST_ASSERT_EQUAL_HEX16(0xA2u, host_flash_last_i2c_addr());  /* chip 0 page 1 */
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_read(FRAM_CHIP_SIZE, head, sizeof(head)));
+    TEST_ASSERT_EQUAL_HEX16(0xA4u, host_flash_last_i2c_addr());  /* chip 1 page 0 */
 
     TEST_ASSERT_EQUAL_UINT8_ARRAY(record, tail, sizeof(tail));
     TEST_ASSERT_EQUAL_UINT8_ARRAY(record + 8, head, sizeof(head));
@@ -422,8 +598,8 @@ void test_laststates_write_refuses_the_write_when_the_pool_lock_fails(void)
 }
 
 
-/* A cyclic record can cross a physical 16 KB chip boundary without crossing
- * the 64 KB ring boundary. The cyclic layer must split it into legal FRAM
+/* A cyclic record can cross a physical 128 KB chip boundary without crossing
+ * the 512 KB ring boundary. The cyclic layer must split it into legal FRAM
  * transfers; exposing a single cross-chip request would make the driver reject
  * it and silently lose ordinary telemetry records. */
 void test_cyclic_buffer_write_splits_a_record_at_a_chip_boundary(void)
@@ -439,7 +615,7 @@ void test_cyclic_buffer_write_splits_a_record_at_a_chip_boundary(void)
     fram_init();
     cyclic_buffer_init();
 
-    for (i = 0u; i < 3u; i++) {
+    for (i = 0u; i < 31u; i++) {
         TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(filler, sizeof(filler)));
     }
     TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(filler, sizeof(filler) - 4u));

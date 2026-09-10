@@ -143,7 +143,8 @@ void host_flash_fail_program_after(uint32_t successes);
 
 /* Last I2C device address the code under test handed to HAL_I2C_Mem_Read/Write
  * (0xFFFF after host_flash_reset()). The HAL takes the 8-bit, already shifted
- * address, so a correct FM24VN10-G access is 0xA0/0xA2/0xA4/0xA6. */
+ * address, so a correct FM24VN10-G access is 0xA0/0xA2/…/0xAE (4 chips x 2
+ * A16 pages). */
 uint16_t host_flash_last_i2c_addr(void);
 
 /* ==========================================================================

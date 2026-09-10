@@ -59,7 +59,7 @@ uintptr_t flash_base = HOST_FLASH_LASTSTATES_BASE;
 I2C_HandleTypeDef hi2c1;
 
 static uint8_t *pool;                       /* mapped at POOL_BASE */
-static uint8_t  fram[4 * 16 * 1024];        /* 4 x FM24VN10-G = 64 KB */
+static uint8_t  fram[4 * 128 * 1024];      /* 4 x FM24VN10-G = 512 KB */
 
 static int      flash_unlocked;
 static uint32_t erase_count;
@@ -67,6 +67,11 @@ static uint32_t program_count;
 static uint32_t unlock_count;
 static uint32_t lock_count;
 static uint16_t last_i2c_dev_addr;
+
+/* Bitmask of forced-silent selects (host fault injection for the fram_init()
+ * probe): bit i silences 7-bit select 0x50+i. 0 = whole bank answers.
+ * Reset by host_flash_reset(). */
+static uint8_t i2c_silent_bits = 0U;
 
 /* Injected program failure (see host_flash_fail_program_after). */
 static int      fail_program_armed;
@@ -138,6 +143,7 @@ void host_flash_reset(void)
 
     memset(pool, 0xFF, POOL_SIZE);   /* erased Flash */
     memset(fram, 0x00, sizeof(fram));
+    i2c_silent_bits = 0U;
 
     flash_unlocked = 0;
     erase_count    = 0u;
@@ -269,25 +275,37 @@ HAL_StatusTypeDef HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *pEraseInit, uint32_t
 /* ---------- HAL I2C (FRAM) ---------- */
 
 /* ---------------------------------------------------------------------------
- * FM24VN10-G device addressing.
+ * FM24VN10-G device addressing (Infineon FM24V10 datasheet, "Slave Device
+ * Address" Fig. 6 and "Addressing Overview").
  *
- * The device select byte is 1 0 1 0 A2 A1 A0 R/W, i.e. 7-bit addresses
- * 0x50..0x53 for the four chips on the OBC. Every STM32 HAL I2C entry point
- * takes the address *already shifted left by one* (the 8-bit form), so the
- * legal values arriving here are 0xA0, 0xA2, 0xA4 and 0xA6 with the R/W bit
- * clear.
+ * The slave byte is 1 0 1 0 A2 A1 A16 R/W: A2/A1 select one of the four
+ * chips, and bit 1 is the PAGE SELECT = A16, the MSB of the 17-bit memory
+ * address. The two memory-address bytes carry A15..A0. One chip is therefore
+ * TWO 64 KB pages, and the bank answers on eight 7-bit selects 0x50..0x57.
+ *
+ * Every STM32 HAL I2C entry point takes the address *already shifted left by
+ * one* (the 8-bit form), so the legal values arriving here are
+ * 0xA0, 0xA2, ..., 0xAE with the R/W bit clear.
  *
  * The unshifted 7-bit values are rejected on purpose: passing 0x50 to the real
  * HAL puts 0x28 on the bus and talks to nothing (or to the wrong device).
  * Accepting both forms here would hide exactly that class of defect.
+ *
+ * One transfer may stream across the A16 page boundary inside a chip (the
+ * part latches the full 17-bit address and auto-increments it; rollover only
+ * at 1FFFFh -> 00000h), but never across chips: a range past the end of the
+ * selected chip is rejected, exactly as the part would NACK a foreign slave.
  * ------------------------------------------------------------------------- */
 #define FRAM_I2C_ADDR_FIRST  0xA0u          /* 7-bit 0x50 << 1 */
-#define FRAM_I2C_ADDR_LAST   0xA6u          /* 7-bit 0x53 << 1 */
-#define FRAM_CHIP_SIZE       (16U * 1024U)
+#define FRAM_I2C_ADDR_LAST   0xAEu          /* 7-bit 0x57 << 1 */
+#define FRAM_CHIP_SIZE       (128U * 1024U)
+#define FRAM_PAGE_SIZE       (64U * 1024U)
 
 static int fram_index(uint16_t dev_addr, uint16_t mem_addr, uint16_t size, size_t *out)
 {
+    size_t sel;
     size_t chip;
+    size_t index;
 
     last_i2c_dev_addr = dev_addr;
 
@@ -298,13 +316,15 @@ static int fram_index(uint16_t dev_addr, uint16_t mem_addr, uint16_t size, size_
         return -1;
     }
 
-    chip = (size_t)((dev_addr - FRAM_I2C_ADDR_FIRST) >> 1);
+    sel   = (size_t)((dev_addr - FRAM_I2C_ADDR_FIRST) >> 1);  /* 0..7 */
+    chip  = sel >> 1;                                        /* 0..3 */
+    index = (chip * FRAM_CHIP_SIZE) + ((sel & 1u) * FRAM_PAGE_SIZE) + mem_addr;
 
-    if (((size_t)mem_addr + size) > FRAM_CHIP_SIZE) {
+    if ((index + size) > ((chip + 1u) * FRAM_CHIP_SIZE)) {
         return -1;                            /* would cross a chip boundary */
     }
 
-    *out = (chip * FRAM_CHIP_SIZE) + mem_addr;
+    *out = index;
     return 0;
 }
 
@@ -341,5 +361,32 @@ HAL_StatusTypeDef HAL_I2C_Mem_Write(I2C_HandleTypeDef *hi2c, uint16_t DevAddress
     }
 
     memcpy(&fram[index], pData, Size);
+    return HAL_OK;
+}
+
+/* Host fault injection: force one shifted slave address silent. */
+void host_i2c_set_silent(uint16_t dev_addr_shifted)
+{
+    if ((dev_addr_shifted >= FRAM_I2C_ADDR_FIRST) &&
+        (dev_addr_shifted <= FRAM_I2C_ADDR_LAST)) {
+        i2c_silent_bits |= (uint8_t)(1U << ((dev_addr_shifted - FRAM_I2C_ADDR_FIRST) >> 1));
+    }
+}
+
+HAL_StatusTypeDef HAL_I2C_IsDeviceReady(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
+                                        uint32_t Trials, uint32_t Timeout)
+{
+    (void)Trials; (void)Timeout;
+    if (hi2c == NULL) {
+        return HAL_ERROR;
+    }
+    /* All 8 selects (0xA0..0xAE shifted) are present on the host unless
+     * forced silent above. */
+    if (DevAddress < FRAM_I2C_ADDR_FIRST || DevAddress > FRAM_I2C_ADDR_LAST) {
+        return HAL_ERROR;
+    }
+    if ((i2c_silent_bits & (uint8_t)(1U << ((DevAddress - FRAM_I2C_ADDR_FIRST) >> 1))) != 0U) {
+        return HAL_ERROR;
+    }
     return HAL_OK;
 }
