@@ -119,6 +119,35 @@ void test_aocs_tlm_mode_to_state_is_two_valued_only(void)
     TEST_ASSERT_NOT_EQUAL_UINT32(3U, aocs_tlm_mode_to_state(1U));
 }
 
+/* Out-of-range state bytes. aocs_state_t only names 0..3, but the function
+ * takes the enum by value, so a corrupted or uninitialised caller can pass
+ * any integer 4..255. That is exactly what the `default:` arm of the switch
+ * is for — and until this test it was never exercised (guaranteed by the
+ * code, not demonstrated by the tests). An unknown state must fall back to
+ * DETUMBLING (0), never to Nadir-Pointing: reporting a state we do not
+ * recognise as "under control" is the failure this whole correction exists
+ * to prevent. */
+void test_aocs_state_to_tlm_mode_out_of_range_falls_back_to_detumbling(void)
+{
+    TEST_ASSERT_EQUAL_UINT32(0U, aocs_state_to_tlm_mode((aocs_state_t)4));
+    TEST_ASSERT_EQUAL_UINT32(0U, aocs_state_to_tlm_mode((aocs_state_t)255));
+    TEST_ASSERT_NOT_EQUAL_UINT32(1U, aocs_state_to_tlm_mode((aocs_state_t)4));
+    TEST_ASSERT_NOT_EQUAL_UINT32(1U, aocs_state_to_tlm_mode((aocs_state_t)255));
+}
+
+/* Out-of-range mode bytes. T_AOCS_MODE is 1 byte but defines only two codes
+ * (0/1); any other byte (2..255) is undefined by the SPF. The inverse
+ * projection must decode it to DET (1), not POINTING: an unrecognised mode
+ * byte must not be read as "the satellite is under control". This is the
+ * implicit `else` arm of the ternary, untested until now. */
+void test_aocs_tlm_mode_to_state_out_of_range_falls_back_to_det(void)
+{
+    TEST_ASSERT_EQUAL_UINT32(1U, aocs_tlm_mode_to_state(2U));
+    TEST_ASSERT_EQUAL_UINT32(1U, aocs_tlm_mode_to_state(255U));
+    TEST_ASSERT_NOT_EQUAL_UINT32(2U, aocs_tlm_mode_to_state(2U));
+    TEST_ASSERT_NOT_EQUAL_UINT32(2U, aocs_tlm_mode_to_state(255U));
+}
+
 /* T_ANGULAR_RATE — position 21, 6 B = 3 axes x 2 B, signed. The internal
  * arithmetic of the length must hold, or a consumer walking the buffer with
  * AOCS_TLM_RATE_AXES / AOCS_TLM_RATE_BYTES_AXIS would read out of bounds. */

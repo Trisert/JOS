@@ -61,17 +61,17 @@ typedef enum {
     AOCS_STATE_FAULT    = 3,  /* AOCS declared FAULT              */
 } aocs_state_t;
 
-/* --- T_AOCS_MODE: the 1-bit telemetry projection (2 values) --------------
+/* --- T_AOCS_MODE: the 1-byte telemetry projection (2 values) -------------
  *
  * Source: SPF operational database, "TELEMETRY PARAMETERS", T_AOCS_MODE,
  * telemetry position 20: 1 B, Integer, 0 = Detumbling, 1 = Nadir-Pointing.
  * The SPF also asks ground to alert if detumbling persists longer than
  * expected; that is a ground-side check, not an OBC one.
  *
- * The field is 1 bit wide, so it can only carry the two values below. It has
- * NO DEFINED ENCODING for OFF or FAULT - a gap in the source documents, not
- * something to invent. The FOUR-valued AOCS_STATUS above is the correct
- * channel for OFF/FAULT; see aocs_state_to_tlm_mode().
+ * The field is 1 byte (2 states used), so it can only carry the two values
+ * below. It has NO DEFINED ENCODING for OFF or FAULT - a gap in the source
+ * documents, not something to invent. The FOUR-valued AOCS_STATUS above is the
+ * correct channel for OFF/FAULT; see aocs_state_to_tlm_mode().
  */
 #define AOCS_TLM_MODE_POS          20U
 #define AOCS_TLM_MODE_LEN          1U
