@@ -3,9 +3,11 @@
 
 #include <stdint.h>
 #include "cmsis_os.h"
+#include "aocs_status.h"   /* aocs_state_t + AOCS_STATUS_*: the ONE definition */
 
 /* ---------------------------------------------------------------------------
- * OBC-side AOCS contract (SPF V3 §3.3).
+ * OBC-side AOCS contract (SPF V3 §3.3; subsystem data dictionary
+ * SW_DATA_TYPES.xlsx, sheet "Data Types").
  *
  * ARCHITECTURE - the AOCS control law does NOT run on the OBC, and an earlier
  * revision of docs/api/aocs.md claimed otherwise. The satellite carries a
@@ -14,18 +16,91 @@
  * and the AOCS is SLAVE, so this module polls and reads. See
  * docs/api/aocs.md for the full contract and the blocker list.
  *
- * Only values the SPF actually fixes are defined here. The SPI frame format,
- * register map, baud/CS wiring, polling rate and scaling are NOT specified in
- * the delivered documentation, so no driver is written against them.
+ * TWO DIFFERENT THINGS - DO NOT CONFLATE THEM:
+ *
+ *   1. AOCS_STATUS  - the SUBSYSTEM STATE. 2-bit field in the housekeeping
+ *                     beacon STATUS byte (bits 3..4, 1-indexed), read by AOCS
+ *                     on the INTERNAL bus. FOUR values: OFF, DET, POINTING,
+ *                     FAULT (SW_DATA_TYPES.xlsx, row "AOCS_STATUS").
+ *   2. T_AOCS_MODE  - a TELEMETRY parameter of the SPF operational database:
+ *                     telemetry position 20, 1 B, Integer, TWO values (0/1).
+ *                     It is a lossy projection of the state, NOT the state.
+ *
+ * An earlier revision of this header modelled the state as the 2-valued
+ * T_AOCS_MODE field (0 = Detumbling, 1 = Nadir-Pointing). That is a
+ * simplification the subsystem data dictionary does not support: an AOCS
+ * FAULT was not representable. The 4-valued state now lives in
+ * aocs_state_t; the 2-valued field is kept, separate and clearly named.
+ *
+ * Only values the delivered documentation actually fixes are defined here.
+ * The SPI frame format, register map, baud/CS wiring, polling rate and
+ * scaling are NOT specified, so no driver is written against them.
  * ------------------------------------------------------------------------- */
 
-/* T_AOCS_MODE - "Current AOCS mode". Telemetry position 20, 1 B, Integer.
+/* --- AOCS_STATUS: the subsystem state (4 values) --------------------------
+ *
+ * The 2-bit field, its four states (OFF, DET, POINTING, FAULT) and the beacon
+ * STATUS byte bit positions are defined ONCE, in aocs_status.h, which this
+ * header includes. aocs_state_t therefore keeps its name and its values for
+ * every existing user of aocs.h; there is no second copy of the enum.
+ *
+ * The header split is what lets App/obsw/beacon.[ch] use aocs_state_t without
+ * acquiring this file's "cmsis_os.h" dependency (see aocs_status.h).
+ */
+
+/* --- T_AOCS_MODE: the 1-byte telemetry projection (2 values) -------------
+ *
+ * Source: SPF operational database, "TELEMETRY PARAMETERS", T_AOCS_MODE,
+ * telemetry position 20: 1 B, Integer, 0 = Detumbling, 1 = Nadir-Pointing.
  * The SPF also asks ground to alert if detumbling persists longer than
- * expected; that is a ground-side check, not an OBC one. */
+ * expected; that is a ground-side check, not an OBC one.
+ *
+ * The field is 1 byte (2 states used), so it can only carry the two values
+ * below. It has NO DEFINED ENCODING for OFF or FAULT - a gap in the source
+ * documents, not something to invent. The FOUR-valued AOCS_STATUS above is the
+ * correct channel for OFF/FAULT; see aocs_state_to_tlm_mode().
+ */
 #define AOCS_TLM_MODE_POS          20U
 #define AOCS_TLM_MODE_LEN          1U
 #define AOCS_MODE_DETUMBLING       0U
 #define AOCS_MODE_NADIR_POINTING   1U
+
+/* --- Internal 4-state <-> 2-value telemetry projection --------------------
+ *
+ * T_AOCS_MODE is LOSSY: OFF and FAULT have no code in that field. These
+ * helpers make the loss explicit instead of letting it happen by accident.
+ *
+ * Conservative encoding - DECLARED here because the source documents leave it
+ * open: both OFF and FAULT project to AOCS_MODE_DETUMBLING (0). Rationale:
+ * value 1 asserts "Nadir-Pointing", i.e. "the satellite is under control".
+ * Emitting 1 while the AOCS is off or faulted would tell ground to stand
+ * down when it must not. Projecting down to 0 never asserts a control
+ * success that has not happened; the OFF/FAULT condition itself is reported
+ * through AOCS_STATUS (2-bit), which is where the four states belong.
+ * This is the choice declared in the PR body; it is reversible in one place.
+ */
+static inline uint8_t aocs_state_to_tlm_mode(aocs_state_t state)
+{
+    switch (state) {
+    case AOCS_STATE_POINTING:
+        return (uint8_t)AOCS_MODE_NADIR_POINTING;
+    case AOCS_STATE_DET:
+    case AOCS_STATE_OFF:
+    case AOCS_STATE_FAULT:
+    default:
+        return (uint8_t)AOCS_MODE_DETUMBLING;
+    }
+}
+
+/* Inverse projection. LOSSY AND NOT INVERTIBLE: the field carries only two
+ * values, so a decoded mode can only ever be DET or POINTING. OFF and FAULT
+ * are NOT recoverable from T_AOCS_MODE - read AOCS_STATUS for those. */
+static inline aocs_state_t aocs_tlm_mode_to_state(uint8_t mode)
+{
+    return (mode == (uint8_t)AOCS_MODE_NADIR_POINTING)
+               ? AOCS_STATE_POINTING
+               : AOCS_STATE_DET;
+}
 
 /* T_ANGULAR_RATE - "Body angular rate (IMU ASM330LHHXTR), 3-axis", deg/s.
  * Telemetry position 21, 6 B total = 3 axes x 2 B, signed. Raw -> deg/s via

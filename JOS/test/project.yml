@@ -94,9 +94,18 @@
 # temp.c is the only host-compilable file in App/payloads (the rest pulls
 # stm32l4xx_hal.h), so it is listed as a single file here — the directory
 # itself must never go on :paths: :source:.
+#
+# eps_fdir.c (FDIR-EPS-EL-03/-05/-04, RED_FDIR_V2.xlsx sheet 'EPS') is listed
+# for the same reason: it is the one host-compilable translation unit in
+# App/bms — pure detection/recovery logic with no HAL, I2C or GPIO — while
+# bms.c next to it configures SPI2 through the real CubeMX struct layout and
+# must stay off the host build. Listing the single file covers it in
+# `ceedling test:all` (and in the gcov thresholds) without putting App/bms on
+# :source:, which would drag bms.c into every test binary.
 :files:
   :source:
     - ../App/payloads/temp.c
+    - ../App/bms/eps_fdir.c
 
 :defines:
   :test:
@@ -198,3 +207,11 @@
     :exception_on_fail: TRUE
     :fail_under_line: 90
     :fail_under_branch: 75
+
+# =============================================================================
+# App/obsw/beacon.c - housekeeping beacon wire format
+# =============================================================================
+# beacon.c is pure C (no HAL, no RTOS, no globals), so it is picked up by the
+# existing ../App/obsw :source: entry above and linked into every test binary
+# with no extra configuration. test/test_beacon.c pins the byte offsets of the
+# fields against the literal positions in SW_DATA_TYPES.xlsx sheet "HB".

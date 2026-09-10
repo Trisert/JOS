@@ -6,6 +6,23 @@
  *   BQ76905 is on the EPS board, connected to the EPS MCU via local I2C.
  *   The OBC queries the EPS over the subsystem SPI bus for battery telemetry
  *   (voltage, current, temperature, SoC, SoH).
+ *
+ * NOTE (documentation only, no code change here): SW_DATA_TYPES.xlsx places
+ * V_BAT / BAT_SOC / BAT_TEMP / I_BAT_CHG / I_BAT_DSG on CHG_I2C at address
+ * 0x26, i.e. the charger IC is read over I2C and there is no battery-monitor
+ * MCU the OBC queries over SPI. The SPI path modelled above is therefore a
+ * pre-0x26 assumption. Both readings are subteam documents without release
+ * status; reconciling them is a decision for the EPS interface work, not for
+ * this file, which keeps the pinned seam and the failure semantics unchanged
+ * (bms_poll() still returns -1 and never fabricates telemetry).
+ *
+ * The FDIR detectors for that charger IC and for the battery monitor
+ * (FDIR-EPS-EL-03 / -05), plus the OBC side of the OBC<->EPS heartbeat
+ * (FDIR-EPS-EL-04), live in App/bms/eps_fdir.c/.h. They are pure logic driven
+ * by a caller-supplied snapshot — bms.c deliberately does not drive them yet,
+ * because the charger register map and the CHG_I2C peripheral assignment are
+ * not specified in any delivered document (the same blocker as the EPS SPI
+ * frame below). See eps_fdir.h for the exact caller contract.
  */
 
 /* ---------- Subsystem SPI master to the EPS STM32L496 ----------

@@ -93,4 +93,18 @@ static inline bool bms_soc_is_low(bms_soc_band_t band)
            (band == BMS_SOC_COMMOK);
 }
 
+/* ---------------------------------------------------------------------------
+ * EPS FDIR detectors (FDIR-EPS-EL-03 / -05 / -04)
+ *
+ * The charger-IC and battery-monitor fault detection and recovery decisions
+ * are NOT here: they live in App/bms/eps_fdir.c/.h, host-unit-tested, driven
+ * by a caller-supplied state snapshot (charging current + I2C read validity,
+ * battery-monitor responsive flag, monotonic tick) and returning reset
+ * requests the caller executes. They are separate from this file so the
+ * decision logic stays testable on the host without mirroring the CubeMX SPI
+ * struct layout that keeps bms.c flight-only (see the note in
+ * test/project.yml). This header keeps the SoC band classification and the
+ * existing thresholds exactly as they were.
+ * ------------------------------------------------------------------------- */
+
 #endif /* BMS_H */

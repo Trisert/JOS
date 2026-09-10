@@ -13,6 +13,7 @@
 #include "unity.h"
 #include "comms.h"
 #include "comms_validate.h"
+#include "tec.h"                    /* comms.c's TT&C path calls tec_dispatch() */
 #include "sha256.h"                /* sealed-frame builder uses the tag API   */
 #include "mock_state_machine.h"
 #include "mock_watchdog.h"     /* link seam only (no expectations queued)     */
