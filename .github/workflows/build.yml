@@ -219,3 +219,99 @@ jobs:
           name: unit-test-coverage
           path: JOS/test/build/artifacts/gcov/
           if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Workflow-schema gate.
+  #
+  # WHY THIS EXISTS: `.github/workflows/codeql.yml` carried `paths-ignore:`
+  # inside the `with:` block of `github/codeql-action/init`, which is not a
+  # valid input for that action. GitHub refuses to parse the file, so every
+  # CodeQL run died at STARTUP with zero jobs:
+  #
+  #   Invalid workflow file: .github/workflows/codeql.yml#L1
+  #   (Line: 84, Col: 13): A sequence was not expected
+  #
+  # A workflow that cannot parse cannot report anything, so the failure was
+  # SILENT: the gate looked configured in the UI and simply never ran a single
+  # job. Nothing in the repo could catch that -- only GitHub's own parser,
+  # too late and outside the PR checks.
+  #
+  # actionlint is a local static analyser (single binary, no quota, no hosted
+  # bot), so this is an in-house gate on the same footing as cppcheck: it
+  # validates workflow syntax AND every action input against its built-in
+  # action database, which is exactly the check that was missing. It is
+  # verified to flag the historical defect at the same line:col GitHub
+  # reported (see the canary step).
+  # ---------------------------------------------------------------------------
+  workflow-lint:
+    name: Workflow lint (actionlint)
+    # Pinned runner, same policy as static-analysis above: an image refresh
+    # must not be able to change the gate result behind our backs.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # PINNED UPSTREAM VERSION. An actionlint bump can add or retune checks;
+      # to move it, change ACTIONLINT_VERSION here and the canary below in the
+      # same PR.
+      - name: Install pinned actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.7
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL --connect-timeout 15 --max-time 120 "$url" -o /tmp/actionlint.tgz
+          tar -xzf /tmp/actionlint.tgz -C /tmp actionlint
+          sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+          actionlint -version
+
+      - name: Lint every workflow
+        run: actionlint -color
+
+      # Proof-of-life, same policy as the cppcheck canary above: assert the
+      # gate can still go RED on the exact regression that killed CodeQL. A
+      # lint gate that cannot fail is decoration. The scratch repo carries the
+      # historical (invalid) `init` step; the canary asserts BOTH that
+      # actionlint exits non-zero AND that it points at the offending line
+      # (`JOS/Drivers`), so it cannot pass for an unrelated reason.
+      - name: Canary (assert the lint gate can fail)
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          mkdir -p "$tmp/.github/workflows"
+          git init -q "$tmp"
+          # Backtick-free heredoc body, uniformly indented: a YAML document may
+          # be indented as a whole, so this parses exactly like the original.
+          cat > "$tmp/.github/workflows/canary.yml" <<'YAML'
+          name: canary
+          on: push
+          jobs:
+            analyze:
+              runs-on: ubuntu-24.04
+              steps:
+                - uses: github/codeql-action/init@v4
+                  with:
+                    languages: c-cpp
+                    paths-ignore:
+                      - JOS/Drivers/**
+          YAML
+          set +e
+          out="$(cd "$tmp" && actionlint 2>&1)"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "ERROR: actionlint accepted an invalid 'paths-ignore' input"
+            echo "       on codeql-action/init -- the very defect that made"
+            echo "       CodeQL die at startup with zero jobs. The lint gate can"
+            echo "       no longer catch it; revisit the gate before merging."
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q 'JOS/Drivers'; then
+            echo "ERROR: actionlint failed, but not on the injected defect:"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+          echo "OK: the invalid codeql-action/init input is still rejected."
+          printf '%s\n' "$out" | head -3
+
