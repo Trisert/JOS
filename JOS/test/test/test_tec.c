@@ -17,6 +17,15 @@
  *     TEC_ERR_UNDEFINED_TASK — never ignored;
  *   - a write to a read-only VarAddr is refused AND the write callback is not
  *     reached; a write to an R/W VarAddr is accepted and reaches the callback;
+ *   - a Variable-change command with several records is ALL-OR-NOTHING: if any
+ *     record is bad (unknown address, read-only, no sink) NOT ONE record is
+ *     applied, so the ground's error and the subsystem state agree;
+ *   - tec_var_write() validates the address and the permission but NOT the
+ *     value: 1e30f, NaN and Inf reach the callback verbatim (documented
+ *     contract — the owning subsystem owns the admissible range);
+ *   - the type ID column (1..4, the enum) and the wire Bin ID column (0..3,
+ *     TEC_WIRE_TYPE_*) are pinned side by side, because they differ (PE = 3 vs
+ *     wire 2) and the frame layer must use the wire one;
  *   - the Variable-change record decode is big-endian: the payload is built
  *     from explicit bytes, so correctness does not depend on host endianness.
  *
@@ -390,6 +399,32 @@ void test_task_types_are_the_literal_spec_values(void)
     TEST_ASSERT_EQUAL_INT(4, (int)TEC_TYPE_DT);
 }
 
+/* The 'Task types' sheet carries TWO numberings: the human-facing "ID" column
+ * (1..4, what the enum holds) and the 2-bit "Bin ID" column that actually goes
+ * on the wire (HK='00', DAQ='01', PE='10', DT='11'). They are not the same
+ * number and must not be confused — PE has ID 3 but wire value 2. Pinned here
+ * as literals so the frame layer (#89) has a checked mapping to wire against. */
+void test_task_type_wire_bin_ids_match_spec_literals(void)
+{
+    TEST_ASSERT_EQUAL_UINT8(0U, (uint8_t)TEC_WIRE_TYPE_HK);
+    TEST_ASSERT_EQUAL_UINT8(1U, (uint8_t)TEC_WIRE_TYPE_DAQ);
+    TEST_ASSERT_EQUAL_UINT8(2U, (uint8_t)TEC_WIRE_TYPE_PE);
+    TEST_ASSERT_EQUAL_UINT8(3U, (uint8_t)TEC_WIRE_TYPE_DT);
+
+    /* The documented relation between the two columns: wire = ID - 1, i.e.
+     * the wire field is the zero-based index of the type. Asserting it makes a
+     * future renumbering of either column fail loudly instead of silently
+     * shifting every type on the link. */
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)((int)TEC_TYPE_HK  - 1), (uint8_t)TEC_WIRE_TYPE_HK);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)((int)TEC_TYPE_DAQ - 1), (uint8_t)TEC_WIRE_TYPE_DAQ);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)((int)TEC_TYPE_PE  - 1), (uint8_t)TEC_WIRE_TYPE_PE);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)((int)TEC_TYPE_DT  - 1), (uint8_t)TEC_WIRE_TYPE_DT);
+
+    /* The two fields fit the spec's claimed widths. */
+    TEST_ASSERT_TRUE((uint8_t)TEC_WIRE_TYPE_DT <= 3U);   /* 2 bits  */
+    TEST_ASSERT_TRUE((int)TEC_TYPE_DT <= 4);             /* ID col  */
+}
+
 /* ========================================================================== */
 /* Handler registration                                                       */
 /* ========================================================================== */
@@ -542,6 +577,60 @@ void test_variable_store_error_is_propagated(void)
     TEST_ASSERT_EQUAL_INT(TEC_ERR_UNKNOWN_VAR, tec_var_write(14U, 1.0f));
 }
 
+/* Build a float from its raw IEEE-754 bits, so a NaN / Inf can be constructed
+ * without relying on host maths library subtleties. */
+static float float_from_bits(uint32_t bits)
+{
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+/* CONTRACT (documented in tec.h): tec_var_write validates the ADDRESS and the
+ * permission, NOT the value. No range check, no NaN/Inf rejection — the value
+ * is the owning subsystem's responsibility and is forwarded verbatim. This test
+ * pins that contract so it cannot be tightened silently into a half-check that
+ * makes the module refuse values the subsystem would have accepted. */
+void test_var_write_forwards_value_without_range_or_finite_check(void)
+{
+    const float nan = float_from_bits(0x7FC00000U);   /* quiet NaN  */
+    const float inf = float_from_bits(0x7F800000U);   /* +Inf       */
+    uint32_t    got_bits;
+
+    TEST_ASSERT_EQUAL_INT(TEC_OK, tec_var_write(14U, 1e30f));
+    TEST_ASSERT_EQUAL_INT(1, g_var_write_calls);
+    TEST_ASSERT_EQUAL_FLOAT(1e30f, g_last_var_value);
+
+    TEST_ASSERT_EQUAL_INT(TEC_OK, tec_var_write(14U, nan));
+    TEST_ASSERT_EQUAL_INT(2, g_var_write_calls);
+    memcpy(&got_bits, &g_last_var_value, sizeof got_bits);
+    TEST_ASSERT_EQUAL_HEX32(0x7FC00000U, got_bits);
+
+    TEST_ASSERT_EQUAL_INT(TEC_OK, tec_var_write(15U, inf));
+    TEST_ASSERT_EQUAL_INT(3, g_var_write_calls);
+    memcpy(&got_bits, &g_last_var_value, sizeof got_bits);
+    TEST_ASSERT_EQUAL_HEX32(0x7F800000U, got_bits);
+}
+
+/* Same contract, end to end through the 0x03 handler: a NaN value on the wire
+ * is decoded and delivered to the subsystem, not swallowed by tec.c. */
+void test_variable_change_forwards_non_finite_value(void)
+{
+    static const uint8_t payload[] = {
+        0x00U, 0x0EU, 0x7FU, 0xC0U, 0x00U, 0x00U,   /* addr 14, NaN, 1e30-free path */
+    };
+    uint32_t got_bits;
+
+    tec_register_default_handlers();
+    TEST_ASSERT_EQUAL_INT(TEC_OK,
+                          tec_dispatch(TEC_TYPE_HK, 0x03U,
+                                       payload, sizeof payload));
+    TEST_ASSERT_EQUAL_INT(1, g_var_write_calls);
+    TEST_ASSERT_EQUAL_UINT16(14U, g_last_var_addr);
+    memcpy(&got_bits, &g_last_var_value, sizeof got_bits);
+    TEST_ASSERT_EQUAL_HEX32(0x7FC00000U, got_bits);
+}
+
 /* ========================================================================== */
 /* Variable change (HK 0x03) end to end                                       */
 /* ========================================================================== */
@@ -568,9 +657,12 @@ void test_variable_change_applies_records(void)
     TEST_ASSERT_EQUAL_FLOAT(2.5f, g_last_var_value);
 }
 
-/* A read-only target in the middle of the list stops the whole command: the
- * ground must learn that the command was not fully applied. */
-void test_variable_change_refuses_read_only_target(void)
+/* ATOMICITY: a command with an allowed record followed by a refused one must
+ * leave the subsystem COMPLETELY untouched. The prior behaviour applied the
+ * good record and then failed, so the ground got an error while the subsystem
+ * was half-configured and a retry double-applied the first record. Now a single
+ * bad record anywhere refuses the whole command up front. */
+void test_variable_change_is_all_or_nothing_with_read_only_target(void)
 {
     static const uint8_t payload[] = {
         0x00U, 0x0EU, 0x3FU, 0x80U, 0x00U, 0x00U,   /* addr 14, 1.0f : allowed  */
@@ -582,9 +674,69 @@ void test_variable_change_refuses_read_only_target(void)
                           tec_dispatch(TEC_TYPE_HK, 0x03U,
                                        payload, sizeof payload));
 
-    /* the first record reached the store, the offending one did not */
-    TEST_ASSERT_EQUAL_INT(1, g_var_write_calls);
+    /* pre-validation refused the command: NOT ONE record reached the store */
+    TEST_ASSERT_EQUAL_INT(0, g_var_write_calls);
+}
+
+/* Same all-or-nothing rule when the offending record is an UNKNOWN address,
+ * and when it is the FIRST record (so the good one comes afterwards). */
+void test_variable_change_is_all_or_nothing_with_unknown_address(void)
+{
+    static const uint8_t bad_last[] = {
+        0x00U, 0x0EU, 0x3FU, 0x80U, 0x00U, 0x00U,   /* addr 14, allowed      */
+        0x00U, 0x63U, 0x3FU, 0x80U, 0x00U, 0x00U,   /* addr 99, unknown -> bad */
+    };
+    static const uint8_t bad_first[] = {
+        0x00U, 0x63U, 0x3FU, 0x80U, 0x00U, 0x00U,   /* addr 99, unknown -> bad */
+        0x00U, 0x0EU, 0x3FU, 0x80U, 0x00U, 0x00U,   /* addr 14, allowed      */
+    };
+
+    tec_register_default_handlers();
+
+    TEST_ASSERT_EQUAL_INT(TEC_ERR_UNKNOWN_VAR,
+                          tec_dispatch(TEC_TYPE_HK, 0x03U,
+                                       bad_last, sizeof bad_last));
+    TEST_ASSERT_EQUAL_INT(0, g_var_write_calls);
+
+    TEST_ASSERT_EQUAL_INT(TEC_ERR_UNKNOWN_VAR,
+                          tec_dispatch(TEC_TYPE_HK, 0x03U,
+                                       bad_first, sizeof bad_first));
+    TEST_ASSERT_EQUAL_INT(0, g_var_write_calls);
+}
+
+/* And when no write callback is installed, the whole command is refused before
+ * any record is "applied" — the pre-pass checks that the sink exists. */
+void test_variable_change_is_all_or_nothing_without_var_ops(void)
+{
+    static const uint8_t payload[] = {
+        0x00U, 0x0EU, 0x3FU, 0x80U, 0x00U, 0x00U,   /* addr 14, allowed */
+    };
+
+    tec_register_default_handlers();
+    tec_set_var_ops(NULL);
+    TEST_ASSERT_EQUAL_INT(TEC_ERR_NO_VAR_OPS,
+                          tec_dispatch(TEC_TYPE_HK, 0x03U,
+                                       payload, sizeof payload));
+    TEST_ASSERT_EQUAL_INT(0, g_var_write_calls);
+}
+
+/* A fully valid command still applies every record, in order: the pre-pass
+ * must not have turned the happy path into a no-op. */
+void test_variable_change_valid_command_applies_every_record(void)
+{
+    static const uint8_t payload[] = {
+        0x00U, 0x0EU, 0x3FU, 0x80U, 0x00U, 0x00U,   /* addr 14, 1.0f  */
+        0x00U, 0x0FU, 0x40U, 0x20U, 0x00U, 0x00U,   /* addr 15, 2.5f  */
+        0x00U, 0x0EU, 0x40U, 0x40U, 0x00U, 0x00U,   /* addr 14, 3.0f  */
+    };
+
+    tec_register_default_handlers();
+    TEST_ASSERT_EQUAL_INT(TEC_OK,
+                          tec_dispatch(TEC_TYPE_HK, 0x03U,
+                                       payload, sizeof payload));
+    TEST_ASSERT_EQUAL_INT(3, g_var_write_calls);
     TEST_ASSERT_EQUAL_UINT16(14U, g_last_var_addr);
+    TEST_ASSERT_EQUAL_FLOAT(3.0f, g_last_var_value);
 }
 
 void test_variable_change_rejects_bad_shape_directly(void)

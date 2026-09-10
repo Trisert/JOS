@@ -40,6 +40,17 @@
  *     count, or an N-byte record repeated an integral number of times).
  *   - a variable write must respect the VarAddr permission: writing a
  *     read-only variable is refused with TEC_ERR_READ_ONLY.
+ *   - a multi-record Variable-change command (HK 0x03) is ALL-OR-NOTHING: every
+ *     record's metadata (known address, RW permission, write sink present) is
+ *     validated BEFORE the first write, so a command with one bad record
+ *     applies nothing. Partial application would leave the subsystem
+ *     half-configured while the ground sees an error, and a retry would
+ *     re-apply the leading records (double-apply).
+ *
+ * WHAT IS DELIBERATELY NOT ENFORCED HERE:
+ *   - the VALUE of a variable write. No range check, no NaN/Inf rejection: the
+ *     admissible range and meaning of a variable belong to the subsystem that
+ *     owns it, and tec_var_write() forwards the value verbatim (see its doc).
  *
  * Refs: NASA Power of Ten #1/#5 (bounded arithmetic, fixed loop bounds),
  *       NASA-STD-8739.8 (unknown/malformed/out-of-range commands are rejected,
@@ -54,17 +65,57 @@
 /** Maximum PL length carried in INFO byte 4 (spec: 0..100). */
 #define TEC_PAYLOAD_MAX 100U
 
-/** One Variable-change record: uint16 address + float32 value (spec: 6 B). */
+/**
+ * One Variable-change record: uint16 address + float32 value = 6 bytes.
+ *
+ * SOURCE OF TRUTH — 'HK tasks' sheet, block #03 "Variable change": Byte 1-2
+ * Address (uint16, 0..65535), Byte 3-6 Value (float32, 0..4294967295), plus the
+ * note "these 6 bytes can be repeated based on variables that need to change,
+ * padding is computed accordingly (not fixed)". That block states the field
+ * widths explicitly, so 6 is the only width it can mean.
+ *
+ * DOCUMENT CONFLICT (to be clarified with TT&C before flight use) — the same
+ * workbook summarises the very same task inconsistently in 'Task details':
+ *   - row 7 (the "Variable change" row) gives PL bytes = "2* N" and Description
+ *     = "(1 byte address + 1 byte value) * N"      -> a 2-byte record;
+ *   - row 6, Remarks column — a row-shifted cell that lands on the "Exit state"
+ *     row but describes variable change — gives
+ *     "(2*1 byte address + 2*1 byte value) * N"    -> a 4-byte record.
+ * Neither 2 nor 4 agrees with the 6-byte detail block. This module follows the
+ * detail block (the only place uint16/float32 are spelled out); the two summary
+ * variants are an open item for TT&C, not silently reconciled here.
+ */
 #define TEC_VAR_CHANGE_RECORD_LEN 6U
 
 /* ---------- TEC task types (INFO byte 3, bits 1-2) ---------- */
 
+/*
+ * The spec ('Task types' sheet) numbers each type TWICE, and the two are not
+ * the same number:
+ *
+ *   column "ID"     — human-facing identifier, 1..4   (what tec_type_t holds)
+ *   column "Bin ID" — the 2-bit value on the wire: HK='00', DAQ='01',
+ *                     PE='10', DT='11'                  (i.e. TEC_WIRE_TYPE_*)
+ *
+ * Concretely PE has ID 3 but wire value 2. The enum below keeps the ID column
+ * because renumbering it is a committente decision (issue #89/#89-bis); the
+ * wire mapping is exposed as separate constants so the frame layer can convert
+ * explicitly instead of casting, and a test pins both columns. DO NOT use the
+ * enum value as a wire value.
+ */
 typedef enum {
     TEC_TYPE_HK  = 1,   /**< Housekeeping        */
     TEC_TYPE_DAQ = 2,   /**< Data Acquisition    */
     TEC_TYPE_PE  = 3,   /**< Payload Execution   */
     TEC_TYPE_DT  = 4,   /**< Data Transfer       */
 } tec_type_t;
+
+/* Wire (2-bit Bin ID) values — 'Task types' sheet, column "Bin ID".
+ * These, not the tec_type_t values above, go into INFO byte 3 bits 1-2. */
+#define TEC_WIRE_TYPE_HK   0U   /**< Bin ID "00" */
+#define TEC_WIRE_TYPE_DAQ  1U   /**< Bin ID "01" */
+#define TEC_WIRE_TYPE_PE   2U   /**< Bin ID "10" */
+#define TEC_WIRE_TYPE_DT   3U   /**< Bin ID "11" */
 
 /* ---------- HK task ids (TEC task field, 6 bits) ---------- */
 
@@ -148,7 +199,12 @@ typedef tec_result_t (*tec_handler_fn)(tec_type_t type, uint8_t task,
 /** Read one variable. @p out is non-NULL; return TEC_OK on success. */
 typedef tec_result_t (*tec_var_read_fn)(uint16_t addr, float *out, void *arg);
 
-/** Write one variable (already permission-checked by tec_var_write()). */
+/**
+ * Write one variable (address and permission already checked by
+ * tec_var_write()). The VALUE is passed through unvalidated — rejecting a
+ * value out of the variable's admissible range is this callback's job, because
+ * only the owning subsystem knows that range.
+ */
 typedef tec_result_t (*tec_var_write_fn)(uint16_t addr, float value, void *arg);
 
 typedef struct {
@@ -175,8 +231,11 @@ tec_result_t tec_register_handler(tec_type_t type, uint8_t task,
  * Register the built-in handlers. Today that is HK Variable change (0x03),
  * whose behaviour is pure VarAddr data access and therefore generic: it walks
  * the payload as repeated [uint16 address big-endian][float32 value
- * big-endian] records and applies each through tec_var_write(), so the R/RW
- * permission rule is enforced in one place. No subsystem knowledge is needed.
+ * big-endian] records, validates EVERY record's metadata up front (known
+ * address, RW permission, write sink present) and only then applies each
+ * through tec_var_write() — so the R/RW permission rule is enforced in one
+ * place and the command is applied all-or-nothing. No subsystem knowledge is
+ * needed.
  */
 void tec_register_default_handlers(void);
 
@@ -202,9 +261,15 @@ tec_result_t tec_dispatch(tec_type_t type, uint8_t task,
  *
  * @p len must be a non-zero multiple of TEC_VAR_CHANGE_RECORD_LEN and at most
  * TEC_PAYLOAD_MAX. Decoding is big-endian byte assembly (never a cast), so it
- * is correct on any host and does not depend on struct layout. Stops at the
- * first record the permission rules refuse and returns that error, so a
- * rejected record is never silently skipped.
+ * is correct on any host and does not depend on struct layout.
+ *
+ * ALL-OR-NOTHING: the metadata of EVERY record (known address, RW permission,
+ * write sink installed) is validated in a pre-pass before the first write. If
+ * any record is refused the whole command is refused with that first error and
+ * NO record is applied. A partial apply would leave the subsystem
+ * half-configured on the ground's error, and a ground retry would re-apply the
+ * leading records. Once the pre-pass passes, every record is applied in order
+ * (the write loop keeps its own error return as a defensive check).
  */
 tec_result_t tec_hk_variable_change(const uint8_t *payload, size_t len);
 
@@ -218,8 +283,17 @@ tec_result_t tec_var_read(uint16_t addr, float *out);
 
 /**
  * Write @p value to @p addr.
- * TEC_ERR_UNKNOWN_VAR if not in the table, TEC_ERR_READ_ONLY if the variable
- * is declared R, TEC_ERR_NO_VAR_OPS if no write callback is installed.
+ *
+ * ADDRESS and PERMISSION are validated here: TEC_ERR_UNKNOWN_VAR if @p addr is
+ * not in the table, TEC_ERR_READ_ONLY if the variable is declared R,
+ * TEC_ERR_NO_VAR_OPS if no write callback is installed.
+ *
+ * The VALUE is NOT validated here — no range check, no NaN/Inf rejection. The
+ * admissible range and the meaning of a variable belong to the subsystem that
+ * owns it (the same reason this module never talks to the subsystem directly):
+ * a value outside the spec range, or a non-finite float, is forwarded verbatim
+ * to the write callback, which is the only layer that can accept or refuse it.
+ * This is a deliberate contract, not an omission, and is pinned by a test.
  */
 tec_result_t tec_var_write(uint16_t addr, float value);
 

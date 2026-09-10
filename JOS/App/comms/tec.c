@@ -258,11 +258,42 @@ static uint16_t read_be16(const uint8_t *p)
     return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 
+/* Pre-validation pass over the metadata of every record, run BEFORE the first
+ * write so the whole command is applied all-or-nothing. Only the parts that do
+ * not depend on the apply actually happening are checked: the address must be
+ * in the VarAddr table, it must be writable (RW), and a write sink must be
+ * installed. This mirrors exactly what tec_var_write() would enforce, minus the
+ * call itself, so the pre-pass cannot reject what tec_var_write would accept.
+ *
+ * The VALUE is deliberately not inspected: no range check, no NaN/Inf test.
+ * That contract lives with the owning subsystem and is documented in tec.h. */
+static tec_result_t validate_var_records(const uint8_t *payload, size_t len)
+{
+    size_t off;
+
+    for (off = 0U; off < len; off += (size_t)TEC_VAR_CHANGE_RECORD_LEN) {
+        uint16_t              addr = read_be16(&payload[off]);
+        const tec_var_desc_t *desc = tec_var_lookup(addr);
+
+        if (desc == NULL) {
+            return TEC_ERR_UNKNOWN_VAR;
+        }
+        if (desc->access != TEC_ACCESS_RW) {
+            return TEC_ERR_READ_ONLY;
+        }
+        if (s_var_ops.write == NULL) {
+            return TEC_ERR_NO_VAR_OPS;
+        }
+    }
+    return TEC_OK;
+}
+
 tec_result_t tec_hk_variable_change(const uint8_t *payload, size_t len)
 {
-    size_t   off;
-    uint32_t bits;
-    float    value;
+    size_t       off;
+    uint32_t     bits;
+    float        value;
+    tec_result_t rc;
 
     if (payload == NULL) {
         return TEC_ERR_NULL_ARG;
@@ -272,9 +303,15 @@ tec_result_t tec_hk_variable_change(const uint8_t *payload, size_t len)
         return TEC_ERR_BAD_LENGTH;
     }
 
+    /* All-or-nothing: validate every record's metadata first. A bad record
+     * anywhere refuses the command before ANY write is applied. */
+    rc = validate_var_records(payload, len);
+    if (rc != TEC_OK) {
+        return rc;
+    }
+
     for (off = 0U; off < len; off += (size_t)TEC_VAR_CHANGE_RECORD_LEN) {
         uint16_t addr = read_be16(&payload[off]);
-        tec_result_t rc;
 
         bits = read_be32(&payload[off + 2U]);
         /* memcpy, not a pointer cast: the bits ARE the IEEE-754 value here
@@ -284,7 +321,7 @@ tec_result_t tec_hk_variable_change(const uint8_t *payload, size_t len)
 
         rc = tec_var_write(addr, value);
         if (rc != TEC_OK) {
-            return rc;   /* first refusal wins; never skip a record silently */
+            return rc;   /* defensive: the pre-pass already cleared this path */
         }
     }
     return TEC_OK;
