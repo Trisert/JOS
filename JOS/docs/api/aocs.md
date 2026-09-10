@@ -32,6 +32,46 @@ connector (SPF §3.3.2). This bus is separate from the payload SPI.
 `App/aocs/aocs.c` therefore holds the **OBC side only**: the polling task and
 the telemetry it consumes.
 
+## EPS telemetry read path (corrected)
+
+An earlier reading of this interface treated the EPS/PDU row above as if the
+OBC read the battery and charger quantities over the **subsystem SPI** to an
+EPS microcontroller. `SW_DATA_TYPES.xlsx` (sheet `Data Types`) does not
+support that: the five EPS quantities in the housekeeping beacon are read by
+**EPS** from the **charger IC over I²C**, on bus `CHG_I2C`, address `0x26`:
+
+| Quantity | Type | Read by | Bus | Address | In HB |
+|---|---|---|---|---|---|
+| `V_BAT` | Digital, 8 bit | EPS | `CHG_I2C` | `0x26` | Yes |
+| `BAT_SOC` | Digital, 8 bit | EPS | `CHG_I2C` | `0x26` | Yes |
+| `BAT_TEMP` | Digital, 8 bit | EPS | `CHG_I2C` | `0x26` | Yes |
+| `I_BAT_CHG` | Digital, 8 bit | EPS | `CHG_I2C` | `0x26` | Yes |
+| `I_BAT_DSG` | Digital, 8 bit | EPS | `CHG_I2C` | `0x26` | Yes |
+
+`AOCS_PWR_CONS` and `SC_CHG` are also EPS-owned; their bus is left as `/`
+(unassigned) in the same sheet. `BAT_STATUS`, `LINES_FAULT`, `AOCS_STATUS`
+and `OBC_STATUS` are read by EPS/AOCS/OBC on the `EPS`/`INTERNAL` bus — *not*
+from the charger.
+
+Consequences, recorded here because they contradict the current model:
+
+- The charger IC (`MP2650`) is an **I²C peripheral at 0x26**, read directly —
+  not a value relayed by an EPS MCU over SPI. `RED_FDIR_V2.xlsx`
+  (FDIR-EPS-EL-03) independently describes the charger as monitored *via I²C
+  to the charger IC*, and the battery monitor (FDIR-EPS-EL-05) as a **separate
+  IC** from the EPS µC. That corroborates the bus assignment above.
+- The **subsystem SPI** remains the link to the **AOCS** board (see the
+  architecture section). The EPS SPI row is about the EPS heartbeat/control
+  link, not about carrying `V_BAT`/`BAT_SOC`/currents.
+- Anything that today models "read the battery over SPI from an EPS MCU" is
+  modelled against the wrong bus. The OBC-side seam for these quantities is an
+  **I²C read at 0x26**; correcting it is `App/bms` work, out of scope for this
+  document revision but recorded so it is not lost.
+
+`SW_DATA_TYPES.xlsx` carries no release status (its fields include
+"da valutare"/TBD), so this is the best available evidence, not an approved
+baseline — to be confirmed with the EPS subteam.
+
 ## OBC-side contract — what the SPF actually fixes
 
 Two telemetry entries (SPF operational database, "TELEMETRY PARAMETERS",
@@ -41,6 +81,42 @@ naming prefix `T_`):
 |---|---|---|---|---|
 | `T_AOCS_MODE` | 20 | 1 B | Integer | `0` = Detumbling, `1` = Nadir-Pointing |
 | `T_ANGULAR_RATE` | 21 | 6 B | Integer (signed) | 3 axes, 2 B per axis, deg/s; raw → deg/s via the IMU datasheet scale factor |
+
+### `AOCS_STATUS` (4 states) is not `T_AOCS_MODE` (2 values)
+
+These are **two different things** and must not be conflated, which is what an
+earlier revision of `aocs.h` did:
+
+| | `AOCS_STATUS` | `T_AOCS_MODE` |
+|---|---|---|
+| **What it is** | the AOCS **subsystem state** | a **telemetry** parameter |
+| **Source** | `SW_DATA_TYPES.xlsx`, row `AOCS_STATUS` | SPF operational database, pos 20 |
+| **Width / size** | 2 bit, in the beacon `STATUS` byte (bits 3–4) | 1 B (1 bit of information) |
+| **Read by / bus** | AOCS, `INTERNAL` | OBC telemetry uplink |
+| **Values** | **four**: OFF, DET, POINTING, FAULT | **two**: `0` = Detumbling, `1` = Nadir-Pointing |
+| **In housekeeping** | Yes (beacon STATUS byte) | Yes (logged every beacon) |
+
+So the 4-state model lives in `AOCS_STATUS`; `T_AOCS_MODE` is a 2-valued
+projection of it. `aocs.h` now carries both: `aocs_state_t` (OFF/DET/POINTING/
+FAULT) and the unchanged `AOCS_MODE_DETUMBLING`/`AOCS_MODE_NADIR_POINTING`
+values, plus the explicit conversion `aocs_state_to_tlm_mode()`.
+
+`SW_DATA_TYPES.xlsx` lists the four states in the order OFF, DET, POINTING,
+FAULT but **gives no numeric codes**. `aocs.h` numbers them 0–3 in that
+listing order and says so in the comment; if the AOCS team assigns different
+codes, only the enum changes.
+
+**The FAULT/OFF → telemetry gap.** `T_AOCS_MODE` is 1 bit, so it has **no
+defined encoding for OFF or FAULT** — a real gap in the source documents, not
+something to invent. `aocs_state_to_tlm_mode()` therefore uses a conservative,
+declared encoding: **OFF and FAULT both project to `0` (Detumbling)**. Value
+`1` asserts *"Nadir-Pointing", i.e. the satellite is under control*; emitting
+it while the AOCS is off or faulted would tell ground to stand down when it
+must not. The OFF/FAULT condition itself is carried by `AOCS_STATUS` (the
+2-bit field, the correct channel for all four states) — not squeezed into
+`T_AOCS_MODE`. The choice is declared in the header and in the PR body, and
+lives in one function so it can be revisited once the AOCS subteam defines a
+telemetry code for FAULT.
 
 The OBC is required to log `T_AOCS_MODE` in every beacon, and to monitor
 `T_ANGULAR_RATE` against a critical-event threshold of **10 deg/s on any
@@ -93,7 +169,9 @@ delivered documentation specifies none of:
 - timeouts, retry policy, CRC or any reply validation;
 - the OBC→AOCS command that changes mode *even though* the SPF says the
   transition is ground-commanded — no telecommand is mapped to it;
-- `T_AOCS_MODE` values beyond `0`/`1`;
+- a telemetry code for `AOCS_STATUS = FAULT` (and `OFF`) in the 1-bit
+  `T_AOCS_MODE` field — the field has only two codes, so OFF/FAULT are a
+  documented gap, resolved conservatively in `aocs.h` (see above);
 - how an AOCS power-on-kill is reported.
 
 These belong in an **OBC↔AOCS ICD**. Until it exists, `aocs.h` carries only
@@ -126,5 +204,8 @@ the SPF-fixed values, and the driver stays unimplemented.
    watchdog-monitored. It is blocked today only by the driver above; creating
    it makes "AOCS monitored" true rather than absent.
 2. Consume `T_AOCS_MODE` in the beacon payload once the ICD lands — the
-   requirement to log it every beacon is already specified.
+   requirement to log it every beacon is already specified. When the beacon's
+   `STATUS` byte is assembled (payload work, not this module), populate the
+   2-bit `AOCS_STATUS` field from `aocs_state_t` so OFF/FAULT are not lost;
+   `T_AOCS_MODE` alone cannot carry them.
 3. Everything else waits on the OBC↔AOCS ICD.
