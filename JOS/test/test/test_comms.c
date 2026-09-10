@@ -2451,6 +2451,39 @@ void test_rx_ttc_dispatches_exit_state_new_state(void)
     TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_ttc_frame(ttc_buf, n));
 }
 
+/* The state machine can REFUSE a well-formed transition request (boot-CRC
+   image untrusted, or the SRAM2-parity latch held). A refusal is NOT an
+   executed command: the frame must come back as a rejection and be counted
+   rejected, never accepted. Pins that the Exit-state handler propagates the
+   state machine's verdict instead of discarding it. */
+void test_rx_ttc_exit_state_transition_refused_is_rejected(void)
+{
+    comms_rx_stats_t before, after;
+    comms_ttc_info_t info;
+    const uint8_t    payload[2] = { 3U, 4U };   /* STATE_READY -> STATE_ACTIVE */
+    size_t           n          = 0U;
+
+    comms_ttc_set_mac_verifier(ttc_mac_recording);
+    ttc_mac_seen_calls  = 0;
+    ttc_mac_seen_accept = 1;
+
+    ttc_info_init(&info, 5U, 0x55U, 0U, 0x02U, 2U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL,
+                              payload, sizeof(payload), &n));
+
+    comms_rx_get_stats(&before);
+
+    /* -1 = the state machine refused the transition. */
+    state_machine_request_transition_ExpectAndReturn(STATE_ACTIVE, TRIGGER_GROUND_CMD, -1);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PAYLOAD_LEN, comms_rx_handle_ttc_frame(ttc_buf, n));
+
+    comms_rx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.accepted, after.accepted);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected + 1U, after.rejected);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_range + 1U, after.rejected_range);
+}
+
 /* End-to-end on an ECC-ON frame: the payload is de-interleaved out of the
    16-byte blocks before dispatch, so Exit state still applies the REQUESTED
    new state, and the MAC seam sees the de-interleaved 4 MAC bytes. */

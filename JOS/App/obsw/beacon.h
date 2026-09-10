@@ -430,4 +430,19 @@ _Static_assert(BEACON_STATUS_BAT_STATUS_MASK == 0x01u &&
                BEACON_PAYLOADS_CRY_STATUS_MASK == 0x03u,
                "sub-field masks must match the documented field widths");
 
+/* Cross-header invariant: the 2-bit AOCS_STATUS field placed in this byte must
+ * be the SAME field App/aocs/aocs_status.h publishes. aocs_status.h states it
+ * as 1-indexed bits (AOCS_STATUS_HB_BIT_FIRST..LAST); this header states it as
+ * a hardware shift. Under the MSB-first mapping a documented "Bit N" is
+ * hardware bit (8 - N), so the field starts at (8 - LAST) and is
+ * AOCS_STATUS_BITS wide. Before this, the two headers could move the field
+ * independently and nothing in the build would notice: now a change on either
+ * side fails the build. */
+_Static_assert(BEACON_STATUS_AOCS_STATUS_SHIFT == (8u - AOCS_STATUS_HB_BIT_LAST),
+               "beacon AOCS_STATUS shift must match aocs_status.h's 1-indexed range");
+_Static_assert((BEACON_STATUS_AOCS_STATUS_MASK + 1u) == (1u << AOCS_STATUS_BITS),
+               "beacon AOCS_STATUS mask must span exactly AOCS_STATUS_BITS bits");
+_Static_assert((AOCS_STATUS_HB_BIT_LAST - AOCS_STATUS_HB_BIT_FIRST + 1u) == AOCS_STATUS_BITS,
+               "aocs_status.h AOCS_STATUS bit range must span AOCS_STATUS_BITS bits");
+
 #endif /* BEACON_H */

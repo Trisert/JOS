@@ -624,6 +624,16 @@ static comms_ttc_result_t comms_ttc_map_tec_result(tec_result_t rc)
         return COMMS_TTC_OK;
     case TEC_ERR_BAD_LENGTH:
     case TEC_ERR_BAD_VALUE:
+    case TEC_ERR_NULL_ARG:
+        return COMMS_TTC_ERR_PAYLOAD;
+    /* A variable the command may not touch (read-only VarAddr, address outside
+     * the table, or no sink installed yet) is a refusal of the command's
+     * ARGUMENTS, not "this command does not exist": the (type,task) was found
+     * and its handler ran. Reporting it as UNSUPPORTED would tell ground the
+     * opcode is unknown and hide a real permission/wiring refusal. */
+    case TEC_ERR_UNKNOWN_VAR:
+    case TEC_ERR_READ_ONLY:
+    case TEC_ERR_NO_VAR_OPS:
         return COMMS_TTC_ERR_PAYLOAD;
     case TEC_ERR_UNKNOWN_TYPE:
     case TEC_ERR_UNDEFINED_TASK:
@@ -690,8 +700,15 @@ static tec_result_t comms_ttc_hk_exit_state(tec_type_t type, uint8_t task,
         (old_state == new_state)) {
         return TEC_ERR_BAD_VALUE;
     }
-    (void)state_machine_request_transition((obw_state_t)new_state,
-                                           TRIGGER_GROUND_CMD);
+    /* The state machine can still REFUSE the transition even when the request
+     * is well formed — boot-CRC image untrusted, or the SRAM2-parity latch
+     * held (see state_machine_request_transition()). A refusal must NOT be
+     * reported as an executed command: propagate it so the frame is accounted
+     * as a rejection instead of an acceptance. */
+    if (state_machine_request_transition((obw_state_t)new_state,
+                                         TRIGGER_GROUND_CMD) != 0) {
+        return TEC_ERR_BAD_VALUE;
+    }
     return TEC_OK;
 }
 
@@ -699,14 +716,27 @@ static bool s_ttc_handlers_bound = false;
 
 static void comms_ttc_bind_handlers(void)
 {
+    tec_result_t rc_reboot;
+    tec_result_t rc_exit;
+
     if (s_ttc_handlers_bound) {
         return;
     }
-    (void)tec_register_handler(TEC_TYPE_HK, TEC_TASK_HK_OBC_REBOOT,
-                               comms_ttc_hk_obc_reboot, NULL);
-    (void)tec_register_handler(TEC_TYPE_HK, TEC_TASK_HK_EXIT_STATE,
-                               comms_ttc_hk_exit_state, NULL);
-    s_ttc_handlers_bound = true;
+    rc_reboot = tec_register_handler(TEC_TYPE_HK, TEC_TASK_HK_OBC_REBOOT,
+                                     comms_ttc_hk_obc_reboot, NULL);
+    rc_exit   = tec_register_handler(TEC_TYPE_HK, TEC_TASK_HK_EXIT_STATE,
+                                     comms_ttc_hk_exit_state, NULL);
+
+    /* Latch the flag ONLY when BOTH bindings landed. A non-OK code here means
+     * the spec table in tec.c and the constants used above have drifted apart:
+     * the affected command is then rejected (TEC_ERR_NO_HANDLER ->
+     * COMMS_TTC_ERR_UNSUPPORTED) and never executed — and because the flag
+     * stays clear, the next frame RETRIES the binding instead of freezing the
+     * silent misconfiguration in place. The registration verdict is never
+     * discarded. */
+    if ((rc_reboot == TEC_OK) && (rc_exit == TEC_OK)) {
+        s_ttc_handlers_bound = true;
+    }
 }
 
 /* Deliver an already-parsed, already-authenticated TT&C command. File-static:

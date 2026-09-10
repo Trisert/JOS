@@ -1,7 +1,9 @@
 # TT&C command frame — spec conformance
 
 Scope: the on-air **telecommand (TC) frame** used on the JOS uplink/downlink
-link, and its implementation in `App/comms/comms.c` / `App/comms/comms.h`.
+link, and its implementation: the frame codec in `App/comms/comms.c` /
+`App/comms/comms.h`, and the TEC command dispatch table in `App/comms/tec.c` /
+`App/comms/tec.h`.
 
 Status of the source: the specification below is transcribed from a subteam
 workbook that **has no release status** and contains contradictory revisions
@@ -186,7 +188,7 @@ TT&C subteam* (open point O1).
 | **Canonical frame length** | any 16-multiple within range parsed (length smuggling) | parse requires `len == comms_ttc_padded_len(HDR + PL, ecc)` exactly (`COMMS_TTC_ERR_LEN_MISMATCH` otherwise) |
 | ECC flag `0x55`/`0xAA`, RS ECC, packet geometry | absent | flag decoded/validated; with ECC on **every 16-byte block becomes a real systematic RS(16,10) codeword** (10 data + 6 parity, known-answer tested) — not zeroed. The packet is `16*n` in both modes (a parity *tail* would break !A14) |
 | MAC 4 B opaque | JOS on-board auth is a **different** scheme (truncated HMAC-SHA256 + CRC over `opcode|len|payload`) | field carried verbatim; the frame is **verified through a pluggable `comms_ttc_set_mac_verifier()` seam** whose default rejects (fail closed). The MAC bytes themselves are never computed here |
-| TEC type/task dispatch | closed opcode set `0x01..0x06` | `comms_rx_handle_ttc_frame()` maps `HK` task `0x01`→OBC reboot, `0x02`→Exit state (applies the requested new state); **unsupported types/tasks and malformed payloads return an explicit rejection verdict** (`COMMS_TTC_ERR_UNSUPPORTED` / `COMMS_TTC_ERR_PAYLOAD`) and are accounted as rejections, never accepted |
+| TEC type/task dispatch | closed opcode set `0x01..0x06` | `comms_rx_handle_ttc_frame()` dispatches through `tec_dispatch()` (the task table lives in `App/comms/tec.c`); `HK` task `0x01`→OBC reboot, `0x02`→Exit state (applies the requested new state, and a transition the state machine refuses is rejected, not counted accepted); **unsupported types/tasks and malformed payloads return an explicit rejection verdict** (`COMMS_TTC_ERR_UNSUPPORTED` / `COMMS_TTC_ERR_PAYLOAD`) and are accounted as rejections, never accepted |
 | Error codes / RX statistics | `comms_tc_result_t`, `comms_rx_stats_t` | TT&C verdicts kept in a dedicated `comms_ttc_result_t` and mapped onto the **existing** counters via `comms_ttc_to_tc_result()` |
 
 ### Where the code lives
@@ -199,6 +201,11 @@ TT&C subteam* (open point O1).
   the MAC seam. `comms_rx_handle_frame()` routes a TT&C-layout frame to the
   TT&C path; the legacy/authenticated layouts are unchanged for backward
   compatibility during migration.
+* `App/comms/tec.h` / `App/comms/tec.c` — **the single command dispatcher**:
+  the spec task table, the payload-length shapes, the VarAddr permission table
+  and the handler registry (`tec_dispatch()`). The TT&C frame layer only
+  converts its wire fields (2-bit Bin ID → `tec_type_t`) and calls into it, so
+  the task set is defined in exactly one place.
 * `test/test/test_comms.c` — codec tests asserting **literal** bytes (INFO
   bitfield, padding, ECC parity KATs, canonical length, truncation, PL length
   bound, MAC seam, dispatch verdicts, replay pin).
