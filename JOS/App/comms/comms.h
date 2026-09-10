@@ -108,22 +108,33 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len);
  *     8      4    MAC        (opaque 32-bit hash — semantics NOT specified)
  *    12      P    PAYLOAD    (0 .. COMMS_TTC_MAX_PL bytes)
  *   ...           PADDING    (zero bytes up to the 16-byte interleaving block)
- *   [tail] 16    RS ECC     (appended ONLY when the ECC flag is ON)
+ *   [tail]  6    RS ECC     (RS(255,249) parity, ONLY when the ECC flag is ON)
  *
- * INFO byte decode (the source does NOT state bit endianness; bit 1 is
- * taken as the least significant bit of the byte — see the open points in
- * docs/api/ttc-frame.md):
+ * INFO byte decode. The workbook's 'Task details' sheet settles the bit order
+ * its own prose leaves open (O3, now closed): column D "TEC bin ID" is the
+ * 8-bit byte formed by prefixing the TEC-type Bin ID ('Task types'!C4:C7 —
+ * HK=00, DAQ=01, PE=10, DT=11) to the 6-bit task Bin ID (column C, also the
+ * task id), and column E "TEC hex ID" is that byte in hex. Worked examples:
+ * 'Task details'!E5 (HK task 1, OBC reboot) = 0x01; 'Task details'!E21
+ * (HK task 17, TLE) = 0x11; 'Task details'!E55 (HK task 51, Lora link) =
+ * 0x33. So bit 1 is the MOST significant bit of the byte:
  *
  *   byte 0: Station ID   1..255              (COMMS_TTC_STATION_MIN/MAX)
  *   byte 1: ECC flag     0x55 = off, 0xAA = on
- *   byte 2: bit 1-2 = TEC type (0..3), bit 3-8 = TEC task
+ *   byte 2: bit 1-2 = TEC type (MSB, 0..3), bit 3-8 = TEC task (0..63)
  *   byte 3: PL length    0..100
  *
- * Alignment: the frame length handed to the radio MUST be a multiple of 16
- * (the source requires this for interleaving). With ECC on, the 16 trailing
- * Reed-Solomon bytes are appended after the 16-byte-aligned data section, so
- * the whole frame is still a multiple of 16. Padding is explicitly an
- * application-layer responsibility (source text); it is zero-filled here.
+ * i.e. the packed byte is (tec_type << 6) | tec_task.
+ *
+ * Alignment: the DATA section (header + payload + zero padding) handed to the
+ * radio is a multiple of 16 (the source requires 16*n for interleaving). With
+ * ECC on, the 6-byte Reed-Solomon parity tail ('Packet structure'!H54 =
+ * "6 bytes") is appended AFTER that block-aligned data section, so an ECC
+ * frame is 16*n + 6. See the block-geometry assumption A1 in
+ * docs/api/ttc-frame.md — the sheet's own diagram does not disambiguate
+ * whether the "16*n" bound covers the parity, and this is flagged for TT&C.
+ * Padding is explicitly an application-layer responsibility (source text);
+ * it is zero-filled here, and the RS parity is computed over it.
  *
  * MAC SEAM — deliberately opaque. The source only says "hash to validate GS
  * command": it does NOT define the algorithm, the keying, or whether the MAC
@@ -131,10 +142,11 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len);
  * (truncated HMAC-SHA256 over opcode|length|payload, see comms_validate.h and
  * sha256.c), and the two are NOT reconciled by this module. build_frame()
  * copies the caller's 4 bytes verbatim (zeros when NULL); parse_frame() hands
- * the same 4 bytes back untouched. No MAC is computed or verified here, and
- * nothing here removes sha256.c. Verification is a pluggable hook
- * (comms_ttc_set_mac_verifier) whose default REJECTS every frame, so the RX
- * path fails closed until the crypto decision is made.
+ * the same 4 bytes back untouched. No MAC is COMPUTED here; verification is
+ * delegated to the pluggable seam comms_ttc_set_mac_verifier(), which the RX
+ * entry point calls with those 4 bytes. The default hook REJECTS every frame,
+ * so the RX path fails closed until the crypto decision is made. Nothing here
+ * removes sha256.c.
  * ====================================================================== */
 
 /** INFO (4) + UNIX TIME (4) + MAC (4). */
@@ -146,8 +158,18 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len);
 /** Interleaving granularity: every TT&C frame length is a multiple of this. */
 #define COMMS_TTC_BLOCK         16U
 
-/** Reed-Solomon tail appended when the ECC flag is ON (none when OFF). */
-#define COMMS_TTC_ECC_TAIL_LEN  16U
+/** Reed-Solomon parity tail appended when the ECC flag is ON (none when OFF).
+ *  'Packet structure'!H54: the RS PARITY element is "6 bytes". The encoder
+ *  lives in comms.c (single TU) — see comms_ttc_rs_ecc_encode() and
+ *  docs/api/ttc-frame.md for the field/generator citation and the
+ *  block-geometry assumption (data section 16*n, parity tail of 6 after it). */
+#define COMMS_TTC_ECC_TAIL_LEN  6U
+
+/** RS parity symbols per codeword (equals the tail length). */
+#define COMMS_TTC_RS_NSYM       6U
+
+/** Largest DATA section one RS encode accepts (GF(256) code-length bound). */
+#define COMMS_TTC_RS_MAX_DATA   (255U - COMMS_TTC_RS_NSYM)
 
 /** Largest payload the field allows (INFO byte 3: 0..100). */
 #define COMMS_TTC_MAX_PL        100U
@@ -155,7 +177,9 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len);
 /** Smallest legal frame: one interleaving block (header only, zero payload). */
 #define COMMS_TTC_MIN_FRAME     COMMS_TTC_BLOCK
 
-/** Largest legal frame: 7 data blocks (112 B = header + 100 B payload) + ECC tail. */
+/** Largest legal frame: 7 data blocks (112 B = header + 100 B payload) and,
+ *  with ECC on, the 6-byte parity tail -> 118 B. Rounded up to 8 blocks so
+ *  the bound is a comfortable 16*n and leaves room for a future tail size. */
 #define COMMS_TTC_MAX_FRAME     (COMMS_TTC_BLOCK * 8U)
 
 /** ECC flag values (INFO byte 1). */
@@ -166,21 +190,22 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len);
 #define COMMS_TTC_STATION_MIN   1U
 #define COMMS_TTC_STATION_MAX   255U
 
-/** INFO byte 2 bitfield: bit 1-2 = TEC type, bit 3-8 = TEC task. */
-#define COMMS_TTC_TEC_TYPE_MASK 0x03U
-#define COMMS_TTC_TEC_TASK_MASK 0xFCU
+/** INFO byte 2 bitfield, MSB-first: bit 1-2 = TEC type, bit 3-8 = TEC task. */
+#define COMMS_TTC_TEC_TYPE_MASK 0xC0U
+#define COMMS_TTC_TEC_TASK_MASK 0x3FU
 #define COMMS_TTC_TEC_TYPE_MAX  3U
-/* The 6-bit task field can hold 0..63. The source text quotes "0-31" while
- * its own command table uses task ids up to 0x33 (51), so the full 6-bit
- * width is accepted here; the discrepancy is an open point in the doc. */
+/* The 6-bit task field can hold 0..63. The source prose quotes "0-31" while
+ * its own command table uses task ids up to 0x33 (51, 6 bits) — see open
+ * point O5. The full 6-bit width is accepted here. */
 #define COMMS_TTC_TEC_TASK_MAX  63U
 
-/** TEC task types (source table). NOTE: DT = 4 does not fit the 2-bit type
- *  field the source also specifies — flagged as an open point in the doc. */
-#define COMMS_TTC_TEC_HK        1U   /* housekeeping           */
-#define COMMS_TTC_TEC_DAQ       2U   /* data acquisition       */
-#define COMMS_TTC_TEC_PE        3U   /* payload execution      */
-#define COMMS_TTC_TEC_DT        4U   /* data transfer (see note) */
+/** TEC task types: the 2-bit Bin IDs from 'Task types'!C4:C7 (NOT the
+ *  human-facing Name IDs 1..4 in column B). The packed INFO byte is
+ *  (COMMS_TTC_TEC_* << 6) | task, so these must be the Bin IDs. */
+#define COMMS_TTC_TEC_HK        0U   /* Bin ID 00 — housekeeping        */
+#define COMMS_TTC_TEC_DAQ       1U   /* Bin ID 01 — data acquisition    */
+#define COMMS_TTC_TEC_PE        2U   /* Bin ID 10 — payload execution   */
+#define COMMS_TTC_TEC_DT        3U   /* Bin ID 11 — data transfer       */
 
 /** Telecommand task ids from the source's HK command table. */
 #define COMMS_TTC_TASK_OBC_REBOOT   0x01U
@@ -205,12 +230,15 @@ typedef enum {
     COMMS_TTC_ERR_NULL,         /**< NULL frame / INFO / output pointer      */
     COMMS_TTC_ERR_TOO_SHORT,    /**< shorter than one interleaving block     */
     COMMS_TTC_ERR_TOO_LONG,     /**< larger than COMMS_TTC_MAX_FRAME         */
-    COMMS_TTC_ERR_ALIGN,        /**< length is not a multiple of 16          */
+    COMMS_TTC_ERR_ALIGN,        /**< data section is not a multiple of 16   */
+    COMMS_TTC_ERR_LEN_MISMATCH, /**< len != comms_ttc_padded_len(HDR+PL,ecc) */
     COMMS_TTC_ERR_PL_LEN,       /**< PL length > 100 or truncated by padding */
     COMMS_TTC_ERR_STATION_ID,   /**< station id < 1                          */
     COMMS_TTC_ERR_ECC_FLAG,     /**< ECC flag is neither 0x55 nor 0xAA       */
     COMMS_TTC_ERR_TEC_TYPE,     /**< TEC type outside 0..3                   */
     COMMS_TTC_ERR_TEC_TASK,     /**< TEC task outside 0..63                  */
+    COMMS_TTC_ERR_UNSUPPORTED,  /**< TEC type/task is not an implemented cmd */
+    COMMS_TTC_ERR_PAYLOAD,      /**< command payload short/incoherent        */
     COMMS_TTC_ERR_MAC,          /**< MAC missing / rejected by the seam      */
     COMMS_TTC_ERR_BUF           /**< caller output buffer too small          */
 } comms_ttc_result_t;
@@ -237,15 +265,36 @@ typedef struct {
 /**
  * @brief Total padded frame length for @p content_len data bytes.
  *
- * Rounds @p content_len up to the next multiple of COMMS_TTC_BLOCK, then
- * adds COMMS_TTC_ECC_TAIL_LEN when @p ecc_on. The result is always a
- * multiple of 16 (the data section and the ECC tail are each 16-aligned).
- * Pure helper; returns 0 for a content length of 0.
+ * Rounds @p content_len up to the next multiple of COMMS_TTC_BLOCK (the DATA
+ * section), then adds COMMS_TTC_ECC_TAIL_LEN (6) when @p ecc_on. The DATA
+ * section is therefore always 16-aligned; an ECC frame is 16*n + 6. Pure
+ * helper; returns 0 for a content length of 0.
  */
 size_t comms_ttc_padded_len(size_t content_len, bool ecc_on);
 
-/** @brief Pack TEC type (bit 1-2) and TEC task (bit 3-8) into INFO byte 2. */
+/** @brief Pack TEC type (bits 1-2, MSB) and TEC task (bits 3-8) into INFO byte 2.
+ *  The byte is (tec_type << 6) | tec_task. */
 uint8_t comms_ttc_info_pack(uint8_t tec_type, uint8_t tec_task);
+
+/**
+ * @brief Reed-Solomon (255,249) shortened encoder over GF(256), 6 parity
+ *        symbols — the RS PARITY element ('Packet structure'!H54).
+ *
+ * Computes @c data(x) * x^6 mod g(x) with g(x) = prod_{i=0..5}(x - alpha^i),
+ * over GF(256) with primitive polynomial 0x11D (x^8+x^4+x^3+x^2+1) and
+ * alpha = 2. These are the standard RS(255,249) field/generator parameters
+ * (python-reedsolo defaults; Wicker & Bhargava 1994, ch. 5) and are NOT
+ * invented here. Encoding is systematic: the 6 parity symbols are appended
+ * after the data. Known-answer vectors validated against reedsolo and an
+ * independent implementation are pinned in test/test_comms.c.
+ *
+ * @param[in]  data    DATA section bytes (non-NULL, len <= COMMS_TTC_RS_MAX_DATA)
+ * @param[in]  len     data length
+ * @param[out] parity  COMMS_TTC_RS_NSYM bytes, always fully written; zeroed
+ *                     on a NULL/oversize call (no uninitialised bytes on air)
+ */
+void comms_ttc_rs_ecc_encode(const uint8_t *data, size_t len,
+                             uint8_t parity[COMMS_TTC_RS_NSYM]);
 
 /** @brief Unpack INFO byte 2. NULL output pointers are ignored. */
 void comms_ttc_info_unpack(uint8_t byte2, uint8_t *tec_type, uint8_t *tec_task);
@@ -254,13 +303,15 @@ void comms_ttc_info_unpack(uint8_t byte2, uint8_t *tec_type, uint8_t *tec_task);
  * @brief Build a TT&C command frame into @p out (TX path).
  *
  * Writes INFO, UNIX TIME, the opaque MAC, the payload, zero padding to the
- * 16-byte block boundary and (when the ECC flag is ON) a zeroed 16-byte ECC
- * tail reserved for the RS layer. @p info->pl_len must equal @p pl_len.
- * @p mac may be NULL (field written as four zero bytes).
+ * 16-byte block boundary and (when the ECC flag is ON) a real 6-byte
+ * Reed-Solomon parity tail computed over the padded data section. @p
+ * info->pl_len must equal @p pl_len. @p mac may be NULL (field written as
+ * four zero bytes).
  *
- * On COMMS_TTC_OK, @p *out_len receives the frame length (a multiple of 16).
- * On COMMS_TTC_ERR_BUF, @p *out_len receives the length that would be needed.
- * Verdict codes carry the same meaning as comms_ttc_result_str().
+ * On COMMS_TTC_OK, @p *out_len receives the frame length (16*n, or 16*n + 6
+ * with ECC on). On COMMS_TTC_ERR_BUF, @p *out_len receives the length that
+ * would be needed. Verdict codes carry the same meaning as
+ * comms_ttc_result_str().
  */
 comms_ttc_result_t comms_ttc_build_frame(uint8_t                  *out,
                                          size_t                    cap,
@@ -275,9 +326,11 @@ comms_ttc_result_t comms_ttc_build_frame(uint8_t                  *out,
  * @brief Parse and validate a received TT&C frame (RX path).
  *
  * Checks, in order: NULL, length bounds (one block .. COMMS_TTC_MAX_FRAME),
- * 16-byte alignment, INFO field ranges (station id, ECC flag, TEC type,
- * TEC task, PL length) and that the declared PL length actually fits the
- * data section. On COMMS_TTC_OK the out-struct points into @p frame.
+ * INFO field ranges (station id, ECC flag, PL length), data-section 16*n
+ * alignment, the CANONICAL length (len must equal
+ * comms_ttc_padded_len(HDR + PL, ecc) — anything else is
+ * COMMS_TTC_ERR_LEN_MISMATCH) and that the declared PL length actually fits
+ * the data section. On COMMS_TTC_OK the out-struct points into @p frame.
  * The MAC is copied out as an opaque pointer ONLY — never verified here
  * (verification is the comms_ttc_mac_verify() seam).
  */
@@ -303,11 +356,14 @@ bool comms_frame_is_ttc_layout(const uint8_t *frame, size_t len);
 /**
  * @brief Validate + dispatch a TT&C command frame (verify-then-dispatch).
  *
- * Parses the frame, runs the MAC seam, accounts the verdict in the existing
- * RX counters and dispatches by TEC type/task on success. Until the MAC
- * semantics are defined the seam rejects everything, so this entry point
- * parses but never executes a command (fail closed). The legacy
- * comms_rx_handle_frame() behaviour is preserved for non-TT&C layouts.
+ * Parses the frame, runs the MAC seam, dispatches by TEC type/task on success
+ * and accounts the FINAL verdict in the existing RX counters. Unsupported TEC
+ * types/tasks and short/incoherent command payloads are rejected
+ * (COMMS_TTC_ERR_UNSUPPORTED / COMMS_TTC_ERR_PAYLOAD) and counted as
+ * rejections — never as accepted. Until the MAC semantics are defined the
+ * seam rejects everything, so this entry point parses but never executes a
+ * command (fail closed). The legacy comms_rx_handle_frame() behaviour is
+ * preserved for non-TT&C layouts.
  */
 comms_tc_result_t comms_rx_handle_ttc_frame(const uint8_t *frame, size_t len);
 

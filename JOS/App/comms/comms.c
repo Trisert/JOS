@@ -185,19 +185,101 @@ size_t comms_ttc_padded_len(size_t content_len, bool ecc_on)
     return total;
 }
 
+/* ---------- Reed-Solomon parity (RS PARITY element, 6 bytes) ----------
+ *
+ * Systematic RS(255,249) shortened code over GF(256), used to fill the tail
+ * of an ECC-enabled command packet. Field/generator citation is on the
+ * comms_ttc_rs_ecc_encode() prototype in comms.h (primitive polynomial
+ * 0x11D = x^8+x^4+x^3+x^2+1, alpha = 2, g(x) = prod (x - alpha^i)) — the
+ * standard RS(255,249) parameters, not invented here. Kept in this TU rather
+ * than a separate rs_ecc.c because Ceedling links each test binary from the
+ * headers that the test includes: a separate module's .c would not be linked
+ * into test_comms_legacy.c (which does not include it), leaving an undefined
+ * reference there.
+ */
+
+/* Carry-less multiply in GF(256) reduced modulo 0x11D. No lookup tables:
+   fixed 8-step loop, no RAM init-order dependency. */
+static uint8_t ttc_gf_mul(uint8_t a, uint8_t b)
+{
+    uint8_t p = 0U;
+
+    for (uint8_t i = 0U; i < 8U; i++) {
+        if ((b & 1U) != 0U) {
+            p ^= a;
+        }
+        const uint8_t hi = (uint8_t)(a & 0x80U);
+        a = (uint8_t)(a << 1);
+        if (hi != 0U) {
+            a ^= 0x1DU;   /* x^8 + x^4 + x^3 + x^2 + 1, folded back */
+        }
+        b = (uint8_t)(b >> 1);
+    }
+    return p;
+}
+
+/* alpha^n in GF(256), alpha = 2. n is always < COMMS_TTC_RS_NSYM. */
+static uint8_t ttc_gf_alpha_pow(unsigned n)
+{
+    uint8_t v = 1U;
+
+    for (unsigned i = 0U; i < (n % 255U); i++) {
+        v = ttc_gf_mul(v, 2U);
+    }
+    return v;
+}
+
+void comms_ttc_rs_ecc_encode(const uint8_t *data, size_t len,
+                             uint8_t parity[COMMS_TTC_RS_NSYM])
+{
+    uint8_t gen[COMMS_TTC_RS_NSYM + 1U] = { 0 };
+    uint8_t rem[COMMS_TTC_RS_NSYM]      = { 0 };
+
+    if (parity == NULL) {
+        return;
+    }
+    memset(parity, 0, COMMS_TTC_RS_NSYM);
+    if ((data == NULL) || (len > (size_t)COMMS_TTC_RS_MAX_DATA)) {
+        return;   /* leaves parity zeroed — never partially written */
+    }
+
+    /* g(x) = prod_{i=0}^{nsym-1} (x - alpha^i); monic, degree NSYM. gen[0]
+       is the leading 1, gen[1..NSYM] the lower-degree coefficients (so the
+       LFSR below can divide by it in place). */
+    gen[0] = 1U;
+    for (size_t i = 0U; i < (size_t)COMMS_TTC_RS_NSYM; i++) {
+        const uint8_t root = ttc_gf_alpha_pow((unsigned)i);
+        gen[i + 1U] = 0U;
+        for (size_t j = i + 1U; j > 0U; j--) {
+            gen[j] = (uint8_t)(gen[j] ^ ttc_gf_mul(gen[j - 1U], root));
+        }
+    }
+
+    /* Systematic division: shift the message through the NSYM-cell LFSR. */
+    for (size_t i = 0U; i < len; i++) {
+        const uint8_t factor = (uint8_t)(data[i] ^ rem[0]);
+        for (size_t j = 0U; (j + 1U) < (size_t)COMMS_TTC_RS_NSYM; j++) {
+            rem[j] = (uint8_t)(rem[j + 1U] ^ ttc_gf_mul(gen[j + 1U], factor));
+        }
+        rem[COMMS_TTC_RS_NSYM - 1U] = ttc_gf_mul(gen[COMMS_TTC_RS_NSYM], factor);
+    }
+
+    memcpy(parity, rem, COMMS_TTC_RS_NSYM);
+}
+
 uint8_t comms_ttc_info_pack(uint8_t tec_type, uint8_t tec_task)
 {
-    return (uint8_t)((tec_type & COMMS_TTC_TEC_TYPE_MASK) |
-                     ((tec_task << 2) & COMMS_TTC_TEC_TASK_MASK));
+    return (uint8_t)(((tec_type << 6) & COMMS_TTC_TEC_TYPE_MASK) |
+                     (tec_task & COMMS_TTC_TEC_TASK_MASK));
 }
 
 void comms_ttc_info_unpack(uint8_t byte2, uint8_t *tec_type, uint8_t *tec_task)
 {
     if (tec_type != NULL) {
-        *tec_type = (uint8_t)(byte2 & COMMS_TTC_TEC_TYPE_MASK);
+        *tec_type = (uint8_t)((byte2 & COMMS_TTC_TEC_TYPE_MASK) >> 6);
     }
     if (tec_task != NULL) {
-        *tec_task = (uint8_t)((byte2 & COMMS_TTC_TEC_TASK_MASK) >> 2);
+        *tec_task = (uint8_t)(byte2 & COMMS_TTC_TEC_TASK_MASK);
     }
 }
 
@@ -239,6 +321,10 @@ comms_ttc_result_t comms_ttc_build_frame(uint8_t                *out,
     const bool   ecc_on  = (info->ecc_flag == COMMS_TTC_ECC_ON);
     const size_t content = (size_t)COMMS_TTC_HDR_LEN + pl_len;
     const size_t total   = comms_ttc_padded_len(content, ecc_on);
+    /* Data section = content padded up to the 16-byte interleaving block;
+     * the RS parity tail (6 B) follows it when ECC is on. */
+    const size_t data_padded = ecc_on ? (total - (size_t)COMMS_TTC_ECC_TAIL_LEN)
+                                      : total;
 
     if (out_len != NULL) {
         *out_len = total;   /* filled even on ERR_BUF, to size a retry */
@@ -265,9 +351,14 @@ comms_ttc_result_t comms_ttc_build_frame(uint8_t                *out,
     if (pl_len > 0U) {
         memcpy(&out[COMMS_TTC_HDR_LEN], payload, pl_len);
     }
-    /* Zero padding to the 16-byte block, plus a zeroed RS ECC tail when on:
-     * both are application-layer responsibilities per the source document. */
-    memset(&out[content], 0, total - content);
+    /* Zero padding to the 16-byte block is an application-layer
+     * responsibility per the source. The RS parity tail is computed over
+     * exactly those padded data bytes — never left zeroed (CodeRabbit:
+     * "ECC-enabled transmissions lack valid parity"). */
+    memset(&out[content], 0, data_padded - content);
+    if (ecc_on) {
+        comms_ttc_rs_ecc_encode(out, data_padded, &out[data_padded]);
+    }
     return COMMS_TTC_OK;
 }
 
@@ -283,9 +374,6 @@ comms_ttc_result_t comms_ttc_parse_frame(const uint8_t     *frame,
     }
     if (len > (size_t)COMMS_TTC_MAX_FRAME) {
         return COMMS_TTC_ERR_TOO_LONG;
-    }
-    if ((len % COMMS_TTC_BLOCK) != 0U) {
-        return COMMS_TTC_ERR_ALIGN;      /* not an interleaving block count */
     }
 
     const uint8_t station = frame[0];
@@ -310,9 +398,20 @@ comms_ttc_result_t comms_ttc_parse_frame(const uint8_t     *frame,
     }
 
     const bool   ecc_on   = (ecc == COMMS_TTC_ECC_ON);
+    /* The ECC flag is validated above, so this subtraction cannot underflow
+       (frame len >= COMMS_TTC_MIN_FRAME = 16 > the 6-byte tail). The DATA
+       section must be a whole number of 16-byte interleaving blocks; the RS
+       parity tail rides after it and is NOT itself 16-aligned. */
     const size_t data_len = len - (ecc_on ? (size_t)COMMS_TTC_ECC_TAIL_LEN : 0U);
-    if ((data_len % COMMS_TTC_BLOCK) != 0U) {
-        return COMMS_TTC_ERR_ALIGN;      /* ECC tail split a data block */
+    if ((data_len < (size_t)COMMS_TTC_MIN_FRAME) ||
+        ((data_len % COMMS_TTC_BLOCK) != 0U)) {
+        return COMMS_TTC_ERR_ALIGN;      /* data section is not 16*n */
+    }
+    /* Canonical length: exactly one frame length is legal for a given
+     * (PL length, ECC flag) pair. Rejecting anything else (e.g. len==128 on
+     * an ECC-off header-only frame) removes length-smuggling room. */
+    if (len != comms_ttc_padded_len((size_t)COMMS_TTC_HDR_LEN + pl_len, ecc_on)) {
+        return COMMS_TTC_ERR_LEN_MISMATCH;
     }
     if (((size_t)COMMS_TTC_HDR_LEN + pl_len) > data_len) {
         return COMMS_TTC_ERR_PL_LEN;     /* payload truncated by the padding */
@@ -342,11 +441,14 @@ const char *comms_ttc_result_str(comms_ttc_result_t result)
     case COMMS_TTC_ERR_TOO_SHORT:   return "TOO_SHORT";
     case COMMS_TTC_ERR_TOO_LONG:    return "TOO_LONG";
     case COMMS_TTC_ERR_ALIGN:       return "ALIGN";
+    case COMMS_TTC_ERR_LEN_MISMATCH: return "LEN_MISMATCH";
     case COMMS_TTC_ERR_PL_LEN:      return "PL_LEN";
     case COMMS_TTC_ERR_STATION_ID:  return "STATION_ID";
     case COMMS_TTC_ERR_ECC_FLAG:    return "ECC_FLAG";
     case COMMS_TTC_ERR_TEC_TYPE:    return "TEC_TYPE";
     case COMMS_TTC_ERR_TEC_TASK:    return "TEC_TASK";
+    case COMMS_TTC_ERR_UNSUPPORTED: return "UNSUPPORTED";
+    case COMMS_TTC_ERR_PAYLOAD:     return "PAYLOAD";
     case COMMS_TTC_ERR_MAC:         return "MAC";
     case COMMS_TTC_ERR_BUF:         return "BUF";
     default:                        return "UNKNOWN";
@@ -361,12 +463,15 @@ comms_tc_result_t comms_ttc_to_tc_result(comms_ttc_result_t result)
     case COMMS_TTC_ERR_TOO_SHORT:  return COMMS_TC_ERR_TOO_SHORT;
     case COMMS_TTC_ERR_TOO_LONG:   return COMMS_TC_ERR_TOO_LONG;
     case COMMS_TTC_ERR_PL_LEN:     return COMMS_TC_ERR_PAYLOAD_LEN;
+    case COMMS_TTC_ERR_PAYLOAD:    return COMMS_TC_ERR_PAYLOAD_LEN;
     case COMMS_TTC_ERR_STATION_ID:
     case COMMS_TTC_ERR_ECC_FLAG:
     case COMMS_TTC_ERR_TEC_TYPE:
     case COMMS_TTC_ERR_TEC_TASK:   return COMMS_TC_ERR_PARAM_RANGE;
+    case COMMS_TTC_ERR_UNSUPPORTED: return COMMS_TC_ERR_OPCODE;
     case COMMS_TTC_ERR_MAC:        return COMMS_TC_ERR_MAC;
     case COMMS_TTC_ERR_ALIGN:
+    case COMMS_TTC_ERR_LEN_MISMATCH:
     case COMMS_TTC_ERR_BUF:
     default:                       return COMMS_TC_ERR_LEN_MISMATCH;
     }
@@ -380,37 +485,70 @@ bool comms_frame_is_ttc_layout(const uint8_t *frame, size_t len)
     if ((len < (size_t)COMMS_TTC_MIN_FRAME) || (len > (size_t)COMMS_TTC_MAX_FRAME)) {
         return false;
     }
-    if ((len % COMMS_TTC_BLOCK) != 0U) {
-        return false;
-    }
     /* INFO byte 1 = ECC flag (0x55/0xAA). A legacy/auth frame carries its
-     * payload length there (0..60), so the two can never collide. */
-    return (frame[1] == COMMS_TTC_ECC_OFF) || (frame[1] == COMMS_TTC_ECC_ON);
+     * payload length there (0..60), so the two can never collide. The DATA
+     * section is 16*n; with ECC on the 6-byte RS parity tail follows it. */
+    if (frame[1] == COMMS_TTC_ECC_OFF) {
+        return (len % COMMS_TTC_BLOCK) == 0U;
+    }
+    if (frame[1] == COMMS_TTC_ECC_ON) {
+        if (len < (size_t)COMMS_TTC_ECC_TAIL_LEN) {
+            return false;
+        }
+        const size_t data_len = len - (size_t)COMMS_TTC_ECC_TAIL_LEN;
+        return (data_len >= (size_t)COMMS_TTC_MIN_FRAME) &&
+               ((data_len % COMMS_TTC_BLOCK) == 0U);
+    }
+    return false;
 }
 
 /* Deliver an already-parsed, already-authenticated TT&C command by TEC type
  * and task. File-static: the only legal caller is comms_rx_handle_ttc_frame()
- * after the MAC seam has accepted the frame. */
-static void comms_ttc_dispatch_unchecked(const comms_ttc_frame_t *f)
+ * after the MAC seam has accepted the frame.
+ *
+ * Returns COMMS_TTC_OK only when the command was actually executed/accepted;
+ * COMMS_TTC_ERR_UNSUPPORTED for a TEC type/task this build does not implement
+ * (or a non-HK type, which is not a command carrier) and
+ * COMMS_TTC_ERR_PAYLOAD for a command whose payload is short or incoherent.
+ * The RX entry point accounts the returned verdict, so neither class is ever
+ * counted as accepted (CodeRabbit orange, comms.c:412). */
+static comms_ttc_result_t comms_ttc_dispatch_unchecked(const comms_ttc_frame_t *f)
 {
     if (f->info.tec_type != COMMS_TTC_TEC_HK) {
         /* DAQ / PE / DT are not command carriers in the source's HK table. */
-        return;
+        return COMMS_TTC_ERR_UNSUPPORTED;
     }
     switch (f->info.tec_task) {
     case COMMS_TTC_TASK_OBC_REBOOT:
+        if (f->info.pl_len != 0U) {
+            return COMMS_TTC_ERR_PAYLOAD;   /* 'Task details'!G5: PL = 0 */
+        }
         NVIC_SystemReset();
         break;
-    case COMMS_TTC_TASK_EXIT_STATE:
-        /* Spec carries old+new state in the payload; the pair is not consumed
-         * yet — same placeholder behaviour as COMMS_TC_EXIT_STATE below. */
-        state_machine_request_transition(STATE_READY, TRIGGER_GROUND_CMD);
+    case COMMS_TTC_TASK_EXIT_STATE: {
+        /* 'HK tasks'!D13:D14 + G6: payload = 1 byte old state, 1 byte new
+         * state (PL = 2). Apply the REQUESTED new state; the empty-payload
+         * path is rejected instead of silently forcing STATE_READY. */
+        if (f->info.pl_len != 2U) {
+            return COMMS_TTC_ERR_PAYLOAD;
+        }
+        const uint8_t old_state = f->payload[0];
+        const uint8_t new_state = f->payload[1];
+        if ((old_state >= (uint8_t)OBW_STATE_COUNT) ||
+            (new_state >= (uint8_t)OBW_STATE_COUNT) ||
+            (old_state == new_state)) {
+            return COMMS_TTC_ERR_PAYLOAD;   /* out of range / no-op request */
+        }
+        (void)state_machine_request_transition((obw_state_t)new_state,
+                                               TRIGGER_GROUND_CMD);
         break;
+    }
     default:
         /* TODO: remaining HK commands (variable change, set time, TLE,
          * EPS/ADCS reboot, LoRa state/config/ping, ACK/NACK). */
-        break;
+        return COMMS_TTC_ERR_UNSUPPORTED;
     }
+    return COMMS_TTC_OK;
 }
 
 comms_tc_result_t comms_rx_handle_ttc_frame(const uint8_t *frame, size_t len)
@@ -423,15 +561,16 @@ comms_tc_result_t comms_rx_handle_ttc_frame(const uint8_t *frame, size_t len)
             verdict = COMMS_TTC_ERR_MAC;   /* fail closed until MAC defined */
         }
     }
-
-    comms_rx_account(comms_ttc_to_tc_result(verdict));
-
-    if (verdict != COMMS_TTC_OK) {
-        return comms_ttc_to_tc_result(verdict);   /* rejected — do NOT dispatch */
+    if (verdict == COMMS_TTC_OK) {
+        /* Unsupported commands and malformed payloads are rejected HERE, so
+         * they are accounted as rejections — never as accepted. A command
+         * that executes (OBC reboot resets immediately) returns no further. */
+        verdict = comms_ttc_dispatch_unchecked(&parsed);
     }
 
-    comms_ttc_dispatch_unchecked(&parsed);
-    return COMMS_TC_OK;
+    const comms_tc_result_t tc_result = comms_ttc_to_tc_result(verdict);
+    comms_rx_account(tc_result);
+    return tc_result;
 }
 
 /* ---------- Telecommand dispatcher (private) ---------- */
