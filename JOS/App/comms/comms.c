@@ -158,6 +158,14 @@ _Static_assert(COMMS_MAX_PACKET > COMMS_CHUNK_HDR_LEN,
  * path parses the frame but never dispatches it. See docs/api/ttc-frame.md. */
 static comms_ttc_mac_verify_fn ttc_mac_verifier = NULL;
 
+/* De-interleaved header + payload of the last parsed ECC-ON frame (an ECC-ON
+ * packet interleaves 10 data with 6 parity bytes per block, so those fields
+ * are not contiguous on air). Sized for the largest legal content — header
+ * plus the 100-byte maximum payload. Only ever written/read by
+ * comms_ttc_parse_frame(); the RX path is single-threaded. */
+static uint8_t ttc_content_scratch[(size_t)COMMS_TTC_HDR_LEN +
+                                   (size_t)COMMS_TTC_MAX_PL];
+
 void comms_ttc_set_mac_verifier(comms_ttc_mac_verify_fn fn)
 {
     ttc_mac_verifier = fn;
@@ -172,23 +180,62 @@ bool comms_ttc_mac_verify(const uint8_t *frame, size_t len,
     return ttc_mac_verifier(frame, len, mac);
 }
 
+/* ---------- 16-byte block geometry (ECC OFF vs ECC ON) ----------
+ *
+ * 'Packet structure'!A14 requires a packet that is 16*n long ("for correct
+ * interleaving") and !H54 fixes the RS PARITY element at 6 bytes. Both hold
+ * together when the parity lives INSIDE each 16-byte block:
+ *   ECC OFF -> the block is 16 data bytes;
+ *   ECC ON  -> the block is a systematic RS(16,10) codeword = 10 data + 6
+ *              parity bytes.
+ * An ECC packet is therefore 16*ceil(content/10), NOT 16*n + 6, and both
+ * geometries are trivially 16-aligned. Assumption A1 in docs/api/ttc-frame.md
+ * records the ordering choice (systematic, 10 data then 6 parity) against the
+ * sheet's own sparse-parity sketch, which does not sum to 16 uniquely.
+ */
+_Static_assert((COMMS_TTC_RS_DATA_LEN + COMMS_TTC_RS_PARITY_LEN) == COMMS_TTC_BLOCK,
+               "one RS codeword must fill exactly one 16-byte interleaving block");
+
+/* Data bytes carried by a frame of @p total_len (the codeword data slots). */
+static size_t ttc_data_capacity(size_t total_len, bool ecc_on)
+{
+    if (!ecc_on) {
+        return total_len;
+    }
+    return (total_len / (size_t)COMMS_TTC_BLOCK) * (size_t)COMMS_TTC_RS_DATA_LEN;
+}
+
+/* On-air offset of the frame content byte at index @p i. With ECC off the
+ * content is laid out verbatim; with ECC on the byte sits in block
+ * (i / 10), slot (i % 10), and the 6 parity slots that follow every 10-byte
+ * data field are skipped. Indices 0..9 map to themselves in both modes, so
+ * the INFO field stays readable at its fixed offsets (the layout
+ * discriminator relies on byte 1 being the ECC flag). */
+static size_t ttc_onair_off(size_t i, bool ecc_on)
+{
+    if (!ecc_on) {
+        return i;
+    }
+    return ((i / (size_t)COMMS_TTC_RS_DATA_LEN) * (size_t)COMMS_TTC_BLOCK) +
+           (i % (size_t)COMMS_TTC_RS_DATA_LEN);
+}
+
 size_t comms_ttc_padded_len(size_t content_len, bool ecc_on)
 {
     if (content_len == 0U) {
         return 0U;
     }
-    const size_t blocks = (content_len + (COMMS_TTC_BLOCK - 1U)) / COMMS_TTC_BLOCK;
-    size_t       total  = blocks * COMMS_TTC_BLOCK;
-    if (ecc_on) {
-        total += (size_t)COMMS_TTC_ECC_TAIL_LEN;
-    }
-    return total;
+    const size_t per_block = ecc_on ? (size_t)COMMS_TTC_RS_DATA_LEN
+                                    : (size_t)COMMS_TTC_BLOCK;
+    const size_t blocks    = (content_len + (per_block - 1U)) / per_block;
+    return blocks * (size_t)COMMS_TTC_BLOCK;
 }
 
-/* ---------- Reed-Solomon parity (RS PARITY element, 6 bytes) ----------
+/* ---------- Reed-Solomon parity (RS PARITY element, 6 bytes per block) ----
  *
- * Systematic RS(255,249) shortened code over GF(256), used to fill the tail
- * of an ECC-enabled command packet. Field/generator citation is on the
+ * Systematic RS(255,249) shortened code over GF(256), used to fill the 6
+ * parity slots of every 16-byte block of an ECC-enabled command packet.
+ * Field/generator citation is on the
  * comms_ttc_rs_ecc_encode() prototype in comms.h (primitive polynomial
  * 0x11D = x^8+x^4+x^3+x^2+1, alpha = 2, g(x) = prod (x - alpha^i)) — the
  * standard RS(255,249) parameters, not invented here. Kept in this TU rather
@@ -321,10 +368,6 @@ comms_ttc_result_t comms_ttc_build_frame(uint8_t                *out,
     const bool   ecc_on  = (info->ecc_flag == COMMS_TTC_ECC_ON);
     const size_t content = (size_t)COMMS_TTC_HDR_LEN + pl_len;
     const size_t total   = comms_ttc_padded_len(content, ecc_on);
-    /* Data section = content padded up to the 16-byte interleaving block;
-     * the RS parity tail (6 B) follows it when ECC is on. */
-    const size_t data_padded = ecc_on ? (total - (size_t)COMMS_TTC_ECC_TAIL_LEN)
-                                      : total;
 
     if (out_len != NULL) {
         *out_len = total;   /* filled even on ERR_BUF, to size a retry */
@@ -333,31 +376,41 @@ comms_ttc_result_t comms_ttc_build_frame(uint8_t                *out,
         return COMMS_TTC_ERR_BUF;
     }
 
-    out[0] = info->station_id;
-    out[1] = info->ecc_flag;
-    out[2] = comms_ttc_info_pack(info->tec_type, info->tec_task);
-    out[3] = (uint8_t)pl_len;
-    out[COMMS_TTC_INFO_LEN]      = (uint8_t)(unix_time >> 24);
-    out[COMMS_TTC_INFO_LEN + 1U] = (uint8_t)(unix_time >> 16);
-    out[COMMS_TTC_INFO_LEN + 2U] = (uint8_t)(unix_time >> 8);
-    out[COMMS_TTC_INFO_LEN + 3U] = (uint8_t)unix_time;
-    if (mac != NULL) {
-        memcpy(&out[COMMS_TTC_INFO_LEN + COMMS_TTC_TIME_LEN], mac,
-               (size_t)COMMS_TTC_MAC_LEN);
-    } else {
-        memset(&out[COMMS_TTC_INFO_LEN + COMMS_TTC_TIME_LEN], 0,
-               (size_t)COMMS_TTC_MAC_LEN);
+    /* Zero the whole packet up front: that is the mandated zero padding
+     * ('Packet structure'!J44/J50) AND it clears the 6 parity slots of every
+     * block before the encoder fills them. */
+    memset(out, 0, total);
+
+    /* Content bytes, placed through the block mapping: with ECC off they land
+     * at their natural offsets, with ECC on at block (i/10), slot (i%10). */
+    out[ttc_onair_off(0U, ecc_on)] = info->station_id;
+    out[ttc_onair_off(1U, ecc_on)] = info->ecc_flag;
+    out[ttc_onair_off(2U, ecc_on)] = comms_ttc_info_pack(info->tec_type,
+                                                         info->tec_task);
+    out[ttc_onair_off(3U, ecc_on)] = (uint8_t)pl_len;
+    out[ttc_onair_off(COMMS_TTC_INFO_LEN, ecc_on)]      = (uint8_t)(unix_time >> 24);
+    out[ttc_onair_off(COMMS_TTC_INFO_LEN + 1U, ecc_on)] = (uint8_t)(unix_time >> 16);
+    out[ttc_onair_off(COMMS_TTC_INFO_LEN + 2U, ecc_on)] = (uint8_t)(unix_time >> 8);
+    out[ttc_onair_off(COMMS_TTC_INFO_LEN + 3U, ecc_on)] = (uint8_t)unix_time;
+    for (size_t i = 0U; i < (size_t)COMMS_TTC_MAC_LEN; i++) {
+        out[ttc_onair_off((size_t)COMMS_TTC_INFO_LEN + COMMS_TTC_TIME_LEN + i,
+                          ecc_on)] = (mac != NULL) ? mac[i] : 0U;
     }
-    if (pl_len > 0U) {
-        memcpy(&out[COMMS_TTC_HDR_LEN], payload, pl_len);
+    for (size_t i = 0U; i < pl_len; i++) {
+        out[ttc_onair_off((size_t)COMMS_TTC_HDR_LEN + i, ecc_on)] = payload[i];
     }
-    /* Zero padding to the 16-byte block is an application-layer
-     * responsibility per the source. The RS parity tail is computed over
-     * exactly those padded data bytes — never left zeroed (CodeRabbit:
-     * "ECC-enabled transmissions lack valid parity"). */
-    memset(&out[content], 0, data_padded - content);
+
     if (ecc_on) {
-        comms_ttc_rs_ecc_encode(out, data_padded, &out[data_padded]);
+        /* One systematic RS(16,10) codeword per block: the 6 parity symbols
+         * are computed over the block's 10 data bytes (the zero padding of the
+         * last block included) and written into its parity slots — never left
+         * zeroed. */
+        const size_t blocks = total / (size_t)COMMS_TTC_BLOCK;
+        for (size_t b = 0U; b < blocks; b++) {
+            uint8_t *blk = &out[b * (size_t)COMMS_TTC_BLOCK];
+            comms_ttc_rs_ecc_encode(blk, (size_t)COMMS_TTC_RS_DATA_LEN,
+                                    &blk[COMMS_TTC_RS_DATA_LEN]);
+        }
     }
     return COMMS_TTC_OK;
 }
@@ -397,23 +450,24 @@ comms_ttc_result_t comms_ttc_parse_frame(const uint8_t     *frame,
         return COMMS_TTC_ERR_PL_LEN;
     }
 
-    const bool   ecc_on   = (ecc == COMMS_TTC_ECC_ON);
-    /* The ECC flag is validated above, so this subtraction cannot underflow
-       (frame len >= COMMS_TTC_MIN_FRAME = 16 > the 6-byte tail). The DATA
-       section must be a whole number of 16-byte interleaving blocks; the RS
-       parity tail rides after it and is NOT itself 16-aligned. */
-    const size_t data_len = len - (ecc_on ? (size_t)COMMS_TTC_ECC_TAIL_LEN : 0U);
-    if ((data_len < (size_t)COMMS_TTC_MIN_FRAME) ||
-        ((data_len % COMMS_TTC_BLOCK) != 0U)) {
-        return COMMS_TTC_ERR_ALIGN;      /* data section is not 16*n */
+    const bool   ecc_on = (ecc == COMMS_TTC_ECC_ON);
+    /* Both geometries are 16*n in full (the RS parity lives inside the blocks,
+       see the block-geometry note above), so the alignment test is
+       unconditional and the ECC flag changes only the DATA capacity. */
+    if ((len % (size_t)COMMS_TTC_BLOCK) != 0U) {
+        return COMMS_TTC_ERR_ALIGN;      /* not a whole number of blocks */
     }
     /* Canonical length: exactly one frame length is legal for a given
-     * (PL length, ECC flag) pair. Rejecting anything else (e.g. len==128 on
-     * an ECC-off header-only frame) removes length-smuggling room. */
+     * (PL length, ECC flag) pair. Rejecting anything else (e.g. len==32 on
+     * an ECC-off header-only frame) removes length-smuggling room. Checked
+     * BEFORE the header is de-interleaved, so a short frame can never make
+     * the block mapping read out of bounds. */
     if (len != comms_ttc_padded_len((size_t)COMMS_TTC_HDR_LEN + pl_len, ecc_on)) {
         return COMMS_TTC_ERR_LEN_MISMATCH;
     }
-    if (((size_t)COMMS_TTC_HDR_LEN + pl_len) > data_len) {
+    const size_t content  = (size_t)COMMS_TTC_HDR_LEN + pl_len;
+    const size_t data_len = ttc_data_capacity(len, ecc_on);
+    if (content > data_len) {
         return COMMS_TTC_ERR_PL_LEN;     /* payload truncated by the padding */
     }
 
@@ -422,12 +476,23 @@ comms_ttc_result_t comms_ttc_parse_frame(const uint8_t     *frame,
     out->info.tec_type   = tec_type;
     out->info.tec_task   = tec_task;
     out->info.pl_len     = pl_len;
-    out->unix_time = ((uint32_t)frame[COMMS_TTC_INFO_LEN] << 24) |
-                     ((uint32_t)frame[COMMS_TTC_INFO_LEN + 1U] << 16) |
-                     ((uint32_t)frame[COMMS_TTC_INFO_LEN + 2U] << 8) |
-                      (uint32_t)frame[COMMS_TTC_INFO_LEN + 3U];
-    out->mac       = &frame[COMMS_TTC_INFO_LEN + COMMS_TTC_TIME_LEN];
-    out->payload   = (pl_len > 0U) ? &frame[COMMS_TTC_HDR_LEN] : NULL;
+    out->unix_time = ((uint32_t)frame[ttc_onair_off(COMMS_TTC_INFO_LEN, ecc_on)] << 24) |
+                     ((uint32_t)frame[ttc_onair_off(COMMS_TTC_INFO_LEN + 1U, ecc_on)] << 16) |
+                     ((uint32_t)frame[ttc_onair_off(COMMS_TTC_INFO_LEN + 2U, ecc_on)] << 8) |
+                      (uint32_t)frame[ttc_onair_off(COMMS_TTC_INFO_LEN + 3U, ecc_on)];
+    if (ecc_on) {
+        /* De-interleave the header + payload out of the 10+6 blocks (they are
+           not contiguous on air). Valid until the next parse call. */
+        for (size_t i = 0U; i < content; i++) {
+            ttc_content_scratch[i] = frame[ttc_onair_off(i, true)];
+        }
+        out->mac     = &ttc_content_scratch[COMMS_TTC_INFO_LEN + COMMS_TTC_TIME_LEN];
+        out->payload = (pl_len > 0U) ? &ttc_content_scratch[COMMS_TTC_HDR_LEN]
+                                     : NULL;
+    } else {
+        out->mac     = &frame[COMMS_TTC_INFO_LEN + COMMS_TTC_TIME_LEN];
+        out->payload = (pl_len > 0U) ? &frame[COMMS_TTC_HDR_LEN] : NULL;
+    }
     out->frame_len = len;
     out->data_len  = data_len;
     return COMMS_TTC_OK;
@@ -485,19 +550,13 @@ bool comms_frame_is_ttc_layout(const uint8_t *frame, size_t len)
     if ((len < (size_t)COMMS_TTC_MIN_FRAME) || (len > (size_t)COMMS_TTC_MAX_FRAME)) {
         return false;
     }
-    /* INFO byte 1 = ECC flag (0x55/0xAA). A legacy/auth frame carries its
-     * payload length there (0..60), so the two can never collide. The DATA
-     * section is 16*n; with ECC on the 6-byte RS parity tail follows it. */
-    if (frame[1] == COMMS_TTC_ECC_OFF) {
+    /* INFO byte 1 = ECC flag (0x55/0xAA), at the same offset with ECC on and
+     * off (content indices 0..9 map to themselves in both geometries). A
+     * legacy/auth frame carries its payload length there (0..60), so the two
+     * can never collide. Both TT&C geometries are a whole number of 16-byte
+     * interleaving blocks — the parity sits inside them, no tail. */
+    if ((frame[1] == COMMS_TTC_ECC_OFF) || (frame[1] == COMMS_TTC_ECC_ON)) {
         return (len % COMMS_TTC_BLOCK) == 0U;
-    }
-    if (frame[1] == COMMS_TTC_ECC_ON) {
-        if (len < (size_t)COMMS_TTC_ECC_TAIL_LEN) {
-            return false;
-        }
-        const size_t data_len = len - (size_t)COMMS_TTC_ECC_TAIL_LEN;
-        return (data_len >= (size_t)COMMS_TTC_MIN_FRAME) &&
-               ((data_len % COMMS_TTC_BLOCK) == 0U);
     }
     return false;
 }

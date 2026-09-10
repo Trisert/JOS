@@ -126,15 +126,17 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len);
  *
  * i.e. the packed byte is (tec_type << 6) | tec_task.
  *
- * Alignment: the DATA section (header + payload + zero padding) handed to the
- * radio is a multiple of 16 (the source requires 16*n for interleaving). With
- * ECC on, the 6-byte Reed-Solomon parity tail ('Packet structure'!H54 =
- * "6 bytes") is appended AFTER that block-aligned data section, so an ECC
- * frame is 16*n + 6. See the block-geometry assumption A1 in
- * docs/api/ttc-frame.md — the sheet's own diagram does not disambiguate
- * whether the "16*n" bound covers the parity, and this is flagged for TT&C.
- * Padding is explicitly an application-layer responsibility (source text);
- * it is zero-filled here, and the RS parity is computed over it.
+ * Alignment: the packet handed to the radio is ALWAYS a multiple of 16 — the
+ * source requires 16*n "for correct interleaving" (!A14) and the RS PARITY
+ * element is fixed at 6 bytes (!H54). With ECC off a 16-byte block is 16 data
+ * bytes; with ECC on it is a systematic RS(16,10) codeword, i.e. 10 data bytes
+ * followed by the 6 parity bytes. The parity therefore rides INSIDE the blocks
+ * and an ECC packet is 16*ceil(content/10), NOT 16*n + 6. See assumption A1 in
+ * docs/api/ttc-frame.md — the sheet's own sketch draws the parity sparsely and
+ * does not disambiguate the order, so the systematic one is flagged for TT&C.
+ * Padding is explicitly an application-layer responsibility (source text); it
+ * is zero-filled here, and each block's RS parity is computed over that
+ * block's data bytes (padding included).
  *
  * MAC SEAM — deliberately opaque. The source only says "hash to validate GS
  * command": it does NOT define the algorithm, the keying, or whether the MAC
@@ -158,15 +160,20 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len);
 /** Interleaving granularity: every TT&C frame length is a multiple of this. */
 #define COMMS_TTC_BLOCK         16U
 
-/** Reed-Solomon parity tail appended when the ECC flag is ON (none when OFF).
+/** DATA bytes carried by one 16-byte block when the ECC flag is ON: the block
+ *  is a systematic RS(16,10) codeword, so 10 of its 16 bytes are data. */
+#define COMMS_TTC_RS_DATA_LEN   10U
+
+/** Parity bytes inside each 16-byte block when the ECC flag is ON.
  *  'Packet structure'!H54: the RS PARITY element is "6 bytes". The encoder
  *  lives in comms.c (single TU) — see comms_ttc_rs_ecc_encode() and
- *  docs/api/ttc-frame.md for the field/generator citation and the
- *  block-geometry assumption (data section 16*n, parity tail of 6 after it). */
-#define COMMS_TTC_ECC_TAIL_LEN  6U
+ *  docs/api/ttc-frame.md for the field/generator citation and for the
+ *  block-geometry assumption (A1: RS(16,10) per 16-byte block, so the packet
+ *  stays 16*n as 'Packet structure'!A14 requires — there is NO parity tail). */
+#define COMMS_TTC_RS_PARITY_LEN 6U
 
-/** RS parity symbols per codeword (equals the tail length). */
-#define COMMS_TTC_RS_NSYM       6U
+/** RS parity symbols per codeword (one parity byte per block slot). */
+#define COMMS_TTC_RS_NSYM       COMMS_TTC_RS_PARITY_LEN
 
 /** Largest DATA section one RS encode accepts (GF(256) code-length bound). */
 #define COMMS_TTC_RS_MAX_DATA   (255U - COMMS_TTC_RS_NSYM)
@@ -177,10 +184,10 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len);
 /** Smallest legal frame: one interleaving block (header only, zero payload). */
 #define COMMS_TTC_MIN_FRAME     COMMS_TTC_BLOCK
 
-/** Largest legal frame: 7 data blocks (112 B = header + 100 B payload) and,
- *  with ECC on, the 6-byte parity tail -> 118 B. Rounded up to 8 blocks so
- *  the bound is a comfortable 16*n and leaves room for a future tail size. */
-#define COMMS_TTC_MAX_FRAME     (COMMS_TTC_BLOCK * 8U)
+/** Largest legal frame, a whole number of 16-byte blocks. The worst case is
+ *  ECC ON with a 100-byte payload: 112 content bytes / 10 data bytes per
+ *  codeword = 12 blocks = 192 B (ECC OFF needs only 7 blocks = 112 B). */
+#define COMMS_TTC_MAX_FRAME     (COMMS_TTC_BLOCK * 12U)
 
 /** ECC flag values (INFO byte 1). */
 #define COMMS_TTC_ECC_OFF       0x55U
@@ -252,23 +259,35 @@ typedef struct {
     uint8_t pl_len;       /**< 0..100                                  */
 } comms_ttc_info_t;
 
-/** A parsed TT&C frame. Pointers alias the caller's buffer (no copy). */
+/** A parsed TT&C frame.
+ *
+ *  With the ECC flag OFF the @c mac and @c payload pointers alias the
+ *  caller's buffer (no copy). With ECC ON every block interleaves 10 data
+ *  with 6 parity bytes, so the fields are not contiguous on air: the parser
+ *  de-interleaves them into a module-internal buffer and the pointers stay
+ *  valid until the next comms_ttc_parse_frame() call (the RX path is
+ *  single-threaded). */
 typedef struct {
     comms_ttc_info_t info;
     uint32_t         unix_time;
     const uint8_t   *mac;        /**< pointer to the 4 opaque MAC bytes    */
     const uint8_t   *payload;    /**< NULL when pl_len == 0                */
-    size_t           frame_len;  /**< total on-air length (with ECC tail)  */
-    size_t           data_len;   /**< frame_len minus the ECC tail         */
+    size_t           frame_len;  /**< total on-air length (always 16*n)    */
+    size_t           data_len;   /**< DATA bytes the frame carries: frame_len
+                                      (ECC off) or blocks*10 (ECC on)        */
 } comms_ttc_frame_t;
 
 /**
  * @brief Total padded frame length for @p content_len data bytes.
  *
- * Rounds @p content_len up to the next multiple of COMMS_TTC_BLOCK (the DATA
- * section), then adds COMMS_TTC_ECC_TAIL_LEN (6) when @p ecc_on. The DATA
- * section is therefore always 16-aligned; an ECC frame is 16*n + 6. Pure
- * helper; returns 0 for a content length of 0.
+ * The on-air packet is ALWAYS a whole number of 16-byte blocks (16*n,
+ * 'Packet structure'!A14) — with the ECC flag on and off alike. Only the DATA
+ * capacity of a block changes with ECC: a block holds COMMS_TTC_BLOCK (16)
+ * data bytes with ECC off, and COMMS_TTC_RS_DATA_LEN (10) data bytes + the 6
+ * parity bytes with ECC on. So this is
+ * @c 16 * ceil(content_len / 16) (ECC off) or
+ * @c 16 * ceil(content_len / 10) (ECC on) — never 16*n + 6.
+ * Pure helper; returns 0 for a content length of 0.
  */
 size_t comms_ttc_padded_len(size_t content_len, bool ecc_on);
 
@@ -284,9 +303,12 @@ uint8_t comms_ttc_info_pack(uint8_t tec_type, uint8_t tec_task);
  * over GF(256) with primitive polynomial 0x11D (x^8+x^4+x^3+x^2+1) and
  * alpha = 2. These are the standard RS(255,249) field/generator parameters
  * (python-reedsolo defaults; Wicker & Bhargava 1994, ch. 5) and are NOT
- * invented here. Encoding is systematic: the 6 parity symbols are appended
- * after the data. Known-answer vectors validated against reedsolo and an
- * independent implementation are pinned in test/test_comms.c.
+ * invented here. Encoding is systematic: the 6 parity symbols follow the
+ * data bytes of the codeword. The codec calls it once per 16-byte block with
+ * a 10-byte data field, so the parity lands in the block's 6 parity slots
+ * (COMMS_TTC_RS_DATA_LEN + COMMS_TTC_RS_PARITY_LEN == COMMS_TTC_BLOCK).
+ * Known-answer vectors validated against reedsolo and an independent
+ * implementation are pinned in test/test_comms.c.
  *
  * @param[in]  data    DATA section bytes (non-NULL, len <= COMMS_TTC_RS_MAX_DATA)
  * @param[in]  len     data length
@@ -304,12 +326,13 @@ void comms_ttc_info_unpack(uint8_t byte2, uint8_t *tec_type, uint8_t *tec_task);
  *
  * Writes INFO, UNIX TIME, the opaque MAC, the payload, zero padding to the
  * 16-byte block boundary and (when the ECC flag is ON) a real 6-byte
- * Reed-Solomon parity tail computed over the padded data section. @p
- * info->pl_len must equal @p pl_len. @p mac may be NULL (field written as
- * four zero bytes).
+ * Reed-Solomon parity inside each block, computed over that block's 10 data
+ * bytes. @p info->pl_len must equal @p pl_len. @p mac may be NULL (field
+ * written as four zero bytes).
  *
- * On COMMS_TTC_OK, @p *out_len receives the frame length (16*n, or 16*n + 6
- * with ECC on). On COMMS_TTC_ERR_BUF, @p *out_len receives the length that
+ * On COMMS_TTC_OK, @p *out_len receives the frame length (always 16*n: 16*n
+ * data-only blocks with ECC off, 16*n RS(16,10) codewords with ECC on). On
+ * COMMS_TTC_ERR_BUF, @p *out_len receives the length that
  * would be needed. Verdict codes carry the same meaning as
  * comms_ttc_result_str().
  */
@@ -326,11 +349,13 @@ comms_ttc_result_t comms_ttc_build_frame(uint8_t                  *out,
  * @brief Parse and validate a received TT&C frame (RX path).
  *
  * Checks, in order: NULL, length bounds (one block .. COMMS_TTC_MAX_FRAME),
- * INFO field ranges (station id, ECC flag, PL length), data-section 16*n
- * alignment, the CANONICAL length (len must equal
+ * INFO field ranges (station id, ECC flag, PL length), the 16*n alignment
+ * (both geometries), the CANONICAL length (len must equal
  * comms_ttc_padded_len(HDR + PL, ecc) — anything else is
  * COMMS_TTC_ERR_LEN_MISMATCH) and that the declared PL length actually fits
- * the data section. On COMMS_TTC_OK the out-struct points into @p frame.
+ * the data section. With ECC off the out-struct points into @p frame; with
+ * ECC on the header/payload are de-interleaved into a module-internal buffer
+ * (see comms_ttc_frame_t).
  * The MAC is copied out as an opaque pointer ONLY — never verified here
  * (verification is the comms_ttc_mac_verify() seam).
  */

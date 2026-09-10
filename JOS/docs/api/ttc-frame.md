@@ -23,6 +23,9 @@ called out explicitly. Do not treat this document as a contract.
 
 ## 2. Frame layout (current sheet) — transcribed
 
+Logical content order (the interleaving rule below says how it maps onto the
+16-byte blocks):
+
 ```
               HEADER = 12 byte
 ┌──────────────┬──────────────┬──────────────┬──────────────────────┐
@@ -59,23 +62,41 @@ called out explicitly. Do not treat this document as a contract.
 * **MAC** (4 B): described only as *"hash to validate GS command"*.
 * **PAYLOAD**: `0..100` bytes; the length is carried in INFO byte 3.
 
-### Interleaving / alignment rule
+### Interleaving / alignment rule (and where the 6 parity bytes live)
 
-The **DATA section** (header + payload + padding) that is handed to the radio
-is a whole number of 16-byte blocks (`16*n`; `Packet structure`!A14 =
-*"Packet should be 16*n length for correct interleaving"*). The padding is
-zero-filled and is **explicitly an application-layer responsibility**
-(`Packet structure`!J44, !J50: *"add padding … so total packet size is 16*N"*).
+The packet handed to the radio is **always a whole number of 16-byte blocks**
+(`16*n`; `Packet structure`!A14 = *"Packet should be 16*n length for correct
+interleaving"*). What the ECC flag changes is how much of each block is
+**data**:
 
-When ECC is on, a **6-byte Reed-Solomon parity tail** is appended after that
-block-aligned data section, so an ECC frame is `16*n + 6`. The 6-byte size is
-`Packet structure`!H54 (*RS PARITY = "6 bytes"*). An ECC-off frame carries no
-tail.
+| ECC flag | a 16-byte block is | packet length for `content` bytes |
+|----------|--------------------|-----------------------------------|
+| `0x55` OFF | 16 data bytes | `16 * ceil(content / 16)` |
+| `0xAA` ON  | a systematic **RS(16,10)** codeword: 10 data + 6 parity | `16 * ceil(content / 10)` |
+
+with `content = 12-byte header + payload`. The **6-byte RS PARITY element**
+(`Packet structure`!H54 = *"6 bytes"*) therefore sits **inside every block**,
+not in a tail after the packet: an ECC frame is `16*n`, **never `16*n + 6`**.
+Within a block the order is the systematic one — the 10 data bytes first, the
+6 parity bytes after them (see assumption A1). Because content indices 0..9 map
+to themselves in both geometries, INFO byte 1 (the ECC flag) sits at the same
+on-air offset with ECC on and off, so the layout discriminator needs no
+decoding.
+
+The padding that fills the unused data slots of the last block is zero-filled
+and is **explicitly an application-layer responsibility** (`Packet structure`!
+J44, !J50: *"add padding … so total packet size is 16*N"*).
+
+On RX the parser de-interleaves the header and payload out of the blocks into a
+module-internal buffer (they are not contiguous on air with ECC on); with ECC
+off the parsed pointers alias the caller's buffer as before.
 
 ### Reed-Solomon parity (the RS PARITY element)
 
 Implemented as `comms_ttc_rs_ecc_encode()` in `comms.c` (single translation
-unit). It is a systematic **RS(255,249) shortened** code:
+unit) and called **once per 16-byte block** with a 10-byte data field, so the
+resulting 6 parity symbols land in that block's parity slots. It is a
+systematic **RS(255,249) shortened** code:
 
 * **Field**: GF(256) with primitive polynomial `0x11D`
   (`x^8 + x^4 + x^3 + x^2 + 1`), generator element `alpha = 2`. These are the
@@ -87,26 +108,44 @@ unit). It is a systematic **RS(255,249) shortened** code:
 * **Generator**: `g(x) = prod_{i=0..5} (x - alpha^i)` (6 parity symbols, first
   consecutive root `alpha^0`).
 * **Parity byte order**: `parity[0..5]` are the coefficients of the remainder
-  from the lowest degree (constant term) upward, appended in that order —
+  from the lowest degree (constant term) upward, emitted in that order —
   identical to what `reedsolo.RSCodec(6).encode(data)[-6:]` returns.
+* **Geometry**: the codeword is *per block*. `comms_ttc_padded_len()` and the
+  build path place `COMMS_TTC_RS_DATA_LEN` (10) data bytes in front of
+  `COMMS_TTC_RS_PARITY_LEN` (6) parity bytes in every block; a compile-time
+  assertion pins `10 + 6 == COMMS_TTC_BLOCK == 16`.
 
-**Known-answer validation.** The pinned parity vectors in
-`test/test_comms.c` (`test_rs_ecc_known_answer_literals`,
-`test_ttc_build_frame_ecc_on_appends_a_six_byte_parity_tail`,
-`test_ttc_build_frame_ecc_header_only_matches_kat`) were produced by **two
-independent implementations that agree bit-for-bit**:
+**Known-answer validation.** The pinned vectors in `test/test_comms.c`
+(`test_rs_ecc_known_answer_literals`,
+`test_ttc_build_frame_ecc_on_keeps_16n_blocks`,
+`test_ttc_build_frame_ecc_header_only_matches_kat`,
+`test_ttc_parse_ecc_on_frame_deinterleaves`) were produced by **two independent
+implementations that agree bit-for-bit**:
 
-1. python-`reedsolo` `RSCodec(6)` with default parameters; and
+1. python-`reedsolo` `RSCodec(6)` with default parameters
+   (`RSCodec(6).encode(block_of_10)[-6:]`); and
 2. an independent GF(256) polynomial-division encoder written for this review.
 
-Pinned vectors (data → 6-byte parity):
+Per-block vectors (10 data bytes → 6 parity bytes; the encoder bound is 249, so
+a 16-byte input is also legal and is kept as a generator cross-check):
 
-| data | parity |
-|------|--------|
-| `00 01 02 03 04 05 06 07 08 09` (10 B) | `0E 7B A9 55 D2 5A` |
-| `00 .. 0F` (16 B) | `19 C6 88 16 C8 89` |
-| header-only ECC frame `01 AA 01 00 00 00 00 00 00 00 00 00 00 00 00 00` | `76 EE 55 66 66 67` |
-| 32-byte frame (station 3, ECC AA, HK|0x11, PL 5, unix 1, MAC 0, payload `0A 0B 0C 0D 0E`, zero pad) | `70 2A 4E 82 84 A0` |
+| 10-byte block data | parity |
+|--------------------|--------|
+| `00 00 00 00 00 00 00 00 00 00` | `00 00 00 00 00 00` |
+| `00 01 02 03 04 05 06 07 08 09` | `0E 7B A9 55 D2 5A` |
+| `0A 0B 0C 0D 0E 0F 10 11 12 13` | `04 04 19 D6 2A E4` |
+| `00 .. 0F` (16 B, not a block — bound check) | `19 C6 88 16 C8 89` |
+
+Whole-frame vectors — the on-air packet is 32 B (`len % 16 == 0`) in both cases:
+
+| frame | on-air packet |
+|-------|---------------|
+| ECC ON, station 42, HK\|0x11, PL 5, unix `11223344`, MAC `DE AD BE EF`, payload `01..05` | block 0 (`2A AA 11 05 11 22 33 44 DE AD`) parity `B6 F8 52 10 1E B1`; block 1 (`BE EF 01 02 03 04 05 00 00 00`, 3 zero pad bytes) parity `3A C8 17 76 04 C7` |
+| ECC OFF, same content | `2A 55 11 05 11 22 33 44 DE AD BE EF 01 02 03 04 05` + 15 zero pad bytes (one 32-byte block pair, no parity) |
+| ECC ON header only, station 1, HK\|0x01, PL 0, unix 0, zero MAC | block 0 (`01 AA 01 00 00 00 00 00 00 00`) parity `82 BB 7F 0F B5 56`; block 1 (ten zero data bytes) parity `00 00 00 00 00 00` |
+
+The ECC-ON worst case (100-byte payload → 112 content bytes → 12 blocks) is
+`COMMS_TTC_MAX_FRAME = 192 B`; ECC OFF needs only 7 blocks (112 B).
 
 ### TEC types and the HK command table
 
@@ -145,7 +184,7 @@ TT&C subteam* (open point O1).
 | INFO bitfield | absent | `comms_ttc_info_pack()` / `comms_ttc_info_unpack()`, `comms_ttc_info_t`; **bit 1 = MSB**, byte = `(type << 6) \| task` |
 | `16*n` alignment + zero padding | not applied to commands | build pads with zeros to the block boundary; parse rejects a non-block-aligned data section |
 | **Canonical frame length** | any 16-multiple within range parsed (length smuggling) | parse requires `len == comms_ttc_padded_len(HDR + PL, ecc)` exactly (`COMMS_TTC_ERR_LEN_MISMATCH` otherwise) |
-| ECC flag `0x55`/`0xAA`, RS ECC | absent | flag decoded/validated; with ECC on a real **6-byte RS(255,249) parity tail** is computed (known-answer tested) — not zeroed |
+| ECC flag `0x55`/`0xAA`, RS ECC, packet geometry | absent | flag decoded/validated; with ECC on **every 16-byte block becomes a real systematic RS(16,10) codeword** (10 data + 6 parity, known-answer tested) — not zeroed. The packet is `16*n` in both modes (a parity *tail* would break !A14) |
 | MAC 4 B opaque | JOS on-board auth is a **different** scheme (truncated HMAC-SHA256 + CRC over `opcode|len|payload`) | field carried verbatim; the frame is **verified through a pluggable `comms_ttc_set_mac_verifier()` seam** whose default rejects (fail closed). The MAC bytes themselves are never computed here |
 | TEC type/task dispatch | closed opcode set `0x01..0x06` | `comms_rx_handle_ttc_frame()` maps `HK` task `0x01`→OBC reboot, `0x02`→Exit state (applies the requested new state); **unsupported types/tasks and malformed payloads return an explicit rejection verdict** (`COMMS_TTC_ERR_UNSUPPORTED` / `COMMS_TTC_ERR_PAYLOAD`) and are accounted as rejections, never accepted |
 | Error codes / RX statistics | `comms_tc_result_t`, `comms_rx_stats_t` | TT&C verdicts kept in a dedicated `comms_ttc_result_t` and mapped onto the **existing** counters via `comms_ttc_to_tc_result()` |
@@ -154,7 +193,8 @@ TT&C subteam* (open point O1).
 
 * `App/comms/comms.h` — layout macros, `comms_ttc_result_t`, `comms_ttc_info_t`,
   `comms_ttc_frame_t`, the RS encoder prototype and the codec/seam prototypes.
-* `App/comms/comms.c` — the codec, the RS(255,249) encoder, the discriminator
+* `App/comms/comms.c` — the block-geometry helpers (`ttc_onair_off()`,
+  `ttc_data_capacity()`), the codec, the RS(255,249) encoder, the discriminator
   `comms_frame_is_ttc_layout()`, the RX entry `comms_rx_handle_ttc_frame()` and
   the MAC seam. `comms_rx_handle_frame()` routes a TT&C-layout frame to the
   TT&C path; the legacy/authenticated layouts are unchanged for backward
@@ -168,13 +208,15 @@ TT&C subteam* (open point O1).
 * It does **not** remove `sha256.c` or the existing HMAC-SHA256 uplink
   authentication. The MAC definition is a decision, not a code task (O2).
 * It does **not** implement freshness / anti-replay (O2).
+* It does **not** implement RS **decoding** / error correction on RX (O9) — only
+  the parity construction.
 
 ## 4. Assumptions (to confirm with TT&C)
 
 | # | Assumption | Rationale / source |
 |---|-----------|--------------------|
-| A1 | The RS parity is a **6-byte tail after** the 16-byte-aligned DATA section, so an ECC frame is `16*n + 6` and the `16*n` rule applies to the data section. | `Packet structure`!H54 fixes the element at 6 bytes; !A14 fixes `16*n`. The sheet's own block diagram (rows 10-14) does not disambiguate whether the `16*n` bound covers the parity. **The main item to confirm.** |
-| A2 | The codeword geometry is nominally **10 data + 6 parity = 16** bytes (RS(255,249) shortened), but the encoder computes parity over the whole DATA section, which may span several 16-byte blocks. | `Task types`/`Packet structure`!O10:U11 sketch a 10+6 block; a single tail over the padded data section is the simplest reading that keeps the header contiguous. Confirm the intended granularity (per 16-byte block vs whole data section). |
+| A1 | **The 6 RS parity bytes live INSIDE every 16-byte block** (systematic order: 10 data bytes, then 6 parity), so the packet is `16*n` with the ECC flag on and off alike and there is no parity tail. | `Packet structure`!H54 fixes the element at 6 bytes and !A14 requires `16*n`: the inside-the-block reading satisfies both. The sheet's own sketch (`Packet structure` row 11) draws the parity *sparsely* (`PAYLOAD 2 \| RS PARITY 2 \| PAYLOAD 1-14 \| PADDING 0-13 \| RS PARITY 2`), which does not sum to 16 uniquely — **the systematic 10+6 order is our choice**. **The main item to confirm with TT&C.** |
+| A2 | The codeword is **per 16-byte block** (each block carries its own 6 parity symbols; the packet has `ceil(content/10)` codewords), not one codeword over the whole packet. | `Task types`/`Packet structure`!O10:U11 sketch a 10+6 block and !A14 makes 16-byte blocks the interleaving unit. A single code over the whole packet would also need the header to stay contiguous, which the 10-byte block budget does not allow. Confirm the intended granularity. |
 | A3 | Field/generator: GF(256) poly `0x11D`, `alpha=2`, `g(x)=prod(x-alpha^i)`, parity appended low-degree-first. | Standard RS(255,249) parameters (reedsolo defaults; Wicker & Bhargava 1994). If TT&C used a different `fcr`/primitive, the parity changes. |
 
 ## 5. Open points (unknowns)
@@ -186,9 +228,10 @@ TT&C subteam* (open point O1).
 | O3 | **INFO byte 2 bit endianness.** — **CLOSED**: `Task details`!D/E prove bit 1 is the MSB and the byte is `(type << 6) \| task`. | Implemented and tested with literal bytes. |
 | O4 | **TEC type `DT=4` vs a 2-bit field.** — **CLOSED**: the 2-bit type field carries the `Bin ID` (`Task types`!C7: DT = `11` = 3). | DT is representable; `COMMS_TTC_TEC_DT = 3`. |
 | O5 | **TEC task range.** The prose says `0..31` (5 bits) while its own command table uses tasks up to `0x33` (51, 6 bits). The code accepts the full 6-bit width (`0..63`). | If tasks really are 5 bits, the bitfield layout (bits 3-7) differs. |
-| O6 | **PHY budget.** A command frame is 16..118 B, but the current radio path caps the PHY payload at 64 B (`COMMS_MAX_PACKET`, `COMMS_TC_MAX_FRAME`) and the SRAM2 RX buffer is 64 B. | Frames larger than 64 B cannot actually be received/sent until the LoRa packet budget and the RX buffer are raised, or the frame is interleaved block-by-block. The codec itself is size-correct; the transport is the constraint. |
-| O7 | **Padding not validated on RX.** The spec mandates zero padding; the RX parse tolerates any padding value (corruption in the padding region is not detected by the codec; the RS parity does cover it). | Tolerant by choice; tighten once O2 defines what the MAC covers. |
+| O6 | **PHY budget.** A command frame is 16..192 B (192 B is the ECC-ON worst case: 12 blocks), but the current radio path caps the PHY payload at 64 B (`COMMS_MAX_PACKET`, `COMMS_TC_MAX_FRAME`) and the SRAM2 RX buffer is 64 B. | Frames larger than 64 B cannot actually be received/sent until the LoRa packet budget and the RX buffer are raised, or the frame is split block-by-block onto the link. The codec itself is size-correct; the transport is the constraint. |
+| O7 | **Padding not validated on RX.** The spec mandates zero padding; the RX parse tolerates any padding value (each block's RS parity does cover its own padding bytes, but the parser does not check them). | Tolerant by choice; tighten once O2 defines what the MAC covers and O9 is decided. |
 | O8 | **Payload semantics of `Exit state` / `Variable change`.** Exit state is implemented (2-byte old/new payload, new state applied, short/out-of-range/no-op payloads rejected); the remaining HK commands (variable change, set time, TLE, reboots, LoRa, ACK/NACK) are still documented TODOs and are rejected as unsupported. | Dispatcher handles only `OBC reboot` and `Exit state` today. |
+| O9 | **No RS decoding / error correction on RX.** The codec *builds* the per-block RS(16,10) parity and pins it with KATs, but the parser neither verifies nor corrects it: a frame whose structure and MAC are intact but whose data bytes were corrupted in flight is accepted as-is (corruption inside a block's padding is likewise invisible — see O7). | Confirm whether the flight software must detect/correct block errors, and whether correction must happen before the MAC seam (which sees the bytes as received). |
 
 ## 6. References
 
