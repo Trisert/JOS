@@ -138,6 +138,10 @@ const deploy_fdir_config_t *deploy_fdir_default_config(void)
     return &deploy_fdir_defaults;
 }
 
+/* Drive the knife line and keep telemetry truthful (defined below). Declared
+ * here because the driver swap and init() must cut through the OLD driver. */
+static void knife_drive(bool on);
+
 bool deploy_fdir_configure(const deploy_fdir_config_t *cfg)
 {
     if ((cfg == NULL) || (cfg->max_attempts == 0u) || (cfg->activation_ms == 0u)) {
@@ -154,11 +158,23 @@ bool deploy_fdir_configure(const deploy_fdir_config_t *cfg)
 
 void deploy_fdir_set_knife_driver(deploy_knife_driver_t drv)
 {
+    /* Cut through the OUTGOING driver before dropping the handle. Otherwise a
+     * knife it energised could never be turned off again: the replacement was
+     * never told the line is on, and detaching (NULL) removes the only
+     * off-path, latching the knife ON for the whole mission. An OFF command
+     * on an already-cold line is harmless; a missing one is not. */
+    knife_drive(false);
     s_drv = drv;
 }
 
 void deploy_fdir_init(void)
 {
+    /* A re-init (watchdog, warm reboot) must not orphan an energised knife:
+     * cut it through the driver in force BEFORE forgetting it, or the actuator
+     * stays hot while telemetry reports knife_on = false. At cold boot no
+     * driver is installed yet, so this calls nothing and touches no GPIO. */
+    knife_drive(false);
+
     s_cfg        = deploy_fdir_defaults;
     s_drv        = NULL;
     s_phase      = FDIR_PH_IDLE;
@@ -197,9 +213,12 @@ uint32_t deploy_fdir_activation_ms(uint8_t attempt_index)
 
 static void knife_drive(bool on)
 {
-    if (s_drv != NULL) {
-        s_drv(on);
+    if (s_drv == NULL) {
+        /* Nothing was commanded to the hardware: do not let telemetry claim
+         * the knife is energised on a line that was never driven. */
+        return;
     }
+    s_drv(on);
     s_st.knife_on = on;
 }
 
@@ -239,6 +258,15 @@ static bool advance(obw_state_t mode, uint32_t now_ms)
         return true;
 
     case FDIR_PH_ON:
+        /* The reaction is scoped to INITIALIZATION: if the mode has already
+         * left it, cut NOW instead of holding the line hot until the end of
+         * the window (up to activation_max_ms, 50 s with the defaults). This
+         * is what makes the cut independent of the caller's cadence: the first
+         * step in a non-INIT mode closes the reaction as ABORTED. */
+        if (mode != STATE_INIT) {
+            finish(DEPLOY_FDIR_ABORTED, false, false, now_ms);
+            return false;
+        }
         /* The switch may close while the knife is still hot. */
         if (deploy_is_deployed() == 1) {
             finish(DEPLOY_FDIR_DEPLOYED, false, true, now_ms);

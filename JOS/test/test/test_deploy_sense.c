@@ -20,6 +20,11 @@
  *   - FDIR: at most 10 activations (never 11), growing period per activation,
  *     no activation outside INITIALIZATION, SAFE MODE requested on resolution
  *     and on timeout, degraded telecom on timeout.
+ *   - FDIR knife cannot be left energised (the hazard this module exists to
+ *     prevent): swapping or clearing the driver cuts through the OLD driver
+ *     first, re-init cuts before forgetting the handle, the ON phase honours
+ *     the mode, the cut does not depend on the caller's step() cadence, and
+ *     knife_on only reports a line that was actually commanded.
  */
 
 #include "unity.h"
@@ -47,6 +52,16 @@ static void knife_recorder(bool on)
     knife_last_level = on ? 1 : 0;
 }
 
+/* Second recorder: proves which driver gets the command when they are
+ * swapped while the knife is energised. */
+static int  knife2_on_calls;
+static void knife_recorder2(bool on)
+{
+    if (on) {
+        knife2_on_calls++;
+    }
+}
+
 static const deploy_fdir_status_t *fdir;
 
 void setUp(void)
@@ -58,6 +73,7 @@ void setUp(void)
     knife_on_calls  = 0;
     knife_off_calls = 0;
     knife_last_level = -1;
+    knife2_on_calls = 0;
     fdir = deploy_fdir_status();
 }
 
@@ -375,4 +391,163 @@ void test_fdir_invalid_config_rejected(void)
     TEST_ASSERT_FALSE(deploy_fdir_configure(&cfg));
 
     TEST_ASSERT_EQUAL_UINT8(10u, deploy_fdir_config()->max_attempts);
+}
+
+/* ==========================================================================
+ * Knife de-energising hazards (CodeRabbit HIGH on PR #88)
+ *
+ * The knife is a load switch: an actuator left energised burns the battery and
+ * destroys the mechanism. Every path that can lose track of the line must cut
+ * it first. Each test below fails on the pre-fix code.
+ * ========================================================================== */
+
+/* HAZARD (a) — deploy_fdir_set_knife_driver() replaced/cleared the driver
+ * without ever de-energising through it. The outgoing driver never received
+ * `false`, and detaching (NULL) removed the only off-path (knife_drive() does
+ * `if (s_drv != NULL)`): the line stayed latched ON for the whole mission. */
+void test_fdir_set_driver_cuts_old_knife(void)
+{
+    host_gpio_force_input(PB1, SW_STOWED);
+
+    deploy_fdir_step(STATE_INIT, 0u);          /* attempt 1 energises the line */
+    TEST_ASSERT_TRUE(fdir->knife_on);
+    TEST_ASSERT_EQUAL_INT(1, knife_on_calls);
+    TEST_ASSERT_EQUAL_INT(0, knife_off_calls);
+
+    /* Swap while energised: the OLD driver must be told to cut, the new one
+     * must not be used for a line it never energised. */
+    deploy_fdir_set_knife_driver(knife_recorder2);
+    TEST_ASSERT_EQUAL_INT(1, knife_off_calls);
+    TEST_ASSERT_EQUAL_INT(0, knife2_on_calls);
+    TEST_ASSERT_FALSE(fdir->knife_on);
+
+    /* Detach entirely while energised: NULL is the worst case — without this
+     * cut there is no off-path left at all. */
+    deploy_fdir_init();                        /* clears state, line already cold */
+    deploy_fdir_set_knife_driver(knife_recorder);
+    deploy_fdir_step(STATE_INIT, 0u);          /* attempt 1 energises again */
+    TEST_ASSERT_TRUE(fdir->knife_on);
+    TEST_ASSERT_EQUAL_INT(2, knife_on_calls);
+
+    knife_off_calls = 0;
+    deploy_fdir_set_knife_driver(NULL);
+    TEST_ASSERT_EQUAL_INT(1, knife_off_calls);  /* the live driver cut the line */
+    TEST_ASSERT_FALSE(fdir->knife_on);
+
+    /* With no driver installed nothing can re-energise, and knife_on says so. */
+    deploy_fdir_step(STATE_INIT, 60000u);
+    TEST_ASSERT_FALSE(fdir->knife_on);
+    TEST_ASSERT_EQUAL_INT(2, knife_on_calls);
+}
+
+/* HAZARD (b) — deploy_fdir_init() cleared s_drv and s_st.knife_on without
+ * driving the line OFF. A warm reboot / watchdog re-init orphaned the
+ * actuator while telemetry reported knife_on = false on a hot line. */
+void test_fdir_init_cuts_knife_before_forget(void)
+{
+    host_gpio_force_input(PB1, SW_STOWED);
+
+    deploy_fdir_step(STATE_INIT, 0u);
+    TEST_ASSERT_TRUE(fdir->knife_on);
+    TEST_ASSERT_EQUAL_INT(1, knife_on_calls);
+
+    deploy_fdir_init();
+
+    TEST_ASSERT_EQUAL_INT(1, knife_off_calls);   /* cut through the live driver */
+    TEST_ASSERT_FALSE(fdir->knife_on);           /* telemetry matches the line  */
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_IDLE, fdir->result);
+    TEST_ASSERT_EQUAL_UINT8(0u, fdir->attempts);
+
+    /* A second re-init with the line already known OFF must not touch it. */
+    deploy_fdir_init();
+    TEST_ASSERT_EQUAL_INT(1, knife_off_calls);
+
+    /* A cold init with no driver installed calls nothing (boot order safe). */
+    TEST_ASSERT_FALSE(fdir->knife_on);
+}
+
+/* HAZARD (c) — the FDIR_PH_ON phase never tested the mode: leaving
+ * STATE_INIT mid-activation kept the knife hot until the end of the window
+ * (up to activation_max_ms, 50 s with the defaults) instead of cutting at
+ * once as ABORTED. */
+void test_fdir_on_cuts_when_mode_leaves_init(void)
+{
+    host_gpio_force_input(PB1, SW_STOWED);
+
+    deploy_fdir_step(STATE_INIT, 0u);            /* attempt 1, knife ON */
+    TEST_ASSERT_TRUE(fdir->knife_on);
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_RETRYING, fdir->result);
+
+    /* 100 ms into a 5000 ms window the mode leaves INITIALIZATION. */
+    deploy_fdir_step(STATE_READY, 100u);
+
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_ABORTED, fdir->result);
+    TEST_ASSERT_FALSE(fdir->knife_on);
+    TEST_ASSERT_FALSE(fdir->safe_mode_requested);  /* the mode change was external */
+    TEST_ASSERT_EQUAL_UINT8(1u, fdir->attempts);
+    TEST_ASSERT_EQUAL_INT(1, knife_off_calls);
+
+    /* Terminal: later steps in any mode never re-energise the line. */
+    deploy_fdir_step(STATE_INIT, 200u);
+    deploy_fdir_step(STATE_READY, 500000u);
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_ABORTED, fdir->result);
+    TEST_ASSERT_EQUAL_UINT8(1u, fdir->attempts);
+    TEST_ASSERT_EQUAL_INT(1, knife_on_calls);
+    TEST_ASSERT_FALSE(fdir->knife_on);
+}
+
+/* HAZARD (d) — every off-path was reachable only from deploy_fdir_step() and
+ * deploy_fdir_ground_command(). With the old header contract (step() "new
+ * activations only start in STATE_INIT") a caller could stop calling step()
+ * outside INITIALIZATION and the knife stayed on forever. The cut must not
+ * depend on the caller driving a fine cadence: the first step in a non-INIT
+ * mode cuts, even if it arrives long after the window. */
+void test_fdir_cut_is_independent_of_step_cadence(void)
+{
+    host_gpio_force_input(PB1, SW_STOWED);
+
+    deploy_fdir_step(STATE_INIT, 0u);            /* knife ON */
+    TEST_ASSERT_TRUE(fdir->knife_on);
+
+    /* Coarse caller: one single step 200 s later, in a non-INIT mode. */
+    deploy_fdir_step(STATE_READY, 200000u);
+
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_ABORTED, fdir->result);
+    TEST_ASSERT_FALSE(fdir->knife_on);
+    TEST_ASSERT_EQUAL_UINT8(1u, fdir->attempts);   /* no extra activation */
+    TEST_ASSERT_EQUAL_INT(1, knife_on_calls);
+    TEST_ASSERT_EQUAL_INT(1, knife_off_calls);
+
+    /* Returning to INITIALIZATION does not resurrect a finished reaction. */
+    deploy_fdir_step(STATE_INIT, 200100u);
+    deploy_fdir_step(STATE_INIT, 400000u);
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_ABORTED, fdir->result);
+    TEST_ASSERT_EQUAL_UINT8(1u, fdir->attempts);
+    TEST_ASSERT_EQUAL_INT(1, knife_on_calls);
+    TEST_ASSERT_FALSE(fdir->knife_on);
+}
+
+/* HAZARD (e) — knife_drive() set s_st.knife_on even when the call never
+ * reached the hardware (no driver installed). knife_on is telemetry and must
+ * report the line actually commanded, or the ground sees "knife on" on a
+ * module that has no line driven at all. */
+void test_fdir_knife_on_reflects_commanded_line(void)
+{
+    host_gpio_force_input(PB1, SW_STOWED);
+
+    deploy_fdir_set_knife_driver(NULL);          /* no line to drive */
+
+    deploy_fdir_step(STATE_INIT, 0u);
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_RETRYING, fdir->result);
+    TEST_ASSERT_EQUAL_UINT8(1u, fdir->attempts); /* the logic still counts */
+    TEST_ASSERT_FALSE(fdir->knife_on);           /* but nothing was commanded */
+
+    deploy_fdir_step(STATE_INIT, 5000u);         /* window ends: still nothing */
+    TEST_ASSERT_FALSE(fdir->knife_on);
+
+    /* With the driver installed again the same sequence does report ON. */
+    deploy_fdir_set_knife_driver(knife_recorder);
+    deploy_fdir_step(STATE_INIT, 15000u);        /* attempt 2 starts */
+    TEST_ASSERT_TRUE(fdir->knife_on);
+    TEST_ASSERT_EQUAL_INT(1, knife_on_calls);
 }

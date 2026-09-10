@@ -81,8 +81,8 @@ void deploy_nrst_pulse(void);
  * outside the touch set of this change. Likewise it does NOT know which load
  * switch fires the knife: the caller installs a driver with
  * deploy_fdir_set_knife_driver(). Until one is installed the module still
- * counts and times the attempts and reports knife_on, so the logic is
- * testable and the hardware seam stays explicit.
+ * counts and times the attempts, but it commands no line, so knife_on stays
+ * false — telemetry only ever reports a level actually driven to hardware.
  * ========================================================================== */
 
 typedef struct {
@@ -112,11 +112,16 @@ typedef struct {
 
 /* Knife hardware seam. Called with true to energise, false to cut. The
  * integration installs this; with none installed the decision logic and the
- * status/telemetry counters keep working (that is what the host tests use). */
+ * attempt counters keep working (that is what the host tests use), but no
+ * line is driven and knife_on stays false: the status never claims a knife is
+ * energised when the command did not reach hardware. */
 typedef void (*deploy_knife_driver_t)(bool on);
 
 /* Reset to defaults and clear all state. Call once at boot (with
- * deploy_mux_init()). */
+ * deploy_mux_init()). De-energises the knife through the driver currently in
+ * force BEFORE dropping the handle, so a re-init (watchdog, warm reboot)
+ * never orphans an energised actuator. At cold boot no driver is installed
+ * yet, so this drives no GPIO. */
 void deploy_fdir_init(void);
 
 /* The declared defaults, with rationale (see the .c file). */
@@ -127,7 +132,9 @@ const deploy_fdir_config_t *deploy_fdir_default_config(void);
  * zero-length activation would silently disable the reaction. */
 bool deploy_fdir_configure(const deploy_fdir_config_t *cfg);
 
-/* Install the knife driver (NULL to detach). */
+/* Install the knife driver (NULL to detach). Before the pointer changes, the
+ * OUTGOING driver is driven OFF through the old pointer: a knife it energised
+ * must never be orphaned, and detaching must not remove the only off-path. */
 void deploy_fdir_set_knife_driver(deploy_knife_driver_t drv);
 
 /* The configuration in force (never NULL). */
@@ -139,7 +146,16 @@ uint32_t deploy_fdir_activation_ms(uint8_t attempt_index);
 
 /* Advance the FDIR. `mode` is the current operational state, `now_ms` a
  * monotonic millisecond tick. Called periodically (100 ms cadence in flight):
- * new activations only start in STATE_INIT. Idempotent after it ends. */
+ * new activations only start in STATE_INIT. Idempotent after it ends.
+ *
+ * CONTRACT — MUST be called ALWAYS, in EVERY mode, at a FIXED cadence; the
+ * mode governs only whether a NEW activation may start, never whether an
+ * energised knife is serviced. De-energising must not depend on the caller:
+ * leaving STATE_INIT while the knife is on cuts it at once on the next call
+ * (ABORTED), regardless of where the activation window is, so a caller that
+ * treats step() as "INITIALIZATION only" cannot leave the line hot. Stopping
+ * the calls outside STATE_INIT is a contract violation and leaves the only
+ * software off-path unused. */
 void deploy_fdir_step(obw_state_t mode, uint32_t now_ms);
 
 /* Exit condition "Telecommand received from ground": stop retrying. The TC
