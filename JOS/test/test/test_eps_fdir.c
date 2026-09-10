@@ -26,6 +26,9 @@
  *     difference), on both windows.
  *   - an unarmed channel never fires; the heartbeat channel fires only once a
  *     caller supplies the TBC window.
+ *   - FDIR-EPS-EL-04 fires the NRST request at 1xTBC from the last heartbeat
+ *     (one window, not two), and the "EPS never heard since boot" path has the
+ *     SAME latency — the two paths of one channel must agree.
  *   - ack restarts the window instead of letting the request hammer the IC,
  *     and the request is a level: it stays set while the fault holds.
  *   - NULL / out-of-range inputs are rejected without side effects.
@@ -37,6 +40,13 @@
 
 #define T60MIN 3600000UL     /* 60 min, RED_FDIR_V2.xlsx 'EPS' FDIR-EPS-EL-03 */
 #define T10S      10000UL    /* 10 s,   RED_FDIR_V2.xlsx 'EPS' FDIR-EPS-EL-05 */
+
+/* FDIR-EPS-EL-04 window: the document writes "TBC ms from the last HB" and
+ * gives no value, so the test supplies one. The assertions below are written
+ * in terms of THIS literal, never the module's own macro, so the latency they
+ * pin down is the one written here and not whatever the module happens to be
+ * configured with: 1xTBC from the last heartbeat, not 2xTBC. */
+#define THB 5000UL
 
 static eps_fdir_t        ctx;
 static eps_fdir_config_t cfg;
@@ -257,25 +267,69 @@ void test_heartbeat_unarmed_is_silent(void)
     TEST_ASSERT_FALSE(step(90UL * 60UL * 1000UL, 250, true, true).eps_reset);
 }
 
-void test_heartbeat_armed_fires_then_rearms_on_heartbeat(void)
+/* FDIR-EPS-EL-04, silence AFTER a heartbeat that was actually received:
+ * "OBS resets the EPS uC via the NRST pin after TBC ms from the last
+ * heartbeat". ONE timeout after the last HB must be enough — a second window
+ * opened on top of the first one would push NRST out to 2xTBC and leave the
+ * EPS uC running as a dead sensor for a full extra TBC. */
+void test_heartbeat_resets_at_one_timeout_from_last_hb(void)
 {
-    eps_fdir_config_t hb = { T60MIN, T10S, 5000UL };   /* window = project input */
+    eps_fdir_config_t hb = { T60MIN, T10S, THB };   /* window = project input */
 
     TEST_ASSERT_EQUAL_INT(0, eps_fdir_init(&ctx, &hb));
 
-    TEST_ASSERT_FALSE(step(0U, 250, true, true).eps_reset);      /* episode starts */
-    TEST_ASSERT_FALSE(step(5000UL, 250, true, true).eps_reset);  /* not "more than" */
-    TEST_ASSERT_TRUE(step(5001UL, 250, true, true).eps_reset);
+    eps_fdir_note_eps_heartbeat(&ctx, 1000U);
+
+    TEST_ASSERT_FALSE(step(1000U, 250, true, true).eps_reset);         /* HB just came */
+    TEST_ASSERT_FALSE(step(1000UL + THB, 250, true, true).eps_reset);  /* exactly TBC: not "more than" */
+    TEST_ASSERT_TRUE(step(1000UL + THB + 1UL, 250, true, true).eps_reset); /* 1xTBC: NRST due */
+
+    /* Level, not pulse: asserted for as long as the silence lasts. */
+    TEST_ASSERT_TRUE(step(1000UL + THB + 2UL, 250, true, true).eps_reset);
 
     /* A heartbeat arrives: the EPS is alive, the request drops. */
-    eps_fdir_note_eps_heartbeat(&ctx, 6000U);
-    TEST_ASSERT_FALSE(step(6000U, 250, true, true).eps_reset);
+    eps_fdir_note_eps_heartbeat(&ctx, 7000U);
+    TEST_ASSERT_FALSE(step(7000U, 250, true, true).eps_reset);
 
-    /* ...and the next silence needs the full window again. */
-    TEST_ASSERT_FALSE(step(11001UL, 250, true, true).eps_reset);
-    TEST_ASSERT_TRUE(step(11001UL + 5001UL, 250, true, true).eps_reset);
+    /* ...and the next silence is again ONE timeout after THAT heartbeat. */
+    TEST_ASSERT_FALSE(step(7000UL + THB, 250, true, true).eps_reset);
+    TEST_ASSERT_TRUE(step(7000UL + THB + 1UL, 250, true, true).eps_reset);
 
     eps_fdir_note_eps_heartbeat(NULL, 0U);   /* must not fault */
+}
+
+/* FDIR-EPS-EL-04, the other path of the SAME channel: an EPS that has never
+ * sent a heartbeat since boot. Its reference is the boot tick, and it must
+ * request NRST with exactly the same latency as the "went silent" path —
+ * TBC. The two paths disagreeing (one at TBC, one at 2xTBC) is the bug this
+ * test pins down. */
+void test_heartbeat_never_seen_resets_at_one_timeout_from_boot(void)
+{
+    eps_fdir_config_t hb = { T60MIN, T10S, THB };
+
+    TEST_ASSERT_EQUAL_INT(0, eps_fdir_init(&ctx, &hb));
+
+    TEST_ASSERT_FALSE(step(0U, 250, true, true).eps_reset);         /* boot, nothing heard */
+    TEST_ASSERT_FALSE(step(THB, 250, true, true).eps_reset);        /* exactly TBC */
+    TEST_ASSERT_TRUE(step(THB + 1UL, 250, true, true).eps_reset);   /* 1xTBC: NRST due */
+    TEST_ASSERT_TRUE(step(THB + 2UL, 250, true, true).eps_reset);   /* still silent */
+}
+
+/* Ack on the heartbeat channel: the caller has pulsed NRST, so the EPS uC is
+ * granted a full fresh window to boot and resume its heartbeat before another
+ * request is raised (same "no hammering" rule as the IC channels). */
+void test_heartbeat_ack_restarts_one_window(void)
+{
+    eps_fdir_config_t hb = { T60MIN, T10S, THB };
+
+    TEST_ASSERT_EQUAL_INT(0, eps_fdir_init(&ctx, &hb));
+    eps_fdir_note_eps_heartbeat(&ctx, 0U);
+    TEST_ASSERT_TRUE(step(THB + 1UL, 250, true, true).eps_reset);
+
+    eps_fdir_ack_reset(&ctx, EPS_FDIR_TARGET_EPS, THB + 1UL);
+    TEST_ASSERT_FALSE(step(THB + 1UL, 250, true, true).eps_reset);
+    TEST_ASSERT_FALSE(step(2UL * THB + 1UL, 250, true, true).eps_reset);       /* one window after the NRST */
+    TEST_ASSERT_TRUE(step(2UL * THB + 2UL, 250, true, true).eps_reset);        /* ...then due again */
 }
 
 /* ------------------------------------------------------- input validation */

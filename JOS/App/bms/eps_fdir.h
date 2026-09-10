@@ -35,6 +35,11 @@
  *   The sheet writes TBC for EVERY one of those windows and no other delivered
  *   document gives a number, so the heartbeat window is NOT defaulted to a
  *   guess — see EPS_FDIR_HB_TIMEOUT_UNARMED below.
+ *   The window is measured from the heartbeat itself: the reset is requested
+ *   at ONE timeout after the last HB (and at one timeout after boot when the
+ *   EPS has never been heard from), never at two. The two paths of the same
+ *   channel must agree, and the number of timeouts is what the sentence in
+ *   the sheet fixes even though the value of TBC is missing.
  *
  * DOCUMENT STATUS: both spreadsheets are subteam working documents with no
  * release status (they still carry "TBC"/"da valutare" fields), so they are
@@ -140,8 +145,12 @@ typedef struct {
     eps_fdir_channel_t  charger;
     eps_fdir_channel_t  batt_monitor;
     eps_fdir_channel_t  eps_hb;
-    bool                hb_seen;      /* an EPS heartbeat was ever noted */
-    uint32_t            last_hb_ms;   /* tick of the last EPS heartbeat  */
+    uint32_t            hb_ref_ms;    /* anchor of the heartbeat window: the
+                                         tick of the last heartbeat, or 0 (the
+                                         boot tick) while none has ever been
+                                         received. Moved by
+                                         eps_fdir_note_eps_heartbeat() and by
+                                         an ack of a pending EPS reset. */
 } eps_fdir_t;
 
 /* --- API ------------------------------------------------------------------- */
@@ -159,7 +168,9 @@ int eps_fdir_init(eps_fdir_t *ctx, const eps_fdir_config_t *cfg);
 
 /* Record that an EPS heartbeat arrived at now_ms (FDIR-EPS-EL-01/-04).
  * Call it from the heartbeat receive path, not from a poll; a heartbeat is an
- * event, not a level. */
+ * event, not a level. This re-anchors the heartbeat window: the next
+ * eps_fdir_update() measures the silence from this tick, so an alive EPS
+ * clears any pending NRST request. */
 void eps_fdir_note_eps_heartbeat(eps_fdir_t *ctx, uint32_t now_ms);
 
 /* Advance every detector with one snapshot and return the outstanding reset
@@ -172,7 +183,30 @@ eps_fdir_requests_t eps_fdir_update(eps_fdir_t *ctx, const eps_fdir_input_t *in)
  * now_ms. If the fault condition still holds, the detection window is
  * restarted from now_ms — the reset must be given a full window to work
  * before another request is raised, and no retry policy is specified by the
- * document (unlike FDIR-COMM-EL-01, which does specify one). */
+ * document (unlike FDIR-COMM-EL-01, which does specify one). For
+ * EPS_FDIR_TARGET_EPS the "window" is the silence since the last heartbeat:
+ * an ack moves it to now_ms only when an NRST request was actually pending,
+ * so the rebooted EPS is granted a full TBC to heartbeat again. */
 void eps_fdir_ack_reset(eps_fdir_t *ctx, eps_fdir_target_t target, uint32_t now_ms);
+
+/* --- OPEN ITEMS ------------------------------------------------------------
+ * Declared, deliberately NOT decided here because the committer has not ruled
+ * on them; they are not silently resolved by this module.
+ *
+ * 1. Charger I2C read failure (FDIR-EPS-EL-03): a failed read is treated as
+ *    "no information", so it opens no episode and breaks one in progress —
+ *    i.e. it resets the 60 min window. Whether a too-long run of failed reads
+ *    should itself be a fault is an open question (a dead CHG_I2C bus is a
+ *    different failure mode and resetting the charger IC would not fix it).
+ *
+ * 2. Battery-monitor contract (FDIR-EPS-EL-05): the caller passes a boolean
+ *    "responsive", while the charger channel takes a value plus a validity
+ *    flag. The asymmetry is deliberate (the sheet's EL-05 condition is binary)
+ *    but the caller-side contract is not yet frozen.
+ *
+ * 3. now_ms monotonicity: the elapsed-time test is exact only while the tick
+ *    is non-decreasing (see eps_fdir_input_t). Freezing that requirement, or
+ *    detecting a backwards tick, is left open.
+ * ------------------------------------------------------------------------- */
 
 #endif /* EPS_FDIR_H */
