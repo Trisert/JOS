@@ -56,6 +56,17 @@
 
 /* USER CODE BEGIN 0 */
 
+/* SPI1 DMA handles (SPF V3 \u00a73.6.4.2: DMA for all SPI transactions).
+   Owned here, used by radiolib_hal.cpp (Transfer) and stm32l4xx_it.c (IRQ).
+   STM32L496 has NO DMAMUX: the peripheral mapping goes through the
+   DMA_CSELR channel-selection register (RM0351 Table 46: Channel 2 +
+   C2S=0001 -> SPI1_RX, Channel 3 + C3S=0001 -> SPI1_TX). HAL_DMA_Init
+   programs CSELR from Init.Request on parts without DMAMUX1, so
+   DMA_REQUEST_1 is correct here (NOT the DMAMUX1 IDs 11/12, which only
+   exist on DMAMUX parts). */
+DMA_HandleTypeDef hdma_spi1_tx;
+DMA_HandleTypeDef hdma_spi1_rx;
+
 /* USER CODE END 0 */
 
 void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
@@ -354,6 +365,36 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef* hspi)
   if(hspi->Instance==SPI1)
   {
     /* USER CODE BEGIN SPI1_MspInit 0 */
+    /* SPI1 DMA (SPF V3 \u00a73.6.4.2). See the CSELR note on the handle
+       declarations above. IRQ prio 5 = FreeRTOS MAX_SYSCALL ceiling, but the
+       callbacks stay HAL/FreeRTOS-free by design (volatile flag handoff). */
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    hdma_spi1_tx.Instance = DMA1_Channel3;
+    hdma_spi1_tx.Init.Request = DMA_REQUEST_1;   /* CSELR C3S=0001 -> SPI1_TX */
+    hdma_spi1_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    hdma_spi1_tx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_spi1_tx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_spi1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_spi1_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_spi1_tx.Init.Mode = DMA_NORMAL;
+    hdma_spi1_tx.Init.Priority = DMA_PRIORITY_VERY_HIGH;
+    if (HAL_DMA_Init(&hdma_spi1_tx) != HAL_OK) { Error_Handler(); }
+    __HAL_LINKDMA(hspi, hdmatx, hdma_spi1_tx);
+    hdma_spi1_rx.Instance = DMA1_Channel2;
+    hdma_spi1_rx.Init.Request = DMA_REQUEST_1;   /* CSELR C2S=0001 -> SPI1_RX */
+    hdma_spi1_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_spi1_rx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_spi1_rx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_spi1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_spi1_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_spi1_rx.Init.Mode = DMA_NORMAL;
+    hdma_spi1_rx.Init.Priority = DMA_PRIORITY_VERY_HIGH;
+    if (HAL_DMA_Init(&hdma_spi1_rx) != HAL_OK) { Error_Handler(); }
+    __HAL_LINKDMA(hspi, hdmarx, hdma_spi1_rx);
+    HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+    HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
 
     /* USER CODE END SPI1_MspInit 0 */
     /* Peripheral clock enable */
@@ -415,6 +456,10 @@ void HAL_SPI_MspDeInit(SPI_HandleTypeDef* hspi)
   if(hspi->Instance==SPI1)
   {
     /* USER CODE BEGIN SPI1_MspDeInit 0 */
+    /* NOTE: DMA handles/NVIC/DMA1 clock are deliberately NOT torn down here:
+       radiolib_hal never calls DeInit (see spiEnd()), so this only runs on a
+       Cube-regen path; disabling the IRQ under a queued transfer would fail
+       it silently. Handles live for the whole mission. */
 
     /* USER CODE END SPI1_MspDeInit 0 */
     /* Peripheral clock disable */

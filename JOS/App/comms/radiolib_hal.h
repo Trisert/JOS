@@ -56,6 +56,17 @@
 /* SPI instance used for the radio (SPF pag 77: OBC<->SX1268 on SPI1). */
 extern SPI_HandleTypeDef hspi1;
 
+/* spiTransfer() outcome codes (spiLastError()). A failed chunk is
+ * zero-filled in in[] so RadioLib never parses a half-shifted frame as
+ * valid; the code tells ground WHY. Cleared on the next fully successful
+ * transfer or via spiClearError(). */
+enum SpiXferStatus {
+    SPI_XFER_OK         = 0,   /* last transfer (or all chunks) complete */
+    SPI_XFER_DMA_START  = 1,   /* TransmitReceive_DMA refused (HAL_BUSY/ERR) */
+    SPI_XFER_DMA_TIMEOUT = 2,  /* chunk exceeded its baud-derived timeout */
+    SPI_XFER_DMA_ERROR  = 3    /* DMA transfer-error flag (TE) via callback */
+};
+
 struct Stm32Pin {
     GPIO_TypeDef* port;
     uint16_t      pin;
@@ -82,6 +93,12 @@ public:
     void spiTransfer(uint8_t* out, size_t len, uint8_t* in) override;
     void spiEndTransaction() override;
     void spiEnd() override;
+
+    /* Last DMA transfer outcome (SpiXferStatus). RadioLib's spiTransfer()
+     * is void, so this is the only error channel: radiolib_driver checks
+     * it after radio operations that must not silently use bad frames. */
+    uint32_t spiLastError(void);
+    void     spiClearError(void);
 
     // Time
     void delay(RadioLibTime_t ms) override;

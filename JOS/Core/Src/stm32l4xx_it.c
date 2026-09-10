@@ -233,6 +233,27 @@ void SysTick_Handler(void)
 
 /* USER CODE BEGIN 1 */
 
+/* SPI1 DMA completion IRQs (SPF V3 \u00a73.6.4.2; handles owned by
+   stm32l4xx_hal_msp.c). Prio 5 = FreeRTOS MAX_SYSCALL ceiling; the handlers
+   only run HAL_DMA_IRQHandler -> HAL_SPI callbacks, which set a volatile
+   flag and never call FreeRTOS/HAL-blocking APIs.
+   CUBEMX REGEN NOTE: .ioc has NVIC.ForceEnableDMAVector=true with hand-held
+   DMA config (see Dma.SPI1_* in JOS.ioc). If a regen ever emits duplicate
+   DMA1_Channel2/3_IRQHandler symbols, delete the GENERATED copies and keep
+   these (same rule as the USART1 note in main.c). */
+extern DMA_HandleTypeDef hdma_spi1_rx;
+extern DMA_HandleTypeDef hdma_spi1_tx;
+
+void DMA1_Channel2_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_spi1_rx);
+}
+
+void DMA1_Channel3_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_spi1_tx);
+}
+
 /* T35 (SPF Table 3.18): TIM6 is the HAL 1 ms timebase. Its update interrupt
    drives uwTick via HAL_IncTick(); SysTick above serves FreeRTOS only. */
 void TIM6_DAC_IRQHandler(void)
