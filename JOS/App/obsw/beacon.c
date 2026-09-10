@@ -2,8 +2,9 @@
  * beacon.c - housekeeping beacon composition (byte-exact HB frame)
  *
  * See beacon.h for the layout source (SW_DATA_TYPES.xlsx sheet "HB"), the
- * width correction for the GPS components, and the two documented assumptions
- * (bit order and byte order) that the document leaves open.
+ * width correction for the GPS components, the MSB-first bit order (evidenced
+ * by TTC packets.xlsx sheet "Task details"), and the BLOCKING open item on the
+ * byte order of the multi-byte fields (still little-endian, unconfirmed).
  *
  * This module is pure C: no HAL, no RTOS, no global state. It is therefore
  * host-compilable and is linked into the Ceedling unit-test build alongside
@@ -22,8 +23,8 @@
  * Written byte-by-byte rather than with a struct/memcpy on purpose: the
  * on-wire order is then a property of this code and identical on the STM32
  * target and on the x86/aarch64 host under test. The document does not state
- * an endianness (beacon.h), so keeping it explicit is what makes the choice
- * reviewable and changeable in one place.
+ * an endianness (beacon.h, BLOCKING OPEN ITEM), so keeping it explicit is what
+ * makes the choice reviewable and changeable in one place.
  * ------------------------------------------------------------------------- */
 static void beacon_put_u16_le(uint8_t *dst, uint16_t v)
 {
@@ -142,8 +143,8 @@ size_t beacon_build_hb(const beacon_hb_state_t *st, uint8_t *out, size_t out_len
     }
 
     /* Zero the whole frame first: every byte the sheet leaves blank
-     * (row 1 byte 8, rows 2-4) is emitted as 0x00, and no byte can be left
-     * carrying whatever the caller's buffer held. */
+     * (row 1 byte 8, rows 2-4, row 5 bytes 5-8) is emitted as 0x00, and no
+     * byte can be left carrying whatever the caller's buffer held. */
     (void)memset(out, 0, (size_t)BEACON_HB_LEN);
 
     /* Row 1 */
@@ -160,9 +161,11 @@ size_t beacon_build_hb(const beacon_hb_state_t *st, uint8_t *out, size_t out_len
                                                      st->cry_status,
                                                      st->heater_bat,
                                                      st->heater_cry);
-    /* Row 2-4: reserved, left zero by the memset. */
+    /* Rows 2-4 and row 5 bytes 5-8: reserved, left zero by the memset. */
 
-    /* Row 5 - pass-through 32-bit value, no format conversion. */
+    /* Row 5 - pass-through 32-bit value, no format conversion. The four bytes
+     * that follow it (offsets 36..39) are the reserved BEACON_OFF_ROW5_RESERVED
+     * region: still zero from the memset above. */
     beacon_put_u32_le(&out[BEACON_OFF_GPS_TIMESTAMP], st->gps_timestamp);
 
     /* Row 6 */
