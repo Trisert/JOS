@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 /* ---------- Operational States ---------- */
 typedef enum {
@@ -81,11 +82,17 @@ enum {
     TRIGGER_FRAM_MISSING      = 19,  /* FRAM select(s) missing at boot       */
 };
 
-/* ---------- BMS interface (stub for now) ---------- */
+/* ---------- BMS interface ----------
+ * valid is the fail-safe seam (fix/bms-soc-gating): false means the SoC is
+ * UNKNOWN/STALE — the EPS link is down or no telemetry has arrived yet — and
+ * every SoC gate below must treat it as "not satisfied". A dead EPS link
+ * used to read back as soc=100 and pass every gate (fail-open); it now
+ * closes them instead. */
 typedef struct {
-    uint8_t soc;                 /* state of charge 0-100% */
+    uint8_t soc;                 /* state of charge 0-100% (meaningful iff valid) */
     int16_t temp_c;              /* battery temperature (0.1 C units) */
     uint16_t voltage_mv;         /* battery voltage in mV */
+    bool valid;                  /* true once fresh EPS telemetry backs this snapshot */
 } bms_status_t;
 
 /* ---------- Beacon intervals per state (ms) ---------- */

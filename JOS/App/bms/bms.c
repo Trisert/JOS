@@ -105,9 +105,15 @@ static int bms_spi_init(void)
 }
 
 static bms_status_t bms_status = {
-    .soc        = 100,
+    .soc        = 0,      /* NOT 100: an unread battery is unknown, not full */
     .temp_c     = 250,
     .voltage_mv = 7400,
+    /* Fail-safe default (fix/bms-soc-gating): the snapshot is only promoted
+       to valid by a completed EPS poll, so until the EPS link answers every
+       SoC gate in the OBSW stays CLOSED. It used to be soc=100 with no way
+       to tell it apart from real telemetry, which made a dead EPS link look
+       like a fully charged battery and let every gate pass (fail-open). */
+    .valid      = false,
 };
 
 void bms_init(void)
@@ -134,4 +140,36 @@ bms_status_t bms_get_status(void)
        are returned; bms_spi_ready() tells callers which of the two they are
        looking at. */
     return bms_status;
+}
+
+/* Refresh the cache from the EPS.
+ *
+ * PINNED SEAM — the EPS SPI frame format is NOT specified anywhere in the
+ * delivered documentation. SPF r.1859 states only that the EPS STM32L4
+ * "communicates all telemetry to the OBC via a dedicated SPI link (operating
+ * as a slave) when requested"; it gives no request opcode, no reply layout,
+ * no field order and no CRC/validation rule. Writing a transaction from here
+ * would mean inventing a wire protocol and then reading a battery level out
+ * of a reply nobody defined — worse than the honest "unknown" this function
+ * reports. The transaction lands once the EPS ICD exists.
+ *
+ * What this function DOES establish is the plumbing and the failure
+ * semantics around that seam:
+ *   - it is a real, callable, periodically-invoked entry point, so the link
+ *     is exercised rather than dead code;
+ *   - it can only ever PROMOTE the snapshot to valid on a real read. A
+ *     failure returns -1 and leaves the last known state alone: the cache
+ *     never degrades into a fabricated "still 100 %" reading. */
+int bms_poll(void)
+{
+    if (bms_spi == NULL) {
+        /* Link never came up (bms_spi_init() failed at boot). The snapshot
+           stays invalid, which is the fail-safe answer. */
+        return -1;
+    }
+
+    /* TODO(EPS ICD): assert EPS chip select -> transmit the telemetry
+       request -> release the chip select -> validate the reply -> only then
+       bms_status = <parsed>; bms_status.valid = true; and return 0. */
+    return -1;
 }

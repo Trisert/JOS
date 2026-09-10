@@ -1,4 +1,5 @@
 #include "state_machine.h"
+#include "bms.h"           /* bms_poll(): EPS link + SoC threshold logic */
 #include "memory.h"        /* laststates_write(): LastStates pool API */
 #include "watchdog.h"
 #include "boot_crc.h"
@@ -58,11 +59,21 @@ static SRAM2_CRITICAL obsw_critical_state_t obsw_state = {
     /* Stub BMS - per RED_DES_ElectronicArchitecture_V1:
          BQ76905 on EPS board via local I2C to EPS MCU,
          OBC queries EPS over subsystem SPI.
-       Default voltage for 2S Li-ion: 7400 mV nominal. */
+       Default voltage for 2S Li-ion: 7400 mV nominal.
+
+       soc = 0 with valid = false is the FAIL-SAFE boot state, not a
+       measurement: no EPS telemetry has been read yet, so the SoC is
+       UNKNOWN and every SoC-gated path below stays closed. The previous
+       default was soc = 100, which was indistinguishable from real
+       telemetry and made a dead EPS link look like a full battery
+       (fix/bms-soc-gating). bms_poll() promotes this to a real reading
+       once the EPS frame format exists; until then the OBSW correctly
+       reports "unknown" instead of "full". */
     .bms                      = {
-        .soc        = 100,
+        .soc        = 0,
         .temp_c     = 250,   /* 25.0 C */
         .voltage_mv = 7400,
+        .valid      = false,
     },
 };
 
@@ -80,20 +91,33 @@ static const bms_thresholds_t default_thresholds = {
     .b_scrit  = 25,
 };
 
-static bms_status_t bms_get_status(void)
+/* Read the OBSW's cached battery snapshot.
+ *
+ * Deliberately NOT bms_get_status(): that name belongs to App/bms/bms.c,
+ * which owns the EPS link and its own cache. The two used to coexist as two
+ * same-named functions with different backing storage and no relationship
+ * between them, so the gates here compared against a constant that the EPS
+ * side never touched. This module reads the SRAM2 snapshot, and
+ * bms_refresh_snapshot() is what keeps that snapshot fed from the EPS. */
+static bms_status_t obsw_bms_snapshot(void)
 {
-    /* TODO: replace with real subsystem SPI query to EPS MCU */
     return obsw_state.bms;
 }
 
-/* For testing: allow overriding SoC from outside */
+/* For testing: allow overriding SoC from outside.
+ *
+ * This stands in for a completed EPS poll, so it also marks the snapshot
+ * VALID: the tests are exercising the gates with a battery reading the OBSW
+ * would actually have received. The un-stubbed default stays invalid, which
+ * is what test_..._unknown_soc_* asserts. */
 void bms_set_soc_stub(uint8_t soc)
 {
     /* Update and re-snapshot atomically: the scrub task must never observe
        the struct between the write and the commit, or it would "repair" a
        legitimate change back to the previous value (W2-5). */
     seu_mitigation_lock();
-    obsw_state.bms.soc = soc;
+    obsw_state.bms.soc   = soc;
+    obsw_state.bms.valid = true;
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
     seu_mitigation_unlock();
     /* Write-through to the FRAM golden copy (W2-5): the SRAM2 shadow alone
@@ -107,6 +131,22 @@ void *state_machine_critical_region(size_t *len)
 {
     if (len != NULL) { *len = sizeof(obsw_state); }
     return &obsw_state;
+}
+
+/* Companion to bms_set_soc_stub(): mark the CURRENT snapshot as
+ * un-backed-by-telemetry, leaving its soc byte where it is.
+ *
+ * The byte is deliberately kept, not zeroed: the hazard this models is a
+ * STALE reading that still says "full" while nothing has read the battery.
+ * A test that zeroed the SoC instead would pass on the threshold alone and
+ * prove nothing about the valid flag. */
+void bms_clear_soc_stub(void)
+{
+    seu_mitigation_lock();
+    obsw_state.bms.valid = false;
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+    seu_mitigation_unlock();
+    (void)seu_mitigation_sync(SEU_REGION_OBSW_STATE);
 }
 
 /* ---------- LastStates logging ---------- */
@@ -174,8 +214,12 @@ static int try_transition(obw_state_t target, uint8_t trigger)
         if (obsw_state.current_state == STATE_INIT) {
             ok = 1;  /* assume antenna deploy + self-test passed */
         } else if (obsw_state.current_state == STATE_CRIT) {
-            bms = bms_get_status();
-            ok = (bms.soc >= default_thresholds.b_opok);
+            bms = obsw_bms_snapshot();
+            /* SoC-gated recovery (SPF r.613/r.816): requires a VALID
+               reading at or above B_OPOK. An unknown SoC does not
+               satisfy it, so the OBSW stays in CRIT rather than
+               recovering on a battery level nobody measured. */
+            ok = bms_soc_allows_payload(&bms, &default_thresholds);
         }
         break;
 
@@ -185,8 +229,10 @@ static int try_transition(obw_state_t target, uint8_t trigger)
         if (obsw_state.current_state == STATE_READY) {
             ok = 1;
         } else if (obsw_state.current_state == STATE_CRIT) {
-            bms = bms_get_status();
-            ok = (bms.soc >= default_thresholds.b_opok) &&
+            bms = obsw_bms_snapshot();
+            /* Manual payload activation requires SoC >= B_OPOK
+               (SPF r.824) — valid data again, fail closed. */
+            ok = bms_soc_allows_payload(&bms, &default_thresholds) &&
                  (trigger == TRIGGER_GROUND_CMD);
         }
         break;
@@ -312,17 +358,91 @@ static void state_fram_sync(void)
     (void)seu_mitigation_sync(SEU_REGION_OBSW_STATE);
 }
 
+/* ---------- Battery snapshot refresh ----------
+
+   Connects the two halves of the EPS link that used to run in parallel:
+   App/bms/bms.c owns the SPI transaction and the cached reading, while this
+   module's critical state holds the snapshot the gates read. Nothing joined
+   them, so obsw_state.bms kept its static initialiser for the whole mission
+   and every SoC comparison was against a constant.
+
+   Called at 1 Hz from the task loop - not at the loop's 10 Hz - because it
+   performs a blocking SPI transaction, and the battery moves on a timescale
+   of minutes.
+
+   The copy happens ONLY after a successful poll. A failed poll leaves the
+   snapshot exactly as it is: it must never be overwritten with a guess.
+   bms.c keeps its own last-known reading and reports valid=false when it
+   has none, so the gates stay closed rather than assuming a full battery.
+   (The boot state is soc=0/valid=false for the same reason.)
+
+   No FRAM write-through here, unlike bms_set_soc_stub(): the snapshot is
+   re-derived from the EPS at every boot, so persisting it every second
+   would buy nothing and cost a blocking I2C write in the task loop. The
+   SEU lock + commit is still required - this mutates parity-protected
+   SRAM2 that the scrub task votes against. */
+static void bms_refresh_snapshot(void)
+{
+    bms_status_t fresh;
+
+    if (bms_poll() != 0) {
+        return;   /* no fresh telemetry: keep the snapshot, never invent one */
+    }
+    fresh = bms_get_status();
+
+    seu_mitigation_lock();
+    obsw_state.bms = fresh;
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+    seu_mitigation_unlock();
+}
+
 /* ---------- Autonomous battery check ----------
    Returns 1 when a transition was committed (caller must run
-   state_fram_sync() after releasing state_mutex), 0 otherwise. */
+   state_fram_sync() after releasing state_mutex), 0 otherwise.
+
+   Every branch below is driven by the SoC BAND from bms.h, so the battery
+   handling matches the SPF in one place instead of via threshold literals
+   scattered through the state machine:
+     - SPF r.600/r.807/r.808 — B_SCRIT / B_CRIT / B_COMMOK are all s2 (CRIT)
+       entries. B_CRIT and B_COMMOK were previously DECLARED but never
+       enforced anywhere (only b_scrit was read), so a battery sliding from
+       79 % down to 26 % produced no protective response at all. They are
+       enforced now.
+     - SPF r.658 — in s4 (ACTIVE) a fall to B_COMMOK suspends the ongoing
+       payload tasks and transitions to s2. The OBSW has no payload-task
+       suspend primitive yet, so what this honours is the TRANSITION, which
+       is the safety-relevant half: the satellite stops running in ACTIVE on
+       a battery it may not be able to sustain. Suspending the individual
+       payloads is tracked with the payload workstream.
+     - SPF r.613/r.816 — recovery to s3 requires SoC >= B_OPOK AND no active
+       critical events; the parity/CRIT latch is what carries "no active
+       critical events" (see try_transition()).
+
+   NOT enforced here, deliberately: the SPF's "SoC <= B_CRIT -> after the
+   current PDT" refinement (r.807). The OBSW has no PDT scheduler yet, so
+   the ordering the SPF describes cannot be honoured; entering CRIT
+   immediately is the conservative side of that requirement and is what
+   this does. It is not a substitute for the PDT ordering once PDTs exist.
+
+   OPEN DECISION (not silently resolved here): the case "already in s4
+   (ACTIVE) and the SoC becomes UNKNOWN" - i.e. the EPS link is lost while
+   payloads are running. Nothing below fires, so the payloads keep running
+   on a battery nobody is measuring. Containing to CRIT would be the
+   conservative answer, but SPF r.805 enumerates the s2 entry conditions and
+   "the battery could not be read" is not among them, so implementing it
+   means either reporting it as a critical event or amending the SPF - both
+   are decisions for the team, not things to invent in the driver. The
+   SoC-GATED paths (recovery to s3, manual activation) are already closed by
+   bms_soc_allows_payload(), so an unknown SoC cannot START payload ops. */
 static int check_battery_autonomous(void)
 {
-    bms_status_t bms = bms_get_status();
+    bms_status_t     bms  = obsw_bms_snapshot();
+    bms_soc_band_t   band = bms_soc_band(&bms, &default_thresholds);
 
-    if (bms.soc <= default_thresholds.b_scrit) {
+    if (bms_soc_is_low(band)) {
         return (try_transition(STATE_CRIT, TRIGGER_BATTERY_LOW) == 0);
     } else if (obsw_state.current_state == STATE_CRIT &&
-               bms.soc >= default_thresholds.b_opok) {
+               bms_soc_allows_payload(&bms, &default_thresholds)) {
         /* No parity check here any more: it lives in try_transition(), which
            covers this caller and every other one (Kilo #23, id 3740885216).
            A refused recovery simply leaves the OBSW in CRIT. */
@@ -345,6 +465,9 @@ static void state_machine_task(void *arg)
      * would wedge the transition critical section). */
     int boot_dirty = 0;
     int init_committed;
+    /* Battery-refresh divider: the loop runs at 10 Hz, the EPS poll at
+       1 Hz (see bms_refresh_snapshot()). */
+    unsigned bms_tick = 0U;
 
     (void)arg;
 
@@ -431,6 +554,15 @@ static void state_machine_task(void *arg)
     for (;;) {
         int batt_dirty;
         watchdog_alive_self();
+
+        /* Battery refresh at 1 Hz (every 10th 100 ms tick): blocking SPI to
+           the EPS, and the battery moves on a timescale of minutes. Runs
+           OUTSIDE state_mutex - it touches only the SRAM2 snapshot, while
+           check_battery_autonomous() below takes the lock to read it. */
+        if (bms_tick++ >= 10U) {
+            bms_tick = 0U;
+            bms_refresh_snapshot();
+        }
 
         osMutexAcquire(state_mutex, osWaitForever);
         batt_dirty = check_battery_autonomous();

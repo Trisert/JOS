@@ -59,6 +59,16 @@
     - ../App/memory
     - ../App/comms
     - ../App/aocs
+    # App/bms is deliberately NOT here. state_machine.c calls bms_poll() /
+    # bms_get_status(), but bms.c configures the SPI2 peripheral through the
+    # full CubeMX SPI_HandleTypeDef layout (Instance, Init.Mode, ..), which
+    # the host fakes expose only as an opaque one-word placeholder on purpose
+    # (see fakes/main.h). Linking it would mean mirroring that layout in a
+    # fake that then silently drifts from the real one. The same trade was
+    # already made for the radio: the driver stays flight-only and the host
+    # build gets a controllable double (support/radiolib_stubs.c). The BMS
+    # double is support/bms_stubs.c, and it USED to be trivial to add a stub;
+    # it is not a placeholder for the real module - see the file header.
     # NOTE: App/payloads as a directory must never go on :source: — the rest
     # of it (cloud/clear/crystals) is NOT host-compilable (pulls
     # stm32l4xx_hal.h), so it would link into EVERY test binary. temp.c is
@@ -76,6 +86,7 @@
     - ../App/memory
     - ../App/comms
     - ../App/aocs
+    - ../App/bms
     - support
   :support:
     - support
