@@ -141,14 +141,16 @@ static comms_tc_result_t validate_auth(const uint8_t *f, size_t len)
 
 /* host_lora_reset() resets the lora failure-INJECTION state (call counters +
  * armed one-shot failures), not the radio model itself: a leftover armed
- * failure must never leak into the next test. */
-void setUp(void)   { memset(frame_buf, 0, sizeof(frame_buf)); host_lora_reset(); }
+ * failure must never leak into the next test. The TT&C MAC hook is reset too:
+ * a verifier installed by a test must never leak into the next one. */
+void setUp(void)   { memset(frame_buf, 0, sizeof(frame_buf)); host_lora_reset();
+                     comms_ttc_set_mac_verifier(NULL); }
 /* Safety net: the hang ceiling must NEVER survive past its own test case.
    The early-return path inside run_task_until_escape() longjmps into Unity
    before alarm(0) runs, so tearDown() disarms unconditionally — otherwise a
    still-ticking timer could kill an innocent later test with a misleading
    "escape stub never fired" diagnostic. */
-void tearDown(void) { alarm(0); }
+void tearDown(void) { alarm(0); comms_ttc_set_mac_verifier(NULL); }
 
 /* ================= CRC known-answer test ================= */
 
@@ -1713,4 +1715,905 @@ void test_lora_beacon_task_loop_retries_failed_registration(void)
     }
 
     run_task_iterations(lora_beacon_task);
+}
+
+/* ==================================================================== */
+/* TT&C command frame codec (W1)                                        */
+/*                                                                      */
+/* Every expected byte/number below is a LITERAL, never the COMMS_TTC_* */
+/* macro the production code uses — a wrong constant in comms.h must    */
+/* not be able to make a test agree with a bug.                         */
+/* ==================================================================== */
+
+/* Independent scratch buffer: a TT&C frame reaches COMMS_TTC_MAX_FRAME (192 B
+   with ECC on: 12 content blocks), larger than the legacy frame_buf
+   (COMMS_TC_MAX_FRAME + 8). */
+static uint8_t ttc_buf[COMMS_TTC_MAX_FRAME + 8U];
+
+static void ttc_info_init(comms_ttc_info_t *info, uint8_t station, uint8_t ecc,
+                          uint8_t type, uint8_t task, uint8_t pl_len)
+{
+    info->station_id = station;
+    info->ecc_flag   = ecc;
+    info->tec_type   = type;
+    info->tec_task   = task;
+    info->pl_len     = pl_len;
+}
+
+/* Build a minimal valid frame (no payload). Holds the ECC flag caller-supplied
+   so the tests can exercise both tail rules. */
+static size_t ttc_build_header_only(uint8_t ecc)
+{
+    comms_ttc_info_t info;
+    size_t           n = 0U;
+
+    ttc_info_init(&info, 1U, ecc, 0U, 0x01U, 0U);   /* HK, OBC reboot */
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
+    return n;
+}
+
+/* ---- INFO bitfield ---- */
+
+void test_ttc_info_bitfield_pack_unpack_literals(void)
+{
+    uint8_t type = 0xEEU;
+    uint8_t task = 0xEEU;
+
+    /* INFO byte 2 = (TEC type << 6) | TEC task: the TEC type occupies the two
+       HIGH bits (bit 1-2 read MSB-first) and the task the six LOW bits (bit 3-8).
+       Source: TTC packets.xlsx 'Task types'!C4:C7 ("Bin ID": HK=00, DAQ=01,
+       PE=10, DT=11) composed with the 6-bit task Bin ID into 'Task details'
+       column D ("TEC bin ID") / column E ("TEC hex ID"). Worked examples from
+       the sheet: 'Task details'!E5 (HK task 1, OBC reboot) = 0x01;
+       'Task details'!E21 (HK task 17, TLE) = 0x11; 'Task details'!E55
+       (HK task 51, Lora link) = 0x33. */
+    TEST_ASSERT_EQUAL_HEX8(0x00U, comms_ttc_info_pack(0U, 0U));
+    TEST_ASSERT_EQUAL_HEX8(0x01U, comms_ttc_info_pack(0U, 0x01U));   /* HK, OBC reboot */
+    TEST_ASSERT_EQUAL_HEX8(0x11U, comms_ttc_info_pack(0U, 0x11U));   /* HK, TLE        */
+    TEST_ASSERT_EQUAL_HEX8(0x33U, comms_ttc_info_pack(0U, 0x33U));   /* HK, Lora link  */
+    TEST_ASSERT_EQUAL_HEX8(0x40U, comms_ttc_info_pack(1U, 0U));      /* DAQ=01 << 6    */
+    TEST_ASSERT_EQUAL_HEX8(0xC0U, comms_ttc_info_pack(3U, 0U));      /* DT=11  << 6    */
+    TEST_ASSERT_EQUAL_HEX8(0xFFU, comms_ttc_info_pack(3U, 63U));
+
+    comms_ttc_info_unpack(0x11U, &type, &task);
+    TEST_ASSERT_EQUAL_UINT8(0U, type);
+    TEST_ASSERT_EQUAL_UINT8(0x11U, task);
+
+    comms_ttc_info_unpack(0x33U, &type, &task);
+    TEST_ASSERT_EQUAL_UINT8(0U, type);
+    TEST_ASSERT_EQUAL_UINT8(0x33U, task);
+
+    comms_ttc_info_unpack(0xFFU, &type, &task);
+    TEST_ASSERT_EQUAL_UINT8(3U, type);
+    TEST_ASSERT_EQUAL_UINT8(63U, task);
+
+    /* NULL output pointers are ignored, not dereferenced. */
+    comms_ttc_info_unpack(0x00U, NULL, NULL);
+}
+
+/* ---- 16*n padding rule ---- */
+
+void test_ttc_padded_len_rounds_to_16(void)
+{
+    TEST_ASSERT_EQUAL_size_t(0U,   comms_ttc_padded_len(0U, false));
+    TEST_ASSERT_EQUAL_size_t(16U,  comms_ttc_padded_len(1U, false));
+    TEST_ASSERT_EQUAL_size_t(16U,  comms_ttc_padded_len(15U, false));
+    TEST_ASSERT_EQUAL_size_t(16U,  comms_ttc_padded_len(16U, false));
+    TEST_ASSERT_EQUAL_size_t(32U,  comms_ttc_padded_len(17U, false));
+    TEST_ASSERT_EQUAL_size_t(112U, comms_ttc_padded_len(112U, false));
+    /* ECC ON: the 6 RS parity bytes ('Packet structure'!H54) live INSIDE each
+       16-byte block, so a block carries 10 DATA bytes + 6 parity and the
+       packet is STILL 16*n (!A14) - it is not 16*n + 6. */
+    TEST_ASSERT_EQUAL_size_t(0U,   comms_ttc_padded_len(0U, true));
+    TEST_ASSERT_EQUAL_size_t(16U,  comms_ttc_padded_len(1U, true));
+    TEST_ASSERT_EQUAL_size_t(16U,  comms_ttc_padded_len(10U, true));
+    TEST_ASSERT_EQUAL_size_t(32U,  comms_ttc_padded_len(11U, true));
+    TEST_ASSERT_EQUAL_size_t(32U,  comms_ttc_padded_len(12U, true));   /* header only */
+    TEST_ASSERT_EQUAL_size_t(32U,  comms_ttc_padded_len(16U, true));
+    TEST_ASSERT_EQUAL_size_t(16U,  comms_ttc_padded_len(12U, false));
+    TEST_ASSERT_EQUAL_size_t(48U,  comms_ttc_padded_len(30U, true));
+    TEST_ASSERT_EQUAL_size_t(64U,  comms_ttc_padded_len(31U, true));
+    TEST_ASSERT_EQUAL_size_t(192U, comms_ttc_padded_len(112U, true));  /* 12 blocks */
+
+    /* The invariant !A14 asks for, in BOTH modes: the total is 16*n. */
+    for (size_t c = 0U; c <= 120U; c++) {
+        TEST_ASSERT_EQUAL_size_t(0U, comms_ttc_padded_len(c, false) % 16U);
+        TEST_ASSERT_EQUAL_size_t(0U, comms_ttc_padded_len(c, true) % 16U);
+        /* The parity costs capacity, never a tail: ECC ON is never shorter. */
+        TEST_ASSERT_TRUE(comms_ttc_padded_len(c, true) >=
+                         comms_ttc_padded_len(c, false));
+    }
+}
+
+/* ---- Reed-Solomon parity known-answer vectors ---- */
+
+/* KAT provenance (docs/api/ttc-frame.md §2): the parity below is produced
+   bit-for-bit by BOTH (a) python `reedsolo` RSCodec(6) with its defaults
+   (fcr=0, prim=0x11D, generator=2 => a shortened RS(255,249) code) and
+   (b) an independent GF(256) polynomial-division encoder written for this
+   review. Two implementations agreeing is what makes the vector a KAT
+   rather than a snapshot of one encoder. */
+void test_rs_ecc_known_answer_literals(void)
+{
+    uint8_t parity[6];
+    const uint8_t kat_zero[6] = { 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U };
+    const uint8_t kat_a[6]    = { 0x0EU, 0x7BU, 0xA9U, 0x55U, 0xD2U, 0x5AU };
+    const uint8_t kat_c[6]    = { 0x04U, 0x04U, 0x19U, 0xD6U, 0x2AU, 0xE4U };
+
+    /* Block of ten zero data bytes -> the all-zero codeword (reedsolo: 00*6). */
+    const uint8_t data_zero[10] = { 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U };
+    memset(parity, 0xEEU, sizeof(parity));
+    comms_ttc_rs_ecc_encode(data_zero, sizeof(data_zero), parity);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(kat_zero, parity, 6U);
+
+    /* 10 data bytes 00..09 -> 6 parity symbols: this is the RS(16,10) codeword
+       that fills one 16-byte interleaving block. */
+    const uint8_t data_a[10] = { 0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U };
+    memset(parity, 0xEEU, sizeof(parity));
+    comms_ttc_rs_ecc_encode(data_a, sizeof(data_a), parity);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(kat_a, parity, 6U);
+
+    /* 10 data bytes 10..19 -> 6 parity symbols (a second block vector). */
+    uint8_t data_c[10];
+    for (size_t i = 0U; i < sizeof(data_c); i++) {
+        data_c[i] = (uint8_t)(10U + i);
+    }
+    memset(parity, 0xEEU, sizeof(parity));
+    comms_ttc_rs_ecc_encode(data_c, sizeof(data_c), parity);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(kat_c, parity, 6U);
+
+    /* The encoder bound is COMMS_TTC_RS_MAX_DATA (249), so a longer message is
+       still legal; this vector cross-checks the generator against reedsolo on
+       a multi-symbol input. */
+    uint8_t       data_b[16];
+    const uint8_t kat_b[6] = { 0x19U, 0xC6U, 0x88U, 0x16U, 0xC8U, 0x89U };
+    for (size_t i = 0U; i < sizeof(data_b); i++) {
+        data_b[i] = (uint8_t)i;
+    }
+    comms_ttc_rs_ecc_encode(data_b, sizeof(data_b), parity);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(kat_b, parity, 6U);
+
+    /* Linearity check: the all-zero codeword has all-zero parity (a real
+       RS encoder must return this, and it proves the tail is computed, not
+       left at the 0xEE poison). */
+    uint8_t zeros[32];
+    memset(zeros, 0, sizeof(zeros));
+    memset(parity, 0xEEU, sizeof(parity));
+    comms_ttc_rs_ecc_encode(zeros, sizeof(zeros), parity);
+    for (size_t i = 0U; i < 6U; i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00U, parity[i]);
+    }
+
+    /* Defensive contract: NULL data / oversize len -> parity zeroed, no
+       uninitialised bytes. */
+    memset(parity, 0xEEU, sizeof(parity));
+    comms_ttc_rs_ecc_encode(NULL, 10U, parity);
+    for (size_t i = 0U; i < 6U; i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00U, parity[i]);
+    }
+    memset(parity, 0xEEU, sizeof(parity));
+    comms_ttc_rs_ecc_encode(data_a, sizeof(data_a) + 260U, parity);
+    for (size_t i = 0U; i < 6U; i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00U, parity[i]);
+    }
+
+    /* NULL parity pointer: must return without touching memory. */
+    comms_ttc_rs_ecc_encode(data_a, sizeof(data_a), NULL);
+}
+
+/* ---- TX build: literal byte layout ---- */
+
+void test_ttc_build_frame_literal_bytes_no_ecc(void)
+{
+    comms_ttc_info_t info;
+    const uint8_t    mac[4]     = { 0xDEU, 0xADU, 0xBEU, 0xEFU };
+    const uint8_t    payload[5] = { 0x01U, 0x02U, 0x03U, 0x04U, 0x05U };
+    size_t           n          = 0U;
+
+    ttc_info_init(&info, 42U, 0x55U, 0U, 0x11U, 5U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info,
+                              0x11223344UL, mac, payload, sizeof(payload), &n));
+
+    TEST_ASSERT_EQUAL_size_t(32U, n);              /* 17 data B -> 32 */
+    TEST_ASSERT_EQUAL_size_t(0U, n % 16U);
+
+    TEST_ASSERT_EQUAL_HEX8(0x2AU, ttc_buf[0]);     /* station id 42        */
+    TEST_ASSERT_EQUAL_HEX8(0x55U, ttc_buf[1]);     /* ECC off              */
+    TEST_ASSERT_EQUAL_HEX8(0x11U, ttc_buf[2]);     /* HK << 6 | task 0x11  */
+    TEST_ASSERT_EQUAL_HEX8(0x05U, ttc_buf[3]);     /* PL length            */
+    TEST_ASSERT_EQUAL_HEX8(0x11U, ttc_buf[4]);     /* UNIX time BE         */
+    TEST_ASSERT_EQUAL_HEX8(0x22U, ttc_buf[5]);
+    TEST_ASSERT_EQUAL_HEX8(0x33U, ttc_buf[6]);
+    TEST_ASSERT_EQUAL_HEX8(0x44U, ttc_buf[7]);
+    TEST_ASSERT_EQUAL_HEX8(0xDEU, ttc_buf[8]);     /* MAC opaque, verbatim */
+    TEST_ASSERT_EQUAL_HEX8(0xADU, ttc_buf[9]);
+    TEST_ASSERT_EQUAL_HEX8(0xBEU, ttc_buf[10]);
+    TEST_ASSERT_EQUAL_HEX8(0xEFU, ttc_buf[11]);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, &ttc_buf[12], 5U);
+
+    /* Zero padding from the end of the payload to the block boundary. */
+    for (size_t i = 17U; i < 32U; i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00U, ttc_buf[i]);
+    }
+}
+
+void test_ttc_build_frame_null_mac_is_zeroed(void)
+{
+    comms_ttc_info_t info;
+    const uint8_t    payload[5] = { 1U, 2U, 3U, 4U, 5U };
+    size_t           n          = 0U;
+
+    ttc_info_init(&info, 9U, 0x55U, 1U, 0x08U, 5U);   /* DAQ */
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL,
+                              payload, sizeof(payload), &n));
+
+    TEST_ASSERT_EQUAL_HEX8(0x00U, ttc_buf[8]);
+    TEST_ASSERT_EQUAL_HEX8(0x00U, ttc_buf[9]);
+    TEST_ASSERT_EQUAL_HEX8(0x00U, ttc_buf[10]);
+    TEST_ASSERT_EQUAL_HEX8(0x00U, ttc_buf[11]);
+    /* DAQ Bin ID 01 << 6 | task 0x08 = 0x48 ('Task types'!C5=01). */
+    TEST_ASSERT_EQUAL_HEX8(0x48U, ttc_buf[2]);
+}
+
+/* ---- ECC block rule: 16*n with the parity INSIDE the blocks ---- */
+
+/* On-air offset of content byte @p i of an ECC-ON frame: block (i / 10), slot
+   (i % 10). The 6 parity bytes of every block occupy slots 10..15. Literals on
+   purpose (see the section header: tests never reuse the macros). */
+static size_t ttc_ecc_onair(size_t i)
+{
+    return ((i / 10U) * 16U) + (i % 10U);
+}
+
+/* 'Packet structure'!H54 fixes the RS PARITY element at 6 bytes; !A14 requires
+   the packet to be 16*n ("correct interleaving"). Both hold together when the
+   parity rides INSIDE each 16-byte block: the block is a systematic RS(16,10)
+   codeword, so the frame is STILL 16*n - never 16*n + 6.
+   KAT provenance: python-reedsolo RSCodec(6) with its defaults (fcr=0,
+   prim=0x11D, generator=2) and an independent GF(256) encoder; both agree
+   byte-for-byte on this whole frame (docs/api/ttc-frame.md). */
+void test_ttc_build_frame_ecc_on_keeps_16n_blocks(void)
+{
+    comms_ttc_info_t info;
+    const uint8_t    mac[4]     = { 0xDEU, 0xADU, 0xBEU, 0xEFU };
+    const uint8_t    payload[5] = { 0x01U, 0x02U, 0x03U, 0x04U, 0x05U };
+    const uint8_t    kat[32]    = {
+        /* content: 2A AA 11 05 11 22 33 44 DE AD | BE EF 01 02 03 04 05 + 3 pad */
+        0x2AU, 0xAAU, 0x11U, 0x05U, 0x11U, 0x22U, 0x33U, 0x44U, 0xDEU, 0xADU,
+        0xB6U, 0xF8U, 0x52U, 0x10U, 0x1EU, 0xB1U,   /* block 0 parity */
+        0xBEU, 0xEFU, 0x01U, 0x02U, 0x03U, 0x04U, 0x05U, 0x00U, 0x00U, 0x00U,
+        0x3AU, 0xC8U, 0x17U, 0x76U, 0x04U, 0xC7U    /* block 1 parity */
+    };
+    size_t n = 0U;
+
+    ttc_info_init(&info, 42U, 0xAAU, 0U, 0x11U, 5U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info,
+                              0x11223344UL, mac, payload, sizeof(payload), &n));
+
+    TEST_ASSERT_EQUAL_size_t(32U, n);          /* 17 content B -> 2 blocks */
+    TEST_ASSERT_EQUAL_size_t(0U, n % 16U);     /* the 16*n rule, ECC ON    */
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(kat, ttc_buf, 32U);
+
+    /* The three tail slots of block 1 are the mandated zero padding
+       ('Packet structure'!J44/J50): content bytes 17..19 -> on-air 23..25. */
+    TEST_ASSERT_EQUAL_UINT8(0x00U, ttc_buf[ttc_ecc_onair(17U)]);
+    TEST_ASSERT_EQUAL_UINT8(0x00U, ttc_buf[ttc_ecc_onair(18U)]);
+    TEST_ASSERT_EQUAL_UINT8(0x00U, ttc_buf[ttc_ecc_onair(19U)]);
+
+    /* The same content with ECC OFF is also 16*n: the parity costs DATA
+       capacity (10 of 16 bytes per block), it is not an appended tail. */
+    ttc_info_init(&info, 42U, 0x55U, 0U, 0x11U, 5U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info,
+                              0x11223344UL, mac, payload, sizeof(payload), &n));
+    TEST_ASSERT_EQUAL_size_t(32U, n);
+    TEST_ASSERT_EQUAL_size_t(0U, n % 16U);
+    for (size_t i = 17U; i < 32U; i++) {
+        TEST_ASSERT_EQUAL_HEX8(0x00U, ttc_buf[i]);   /* zero padding, ECC OFF */
+    }
+}
+
+/* Header-only ECC-ON frame: 12 content bytes -> ceil(12/10) = 2 blocks -> 32 B
+   (not 22). block 0 = 01 AA 01 00 00 00 00 00 00 00 -> parity 82 BB 7F 0F B5 56
+   (station 1, HK|OBC reboot, PL 0, unix 0, zero MAC); block 1 is ten zero data
+   bytes -> all-zero parity. */
+void test_ttc_build_frame_ecc_header_only_matches_kat(void)
+{
+    const uint8_t kat[32] = {
+        0x01U, 0xAAU, 0x01U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x82U, 0xBBU, 0x7FU, 0x0FU, 0xB5U, 0x56U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+        0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U
+    };
+    size_t n = ttc_build_header_only(0xAAU);
+
+    TEST_ASSERT_EQUAL_size_t(32U, n);
+    TEST_ASSERT_EQUAL_size_t(0U, n % 16U);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(kat, ttc_buf, 32U);
+}
+
+void test_ttc_build_frame_zero_payload_aligns_to_blocks(void)
+{
+    TEST_ASSERT_EQUAL_size_t(16U, ttc_build_header_only(0x55U));  /* 1 block  */
+    TEST_ASSERT_EQUAL_size_t(32U, ttc_build_header_only(0xAAU));  /* 2 blocks */
+}
+
+/* ---- RX parse: round trip ---- */
+
+void test_ttc_build_parse_round_trip(void)
+{
+    comms_ttc_info_t  info;
+    comms_ttc_frame_t f;
+    const uint8_t     mac[4]     = { 0xA0U, 0xA1U, 0xA2U, 0xA3U };
+    const uint8_t     payload[5] = { 0x11U, 0x22U, 0x33U, 0x44U, 0x55U };
+    size_t            n          = 0U;
+
+    ttc_info_init(&info, 77U, 0x55U, 0U, 0x11U, 5U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info,
+                              0xDEADBEEFUL, mac, payload, sizeof(payload), &n));
+
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK, comms_ttc_parse_frame(ttc_buf, n, &f));
+    TEST_ASSERT_EQUAL_UINT8(77U, f.info.station_id);
+    TEST_ASSERT_EQUAL_HEX8(0x55U, f.info.ecc_flag);
+    TEST_ASSERT_EQUAL_UINT8(0U, f.info.tec_type);
+    TEST_ASSERT_EQUAL_UINT8(0x11U, f.info.tec_task);
+    TEST_ASSERT_EQUAL_UINT8(5U, f.info.pl_len);
+    TEST_ASSERT_EQUAL_HEX32(0xDEADBEEFUL, f.unix_time);
+    TEST_ASSERT_EQUAL_PTR(&ttc_buf[8], f.mac);          /* opaque, aliased */
+    TEST_ASSERT_EQUAL_PTR(&ttc_buf[12], f.payload);
+    TEST_ASSERT_EQUAL_size_t(32U, f.frame_len);
+    TEST_ASSERT_EQUAL_size_t(32U, f.data_len);
+    TEST_ASSERT_EQUAL_HEX8(0xA0U, f.mac[0]);
+    TEST_ASSERT_EQUAL_HEX8(0xA3U, f.mac[3]);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, f.payload, 5U);
+}
+
+/* ECC-ON round trip: the header and payload are de-interleaved out of the
+   16-byte blocks (10 data + 6 parity each), and data_len reports the DATA
+   capacity the blocks carry (2 blocks -> 20 B), not the on-air total. */
+void test_ttc_parse_ecc_on_frame_deinterleaves(void)
+{
+    comms_ttc_frame_t f;
+    const uint8_t     payload[5] = { 1U, 2U, 3U, 4U, 5U };
+    const uint8_t     mac[4]     = { 0xA0U, 0xA1U, 0xA2U, 0xA3U };
+    comms_ttc_info_t  info;
+    size_t            n = 0U;
+
+    ttc_info_init(&info, 4U, 0xAAU, 0U, 0x11U, 5U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, mac,
+                              payload, sizeof(payload), &n));
+
+    TEST_ASSERT_EQUAL_size_t(0U, n % 16U);
+    TEST_ASSERT_EQUAL_size_t(32U, n);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK, comms_ttc_parse_frame(ttc_buf, n, &f));
+    TEST_ASSERT_EQUAL_size_t(32U, f.frame_len);
+    TEST_ASSERT_EQUAL_size_t(20U, f.data_len);          /* 2 blocks x 10 data */
+    TEST_ASSERT_EQUAL_UINT8(4U, f.info.station_id);
+    TEST_ASSERT_EQUAL_HEX8(0xAAU, f.info.ecc_flag);
+    TEST_ASSERT_EQUAL_UINT8(5U, f.info.pl_len);
+    TEST_ASSERT_NOT_NULL(f.mac);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(mac, f.mac, 4U);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(payload, f.payload, 5U);
+}
+
+/* ---- RX parse: rejection classes ---- */
+
+void test_ttc_parse_rejects_null_and_runt_and_oversize(void)
+{
+    comms_ttc_frame_t f;
+    size_t            n = ttc_build_header_only(0x55U);
+
+    TEST_ASSERT_EQUAL_size_t(16U, n);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_NULL, comms_ttc_parse_frame(NULL, n, &f));
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_NULL, comms_ttc_parse_frame(ttc_buf, n, NULL));
+
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_TOO_SHORT, comms_ttc_parse_frame(ttc_buf, 0U, &f));
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_TOO_SHORT, comms_ttc_parse_frame(ttc_buf, 15U, &f));
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_TOO_LONG, comms_ttc_parse_frame(ttc_buf, 208U, &f));
+
+    /* 17 is within [16,128] but not an interleaving block count. */
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_ALIGN, comms_ttc_parse_frame(ttc_buf, 17U, &f));
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_TOO_SHORT, comms_ttc_parse_frame(ttc_buf, 1U, &f));
+}
+
+/* Canonical length: the frame length must equal exactly
+   comms_ttc_padded_len(HDR + PL, ecc). A frame that declares 5 payload bytes
+   but is only one 16-byte block long is non-canonical (comms.c:319 accepted
+   it before this fix) and must be rejected, not silently truncated. */
+void test_ttc_parse_rejects_noncanonical_length(void)
+{
+    comms_ttc_info_t  info;
+    comms_ttc_frame_t f;
+    const uint8_t     payload[5] = { 1U, 2U, 3U, 4U, 5U };
+    size_t            n          = 0U;
+
+    ttc_info_init(&info, 8U, 0x55U, 0U, 0x11U, 5U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL,
+                              payload, sizeof(payload), &n));
+    TEST_ASSERT_EQUAL_size_t(32U, n);
+
+    /* Declares PL 5 (canonical 32 B) but handed as 16 B. */
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_LEN_MISMATCH,
+                          comms_ttc_parse_frame(ttc_buf, 16U, &f));
+    /* The canonical length parses. */
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK, comms_ttc_parse_frame(ttc_buf, 32U, &f));
+
+    /* Header-only frame (PL 0, canonical 16 B) padded out to 32 B: the extra
+       block is not a legal canonical length either. */
+    size_t n0 = ttc_build_header_only(0x55U);
+    TEST_ASSERT_EQUAL_size_t(16U, n0);
+    memset(&ttc_buf[n0], 0, 16U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_LEN_MISMATCH,
+                          comms_ttc_parse_frame(ttc_buf, 32U, &f));
+
+    /* Same rule with ECC: a header-only ECC frame is 32 B (two RS(16,10)
+       blocks - the 12 content bytes do not fit one 10-byte data field). 16 B
+       with the ECC flag set is 16-aligned but not canonical, and neither is
+       the 48 B over-pad. */
+    n0 = ttc_build_header_only(0xAAU);
+    TEST_ASSERT_EQUAL_size_t(32U, n0);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_LEN_MISMATCH,
+                          comms_ttc_parse_frame(ttc_buf, 16U, &f));
+    memset(&ttc_buf[n0], 0, 16U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_LEN_MISMATCH,
+                          comms_ttc_parse_frame(ttc_buf, 48U, &f));
+}
+
+void test_ttc_parse_rejects_pl_len_field_beyond_max(void)
+{
+    comms_ttc_frame_t f;
+    size_t            n = ttc_build_header_only(0x55U);
+
+    TEST_ASSERT_EQUAL_size_t(16U, n);
+    ttc_buf[3] = 101U;                       /* one over the 0..100 field */
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_PL_LEN, comms_ttc_parse_frame(ttc_buf, n, &f));
+
+    ttc_buf[3] = 255U;
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_PL_LEN, comms_ttc_parse_frame(ttc_buf, n, &f));
+}
+
+void test_ttc_parse_rejects_bad_info_fields(void)
+{
+    comms_ttc_frame_t f;
+    size_t            n = ttc_build_header_only(0x55U);
+
+    ttc_buf[0] = 0U;   /* station id 0 is not legal */
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_STATION_ID, comms_ttc_parse_frame(ttc_buf, n, &f));
+
+    ttc_buf[0] = 1U;
+    ttc_buf[1] = 0x00U; /* neither 0x55 nor 0xAA */
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_ECC_FLAG, comms_ttc_parse_frame(ttc_buf, n, &f));
+}
+
+/* ---- TX validation ---- */
+
+void test_ttc_build_rejects_pl_len_beyond_max(void)
+{
+    comms_ttc_info_t info;
+    uint8_t          payload[101];
+    size_t           n = 0U;
+
+    memset(payload, 0xA5U, sizeof(payload));
+    ttc_info_init(&info, 1U, 0x55U, 1U, 0x01U, 101U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_PL_LEN,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL,
+                              payload, 101U, &n));
+
+    /* INFO and the payload length argument must agree. */
+    ttc_info_init(&info, 1U, 0x55U, 1U, 0x01U, 101U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_PL_LEN,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL,
+                              payload, 100U, &n));
+}
+
+void test_ttc_build_rejects_bad_info_and_null(void)
+{
+    comms_ttc_info_t info;
+    size_t           n = 0U;
+
+    ttc_info_init(&info, 1U, 0x55U, 1U, 0x01U, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_NULL,
+        comms_ttc_build_frame(NULL, 32U, &info, 0UL, NULL, NULL, 0U, &n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_NULL,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), NULL, 0UL, NULL, NULL, 0U, &n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_NULL,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 3U, &n));
+
+    ttc_info_init(&info, 0U, 0x55U, 1U, 0x01U, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_STATION_ID,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
+
+    ttc_info_init(&info, 1U, 0x11U, 1U, 0x01U, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_ECC_FLAG,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
+
+    ttc_info_init(&info, 1U, 0x55U, 4U, 0x01U, 0U);   /* type field is 2 bits */
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_TEC_TYPE,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
+
+    ttc_info_init(&info, 1U, 0x55U, 1U, 64U, 0U);     /* task field is 6 bits */
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_TEC_TASK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
+}
+
+void test_ttc_build_reports_needed_length_when_buffer_too_small(void)
+{
+    comms_ttc_info_t info;
+    uint8_t          small[8];
+    size_t           n = 0U;
+
+    ttc_info_init(&info, 1U, 0x55U, 1U, 0x01U, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_ERR_BUF,
+        comms_ttc_build_frame(small, sizeof(small), &info, 0UL, NULL, NULL, 0U, &n));
+    TEST_ASSERT_EQUAL_size_t(16U, n);      /* the caller learns the size to alloc */
+}
+
+/* ---- layout discriminator ---- */
+
+void test_ttc_layout_discriminator(void)
+{
+    size_t n;
+
+    n = ttc_build_header_only(0x55U);
+    TEST_ASSERT_TRUE(comms_frame_is_ttc_layout(ttc_buf, n));
+    n = ttc_build_header_only(0xAAU);
+    TEST_ASSERT_TRUE(comms_frame_is_ttc_layout(ttc_buf, n));
+
+    /* Legacy CRC-only frame: byte 1 is its payload length, never 0x55/0xAA. */
+    uint8_t payload[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    n = build_frame(COMMS_TC_SEND_DATA, payload, 8U);
+    TEST_ASSERT_FALSE(comms_frame_is_ttc_layout(frame_buf, n));
+
+    /* Authenticated frame is 16 B but byte 1 = 8 (payload length). */
+    uint8_t auth_payload[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    n = build_auth_frame(COMMS_TC_SEND_DATA, auth_payload, 8U);
+    TEST_ASSERT_EQUAL_size_t(16U, n);
+    TEST_ASSERT_FALSE(comms_frame_is_ttc_layout(frame_buf, n));
+
+    TEST_ASSERT_FALSE(comms_frame_is_ttc_layout(NULL, 16U));
+    TEST_ASSERT_FALSE(comms_frame_is_ttc_layout(frame_buf, 0U));
+}
+
+/* ---- result strings and mapping ---- */
+
+void test_ttc_result_strings_are_never_null(void)
+{
+    for (int r = COMMS_TTC_OK; r <= COMMS_TTC_ERR_BUF; r++) {
+        TEST_ASSERT_NOT_NULL(comms_ttc_result_str((comms_ttc_result_t)r));
+    }
+    TEST_ASSERT_EQUAL_STRING("ALIGN", comms_ttc_result_str(COMMS_TTC_ERR_ALIGN));
+    TEST_ASSERT_EQUAL_STRING("LEN_MISMATCH", comms_ttc_result_str(COMMS_TTC_ERR_LEN_MISMATCH));
+    TEST_ASSERT_EQUAL_STRING("UNSUPPORTED", comms_ttc_result_str(COMMS_TTC_ERR_UNSUPPORTED));
+    TEST_ASSERT_EQUAL_STRING("PAYLOAD", comms_ttc_result_str(COMMS_TTC_ERR_PAYLOAD));
+    TEST_ASSERT_EQUAL_STRING("MAC", comms_ttc_result_str(COMMS_TTC_ERR_MAC));
+    TEST_ASSERT_EQUAL_STRING("UNKNOWN", comms_ttc_result_str((comms_ttc_result_t)999));
+
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_ttc_to_tc_result(COMMS_TTC_OK));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, comms_ttc_to_tc_result(COMMS_TTC_ERR_MAC));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PARAM_RANGE,
+                          comms_ttc_to_tc_result(COMMS_TTC_ERR_STATION_ID));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PAYLOAD_LEN,
+                          comms_ttc_to_tc_result(COMMS_TTC_ERR_PL_LEN));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PAYLOAD_LEN,
+                          comms_ttc_to_tc_result(COMMS_TTC_ERR_PAYLOAD));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_OPCODE,
+                          comms_ttc_to_tc_result(COMMS_TTC_ERR_UNSUPPORTED));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_LEN_MISMATCH,
+                          comms_ttc_to_tc_result(COMMS_TTC_ERR_ALIGN));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_LEN_MISMATCH,
+                          comms_ttc_to_tc_result(COMMS_TTC_ERR_LEN_MISMATCH));
+}
+
+/* ---- MAC seam ---- */
+
+static int     ttc_mac_seen_calls;
+static int     ttc_mac_seen_accept;
+static uint8_t ttc_mac_seen_bytes[4];
+
+static bool ttc_mac_recording(const uint8_t *frame, size_t len,
+                              const uint8_t mac[4])
+{
+    (void)len;
+    ttc_mac_seen_calls++;
+    /* On an ECC-OFF frame the MAC pointer must alias the 4 bytes at offset 8
+       of the on-air buffer (no copy anywhere on that path). */
+    TEST_ASSERT_EQUAL_PTR(&frame[8], mac);
+    return ttc_mac_seen_accept != 0;
+}
+
+/* Same recorder, but it captures the 4 MAC bytes instead of asserting the
+   alias: an ECC-ON frame interleaves the MAC with parity, so the seam is
+   handed the de-interleaved copy, not a pointer into the frame. */
+static bool ttc_mac_recording_capture(const uint8_t *frame, size_t len,
+                                      const uint8_t mac[4])
+{
+    (void)frame;
+    (void)len;
+    ttc_mac_seen_calls++;
+    memcpy(ttc_mac_seen_bytes, mac, 4U);
+    return ttc_mac_seen_accept != 0;
+}
+
+void test_ttc_mac_seam_is_fail_closed_by_default(void)
+{
+    const uint8_t mac[4] = { 1U, 2U, 3U, 4U };
+
+    /* No verifier installed -> every frame is rejected (fail closed). */
+    TEST_ASSERT_FALSE(comms_ttc_mac_verify(ttc_buf, 16U, mac));
+
+    comms_ttc_set_mac_verifier(ttc_mac_recording);
+    ttc_mac_seen_calls  = 0;
+    ttc_mac_seen_accept = 1;
+    /* mac must alias the frame bytes at offset 8 (asserted in the callback). */
+    TEST_ASSERT_TRUE(comms_ttc_mac_verify(ttc_buf, 16U, &ttc_buf[8]));
+    TEST_ASSERT_EQUAL_INT(1, ttc_mac_seen_calls);
+
+    ttc_mac_seen_accept = 0;
+    TEST_ASSERT_FALSE(comms_ttc_mac_verify(ttc_buf, 16U, &ttc_buf[8]));
+}
+
+/* ---- RX entry: parse, account, dispatch ---- */
+
+/* With no MAC verifier the frame is parsed but NEVER dispatched (no
+   NVIC/state-machine expectations queued -> CMock fails if it is). */
+void test_rx_ttc_fails_closed_without_mac_verifier(void)
+{
+    comms_rx_stats_t before, after;
+    size_t           n = ttc_build_header_only(0x55U);
+
+    comms_rx_get_stats(&before);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, comms_rx_handle_ttc_frame(ttc_buf, n));
+    comms_rx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.accepted, after.accepted);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected + 1U, after.rejected);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_mac + 1U, after.rejected_mac);
+}
+
+/* The legacy entry point routes a TT&C-layout frame to the TT&C path: same
+   fail-closed verdict, never to the opcode validator. */
+void test_rx_gate_routes_ttc_layout_frames(void)
+{
+    size_t n = ttc_build_header_only(0x55U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, comms_rx_handle_frame(ttc_buf, n));
+}
+
+/* A valid MAC and a valid frame reach the dispatcher: TEC HK task 0x01 is
+   OBC reboot and must actually reset. */
+void test_rx_ttc_dispatches_obc_reboot(void)
+{
+    comms_ttc_info_t info;
+    size_t           n = 0U;
+
+    comms_ttc_set_mac_verifier(ttc_mac_recording);
+    ttc_mac_seen_calls  = 0;
+    ttc_mac_seen_accept = 1;
+
+    ttc_info_init(&info, 5U, 0x55U, 0U, 0x01U, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
+
+    const uint32_t resets_before = host_nvic_reset_count();
+    HOST_EXPECT_NVIC_RESET(comms_rx_handle_ttc_frame(ttc_buf, n));
+    TEST_ASSERT_EQUAL_UINT32(resets_before + 1U, host_nvic_reset_count());
+    TEST_ASSERT_EQUAL_INT(1, ttc_mac_seen_calls);
+}
+
+/* OBC reboot declares PL = 0 ('Task details'!G5); a frame that smuggles a
+   payload is rejected as incoherent and must NOT reset. */
+void test_rx_ttc_obc_reboot_rejects_payload(void)
+{
+    comms_ttc_info_t info;
+    const uint8_t    payload[1] = { 0xFFU };
+    size_t           n          = 0U;
+
+    comms_ttc_set_mac_verifier(ttc_mac_recording);
+    ttc_mac_seen_calls  = 0;
+    ttc_mac_seen_accept = 1;
+
+    ttc_info_init(&info, 5U, 0x55U, 0U, 0x01U, 1U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL,
+                              payload, sizeof(payload), &n));
+
+    /* No HOST_EXPECT_NVIC_RESET armed: a reset here would fail the run. */
+    const uint32_t resets_before = host_nvic_reset_count();
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PAYLOAD_LEN, comms_rx_handle_ttc_frame(ttc_buf, n));
+    TEST_ASSERT_EQUAL_UINT32(resets_before, host_nvic_reset_count());
+}
+
+/* Exit state ('HK tasks'!D13:D14 — payload byte 1 "State old", byte 2 "State
+   new"): the handler must request the NEW state carried in the payload, not a
+   hardcoded STATE_READY (the comms.c:407 defect). */
+void test_rx_ttc_dispatches_exit_state_new_state(void)
+{
+    comms_ttc_info_t info;
+    const uint8_t    payload[2] = { 3U, 4U };   /* STATE_READY -> STATE_ACTIVE */
+    size_t           n          = 0U;
+
+    comms_ttc_set_mac_verifier(ttc_mac_recording);
+    ttc_mac_seen_calls  = 0;
+    ttc_mac_seen_accept = 1;
+
+    ttc_info_init(&info, 5U, 0x55U, 0U, 0x02U, 2U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL,
+                              payload, sizeof(payload), &n));
+
+    state_machine_request_transition_ExpectAndReturn(STATE_ACTIVE, TRIGGER_GROUND_CMD, 0);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_ttc_frame(ttc_buf, n));
+}
+
+/* End-to-end on an ECC-ON frame: the payload is de-interleaved out of the
+   16-byte blocks before dispatch, so Exit state still applies the REQUESTED
+   new state, and the MAC seam sees the de-interleaved 4 MAC bytes. */
+void test_rx_ttc_ecc_on_frame_dispatches_exit_state(void)
+{
+    comms_ttc_info_t info;
+    const uint8_t    payload[2] = { 3U, 4U };   /* STATE_READY -> STATE_ACTIVE */
+    const uint8_t    mac[4]     = { 0xA0U, 0xA1U, 0xA2U, 0xA3U };
+    size_t           n          = 0U;
+
+    comms_ttc_set_mac_verifier(ttc_mac_recording_capture);
+    ttc_mac_seen_calls  = 0;
+    ttc_mac_seen_accept = 1;
+    memset(ttc_mac_seen_bytes, 0, sizeof(ttc_mac_seen_bytes));
+
+    ttc_info_init(&info, 5U, 0xAAU, 0U, 0x02U, 2U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, mac,
+                              payload, sizeof(payload), &n));
+    TEST_ASSERT_EQUAL_size_t(0U, n % 16U);
+
+    state_machine_request_transition_ExpectAndReturn(STATE_ACTIVE, TRIGGER_GROUND_CMD, 0);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_ttc_frame(ttc_buf, n));
+    TEST_ASSERT_EQUAL_INT(1, ttc_mac_seen_calls);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(mac, ttc_mac_seen_bytes, 4U);
+}
+
+/* Exit-state payload validation (comms.c:407): empty / 1-byte payloads, an
+   out-of-range old or new state, and a no-op old == new pair are all rejected
+   — never dispatched, never counted accepted. */
+void test_rx_ttc_exit_state_rejects_bad_payload(void)
+{
+    comms_rx_stats_t before, after;
+    comms_ttc_info_t info;
+    size_t           n = 0U;
+    const uint8_t    good[2]    = { 3U, 4U };
+    const uint8_t    bad_new[2] = { 3U, 9U };   /* new state 9 > STATE_ACTIVE */
+    const uint8_t    bad_old[2] = { 7U, 4U };   /* old state 7 > STATE_ACTIVE */
+    const uint8_t    same[2]    = { 3U, 3U };   /* no transition requested   */
+
+    comms_ttc_set_mac_verifier(ttc_mac_recording);
+    ttc_mac_seen_calls  = 0;
+    ttc_mac_seen_accept = 1;
+
+    comms_rx_get_stats(&before);
+
+    /* Empty payload: too short. */
+    ttc_info_init(&info, 5U, 0x55U, 0U, 0x02U, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PAYLOAD_LEN, comms_rx_handle_ttc_frame(ttc_buf, n));
+
+    /* 1-byte payload: too short. */
+    ttc_info_init(&info, 5U, 0x55U, 0U, 0x02U, 1U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, good, 1U, &n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PAYLOAD_LEN, comms_rx_handle_ttc_frame(ttc_buf, n));
+
+    /* 2-byte payloads that are out of range or inconsistent. */
+    ttc_info_init(&info, 5U, 0x55U, 0U, 0x02U, 2U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, bad_new, 2U, &n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PAYLOAD_LEN, comms_rx_handle_ttc_frame(ttc_buf, n));
+
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, bad_old, 2U, &n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PAYLOAD_LEN, comms_rx_handle_ttc_frame(ttc_buf, n));
+
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, same, 2U, &n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PAYLOAD_LEN, comms_rx_handle_ttc_frame(ttc_buf, n));
+
+    comms_rx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.accepted, after.accepted);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected + 5U, after.rejected);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_range + 5U, after.rejected_range);
+}
+
+/* Unsupported commands must be REJECTED, not counted as accepted (the
+   comms.c:412 defect). A non-HK TEC type and an unimplemented HK task both
+   return COMMS_TC_ERR_OPCODE and take no action. */
+void test_rx_ttc_unsupported_type_and_task_are_rejected(void)
+{
+    comms_rx_stats_t before, after;
+    comms_ttc_info_t info;
+    size_t           n = 0U;
+
+    comms_ttc_set_mac_verifier(ttc_mac_recording);
+    ttc_mac_seen_calls  = 0;
+    ttc_mac_seen_accept = 1;
+
+    comms_rx_get_stats(&before);
+
+    /* DAQ (Bin ID 01, 'Task types'!C5) is not a command carrier. */
+    ttc_info_init(&info, 5U, 0x55U, 1U, 0x01U, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_OPCODE, comms_rx_handle_ttc_frame(ttc_buf, n));
+
+    /* HK task 0x11 (TLE, 'Task details'!E21) is not implemented here. */
+    ttc_info_init(&info, 5U, 0x55U, 0U, 0x11U, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0UL, NULL, NULL, 0U, &n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_OPCODE, comms_rx_handle_ttc_frame(ttc_buf, n));
+
+    comms_rx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.accepted, after.accepted);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected + 2U, after.rejected);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_opcode + 2U, after.rejected_opcode);
+}
+
+/* Freshness / anti-replay is deliberately NOT implemented (system-level
+   decision; open point O2 in docs/api/ttc-frame.md). The UNIX time is parsed
+   but never compared, so the SAME frame is dispatched twice. This test PINS
+   the current behaviour and must be replaced when replay protection lands —
+   it is the executable record of the gap. */
+void test_rx_ttc_replay_is_accepted_today(void)
+{
+    comms_rx_stats_t before, after;
+    comms_ttc_info_t info;
+    const uint8_t    payload[2] = { 3U, 4U };
+    size_t           n          = 0U;
+
+    comms_ttc_set_mac_verifier(ttc_mac_recording);
+    ttc_mac_seen_calls  = 0;
+    ttc_mac_seen_accept = 1;
+
+    ttc_info_init(&info, 5U, 0x55U, 0U, 0x02U, 2U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TTC_OK,
+        comms_ttc_build_frame(ttc_buf, sizeof(ttc_buf), &info, 0x12345678UL, NULL,
+                              payload, sizeof(payload), &n));
+
+    comms_rx_get_stats(&before);
+    state_machine_request_transition_ExpectAndReturn(STATE_ACTIVE, TRIGGER_GROUND_CMD, 0);
+    state_machine_request_transition_ExpectAndReturn(STATE_ACTIVE, TRIGGER_GROUND_CMD, 0);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_ttc_frame(ttc_buf, n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_ttc_frame(ttc_buf, n));
+    comms_rx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.accepted + 2U, after.accepted);
+}
+
+/* Rejected TT&C frames are accounted in the existing counter classes. */
+void test_rx_ttc_accounts_rejections(void)
+{
+    comms_rx_stats_t before, after;
+    size_t           n = ttc_build_header_only(0x55U);
+
+    comms_ttc_set_mac_verifier(ttc_mac_recording);
+    ttc_mac_seen_accept = 0;
+
+    comms_rx_get_stats(&before);
+    /* MAC rejection (verifier rejects). */
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_MAC, comms_rx_handle_ttc_frame(ttc_buf, n));
+    /* Structural rejection: not a block count. */
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_LEN_MISMATCH,
+                          comms_rx_handle_ttc_frame(ttc_buf, 17U));
+    /* Bad INFO field: parameter range. */
+    ttc_buf[0] = 0U;
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_PARAM_RANGE,
+                          comms_rx_handle_ttc_frame(ttc_buf, n));
+    comms_rx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected + 3U, after.rejected);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_mac + 1U, after.rejected_mac);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_malformed + 1U, after.rejected_malformed);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_range + 1U, after.rejected_range);
+    TEST_ASSERT_EQUAL_UINT32(before.accepted, after.accepted);
 }
