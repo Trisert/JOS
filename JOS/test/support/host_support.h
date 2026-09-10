@@ -16,6 +16,7 @@
 #define HOST_SUPPORT_H
 
 #include <setjmp.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -159,5 +160,24 @@ uint16_t host_flash_last_i2c_addr(void);
 void host_lora_fail_tx_on_call(int n);
 void host_lora_fail_wait_on_call(int n);
 void host_lora_reset(void);
+
+/* ==========================================================================
+ * BMS / EPS link double (support/bms_stubs.c)
+ *
+ * The host build cannot link App/bms/bms.c (it drives the full CubeMX
+ * SPI_HandleTypeDef layout; see project.yml), so the EPS link is doubled.
+ * The double DEFAULTS TO NO TELEMETRY, matching flight until the EPS frame
+ * format exists: bms_poll() fails and bms_get_status() reports valid=false.
+ * A test that wants the SoC-gated paths to open must arm a reading with
+ * host_bms_arm(), which is what keeps "unknown SoC closes the gates" honest.
+ * ========================================================================== */
+
+/* Back to "no telemetry": poll fails, snapshot invalid. */
+void host_bms_disarm(void);
+
+/* Poll succeeds and reports this snapshot. `valid` is the knob that models a
+ * reading the OBSW may trust; arm it false to model a reply that arrived but
+ * cannot be trusted. */
+void host_bms_arm(uint8_t soc, bool valid);
 
 #endif /* HOST_SUPPORT_H */

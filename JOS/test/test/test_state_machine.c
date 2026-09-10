@@ -25,6 +25,7 @@
  * ------------------------------------------------------------------------- */
 #include "unity.h"
 #include "state_machine.h"      /* unit under test -> links state_machine.c */
+#include "bms.h"                /* SoC band helpers used by the gates      */
 #include "boot_crc.h"           /* boot_crc_verify(): establish a trusted image */
 #include "memory.h"             /* real LastStates pool behind try_transition() */
 #include "obsw_types.h"
@@ -41,6 +42,7 @@
  * header (flight code never calls it); declared here for the CRIT-recovery
  * tests below. */
 extern void bms_set_soc_stub(uint8_t soc);
+extern void bms_clear_soc_stub(void);
 
 /* ---------- Minimal RTOS double (no scheduler on the host) ---------- */
 /* Opaque RTOS handles are pointers: back them with pointer-sized, aligned
@@ -340,14 +342,49 @@ static void boot_to_crit(void)
     TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
 }
 
-/* s2->s3: battery recovered (default stub SoC 100 >= b_opok 80). */
+/* s2->s3: battery recovered. The SoC is armed EXPLICITLY: before
+ * fix/bms-soc-gating this test relied on the boot default being 100, i.e. on
+ * the very constant that made a dead EPS link look like a full battery. A
+ * recovery now needs a reading somebody actually measured. */
 void test_crit_recovery_to_ready_when_soc_ok(void)
 {
     boot_to_crit();
 
+    bms_set_soc_stub(90u);   /* >= b_opok (80), valid */
     TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_READY,
                                                         TRIGGER_BATTERY_OK));
     TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
+}
+
+/* The fail-safe that used to be missing: with NO telemetry the snapshot is
+ * invalid, so a recovery is refused even though the cached byte is 0..100
+ * and "looks" like a number. A dead EPS link must not let the OBSW climb
+ * back to READY on a battery level nobody read. */
+void test_crit_recovery_to_ready_refused_when_soc_unknown(void)
+{
+    boot_to_crit();
+
+    /* STALE-BUT-FULL: the byte still says 90, which alone would open the
+       gate. Only the valid flag refuses it, so this fails if the flag is
+       ever dropped. */
+    bms_set_soc_stub(90u);
+    bms_clear_soc_stub();
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_READY,
+                                                        TRIGGER_BATTERY_OK));
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
+}
+
+/* Same fail-safe on the manual payload-activation path (SPF r.824 requires
+ * SoC >= B_OPOK; "unknown" does not satisfy it). */
+void test_crit_to_active_refused_when_soc_unknown(void)
+{
+    boot_to_crit();
+
+    bms_set_soc_stub(90u);   /* same stale-but-full shape */
+    bms_clear_soc_stub();
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_ACTIVE,
+                                                        TRIGGER_GROUND_CMD));
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
 }
 
 /* s2->s3 stays refused while the battery is still low, and opens once the
@@ -523,6 +560,52 @@ void test_task_loop_drives_crit_on_battery_low(void)
     TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
 
     bms_set_soc_stub(100u);   /* no leakage into later tests */
+}
+
+/* B_CRIT and B_COMMOK were DECLARED in default_thresholds but never read
+ * anywhere: only b_scrit was enforced, so a battery sliding from ~79 % down
+ * to ~26 % produced no protective response. SPF r.600/r.807/r.808 map all
+ * three thresholds to an s2 (CRIT) entry. This arms a SoC in the B_COMMOK
+ * band (b_crit < soc <= b_commok) and asserts the loop now contains. */
+void test_task_loop_drives_crit_on_b_commok_band(void)
+{
+    bms_set_soc_stub(50u);   /* 40 < 50 <= 60: previously unenforced band */
+    run_task_until_delay(3);
+
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
+
+    bms_set_soc_stub(100u);  /* no leakage into later tests */
+}
+
+/* Same for the B_CRIT band (b_scrit < soc <= b_crit), also previously
+ * unenforced. */
+void test_task_loop_drives_crit_on_b_crit_band(void)
+{
+    bms_set_soc_stub(30u);   /* 25 < 30 <= 40 */
+    run_task_until_delay(3);
+
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
+
+    bms_set_soc_stub(100u);
+}
+
+/* The other direction of the same check, and the one that decides whether
+ * the valid flag is really read: the STALE BYTE IS LOW (10 %), so treating
+ * it as truth would raise a battery fault the OBSW cannot substantiate.
+ * SPF r.805 lists the s2 entry conditions as the B_COMMOK/B_CRIT/B_SCRIT
+ * breaches (from monitored telemetry), a critical event, a reboot or a
+ * ground command — "the battery could not be read" is none of them, so the
+ * OBSW stays in READY and keeps the SoC-GATED paths closed instead of
+ * inventing a fault. Fails if the valid flag is dropped from the band. */
+void test_task_loop_does_not_fabricate_battery_fault_when_soc_unknown(void)
+{
+    bms_set_soc_stub(10u);   /* stale byte, BELOW b_scrit */
+    bms_clear_soc_stub();    /* ... but not backed by telemetry */
+    run_task_until_delay(3);
+
+    TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
+
+    bms_set_soc_stub(100u);
 }
 
 /* An untrusted image survives into the task boot: INIT bookkeeping still
