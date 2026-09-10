@@ -1,7 +1,9 @@
 /**
  * @file    test_deploy_sense.c
  * @brief   Unit tests for the DEPLOY_SENSE / LoRa_NRST mux on PB1
- *          (App/comms/deploy_sense.c, SPF v3 3.7.5.3.1 p.95).
+ *          (App/comms/deploy_sense.c, SPF v3 3.7.5.3.1 p.95) and for the
+ *          FDIR-COMM-EL-01 antenna-deployment reaction (RED_FDIR_V2.xlsx,
+ *          sheet 'COMM', FMEA-COMM-EL-01).
  *
  * The PB1 GPIO is doubled by support/hal_stubs.c: HAL_GPIO_Init records the
  * last mode/pull per pin, HAL_GPIO_WritePin drives an ODR latch, and
@@ -15,24 +17,54 @@
  *   - deployed = LOW, stowed = HIGH (DEPLOY_DEPLOYED_LEVEL).
  *   - the SX1268 reset helpers drive the same pin (assert LOW, release HIGH,
  *     pulse ends HIGH).
+ *   - FDIR: at most 10 activations (never 11), growing period per activation,
+ *     no activation outside INITIALIZATION, SAFE MODE requested on resolution
+ *     and on timeout, degraded telecom on timeout.
  */
 
 #include "unity.h"
 #include "deploy_sense.h"
 #include "host_support.h"
-#include "main.h"   /* fakes/main.h on the host: GPIO mode/pull constants */
+#include "main.h"       /* fakes/main.h on the host: GPIO mode/pull constants */
+#include "obsw_types.h" /* obw_state_t: STATE_INIT is INITIALIZATION MODE */
 
 #define PB1 1
+
+#define SW_DEPLOYED 0   /* switch pulls PB1 to GND once the antenna fires */
+#define SW_STOWED   1
+
+/* ---- knife-driver recorder (deploy_fdir_set_knife_driver) -------------- */
+static int  knife_on_calls;
+static int  knife_off_calls;
+static int  knife_last_level;
+static void knife_recorder(bool on)
+{
+    if (on) {
+        knife_on_calls++;
+    } else {
+        knife_off_calls++;
+    }
+    knife_last_level = on ? 1 : 0;
+}
+
+static const deploy_fdir_status_t *fdir;
 
 void setUp(void)
 {
     host_gpio_reset();
     host_gpio_force_input(PB1, -1);   /* PB1 follows ODR unless forced */
+    deploy_fdir_init();
+    deploy_fdir_set_knife_driver(knife_recorder);
+    knife_on_calls  = 0;
+    knife_off_calls = 0;
+    knife_last_level = -1;
+    fdir = deploy_fdir_status();
 }
 
 void tearDown(void)
 {
     host_gpio_force_input(PB1, -1);
+    deploy_fdir_set_knife_driver(NULL);
 }
 
 /* Mux init must idle HIGH as push-pull output: the SX1268 reset is
@@ -117,4 +149,230 @@ void test_nrst_helpers(void)
     deploy_nrst_pulse();
     TEST_ASSERT_EQUAL(1, host_gpio_odr(PB1));
     TEST_ASSERT_EQUAL_UINT32(GPIO_MODE_OUTPUT_PP, host_gpio_last_mode(PB1));
+}
+
+/* ==========================================================================
+ * FDIR-COMM-EL-01
+ * ========================================================================== */
+
+#define FDIR_STEP_MS   100u
+/* Worst case with the defaults: 275 s of knife-on + 10 x 5 s gap = 325 s. */
+#define FDIR_LIMIT_MS  400000u
+
+static bool fdir_ended(void)
+{
+    return (fdir->result == DEPLOY_FDIR_DEPLOYED) ||
+           (fdir->result == DEPLOY_FDIR_FAILED)   ||
+           (fdir->result == DEPLOY_FDIR_ABORTED);
+}
+
+/* Run the reaction from `first_ms` to the end (or the limit) in FDIR_STEP_MS
+ * slices, all in INITIALIZATION. Returns the tick at which it terminated. */
+static uint32_t fdir_run_in_init(uint32_t first_ms)
+{
+    uint32_t t;
+
+    for (t = first_ms; (t <= FDIR_LIMIT_MS) && !fdir_ended(); t += FDIR_STEP_MS) {
+        deploy_fdir_step(STATE_INIT, t);
+    }
+    return t;
+}
+
+/* The declared defaults: the 10-attempt ceiling comes from the document, the
+ * timing knobs are declared project choices and must be coherent (growth is
+ * positive, ceiling above the first period, non-zero gap). */
+void test_fdir_defaults_are_declared_and_coherent(void)
+{
+    const deploy_fdir_config_t *cfg = deploy_fdir_default_config();
+
+    TEST_ASSERT_NOT_NULL(cfg);
+    TEST_ASSERT_EQUAL_UINT8(10u, cfg->max_attempts);   /* document */
+    TEST_ASSERT_GREATER_THAN_UINT32(0u, cfg->activation_ms);
+    TEST_ASSERT_GREATER_THAN_UINT32(0u, cfg->activation_step_ms);
+    TEST_ASSERT_GREATER_THAN_UINT32(0u, cfg->gap_ms);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(cfg->activation_ms, cfg->activation_max_ms);
+}
+
+/* "up to 10 ... activations": the counter stops at exactly 10, never 11, and
+ * the timeout declares the fault ignored and asks for SAFE MODE with degraded
+ * telecommunication as the fallback. */
+void test_fdir_stops_at_10_attempts_not_11(void)
+{
+    uint32_t t;
+
+    host_gpio_force_input(PB1, SW_STOWED);
+    t = fdir_run_in_init(0u);
+    TEST_ASSERT_TRUE(fdir_ended());
+    TEST_ASSERT_TRUE(t <= FDIR_LIMIT_MS);
+
+    TEST_ASSERT_EQUAL_UINT8(10u, fdir->attempts);
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_FAILED, fdir->result);
+    TEST_ASSERT_TRUE(fdir->degraded_telecom);
+    TEST_ASSERT_TRUE(fdir->safe_mode_requested);
+    TEST_ASSERT_FALSE(fdir->knife_on);
+    TEST_ASSERT_EQUAL_INT(10, knife_on_calls);   /* one per activation */
+    TEST_ASSERT_EQUAL_INT(0, knife_last_level);  /* ends with the knife cut */
+
+    /* Terminal: further calls (even far in the future) change nothing. */
+    deploy_fdir_step(STATE_INIT, FDIR_LIMIT_MS + 1000000u);
+    TEST_ASSERT_EQUAL_UINT8(10u, fdir->attempts);
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_FAILED, fdir->result);
+    TEST_ASSERT_EQUAL_INT(10, knife_on_calls);
+}
+
+/* "longer activation period each repetition": every consecutive activation is
+ * strictly longer than the previous one. Observed from the real run, not from
+ * the helper alone. */
+void test_fdir_period_grows_between_consecutive_attempts(void)
+{
+    uint32_t periods[10];
+    uint8_t  prev_attempts = 0;
+    uint8_t  i;
+    uint32_t t;
+
+    host_gpio_force_input(PB1, SW_STOWED);
+    for (i = 0; i < 10u; i++) {
+        periods[i] = 0u;
+    }
+
+    for (t = 0u; (t <= FDIR_LIMIT_MS) && !fdir_ended(); t += FDIR_STEP_MS) {
+        deploy_fdir_step(STATE_INIT, t);
+        if (fdir->attempts != prev_attempts) {
+            TEST_ASSERT_TRUE(fdir->attempts <= 10u);
+            periods[fdir->attempts - 1u] = fdir->current_activation_ms;
+            prev_attempts = fdir->attempts;
+        }
+    }
+
+    TEST_ASSERT_EQUAL_UINT8(10u, prev_attempts);
+    for (i = 1u; i < 10u; i++) {
+        TEST_ASSERT_GREATER_THAN_UINT32(periods[i - 1u], periods[i]);
+    }
+    /* And the periods are the declared schedule, not incidental values. */
+    for (i = 0u; i < 10u; i++) {
+        TEST_ASSERT_EQUAL_UINT32((uint32_t)(i + 1u) * 5000u, periods[i]);
+    }
+}
+
+/* A resolved deployment (the switch closes) requests SAFE MODE, clears the
+ * degraded flag, and cuts the knife. */
+void test_fdir_deployed_requests_safe_mode(void)
+{
+    host_gpio_force_input(PB1, SW_DEPLOYED);   /* switch already closed */
+    deploy_fdir_step(STATE_INIT, 0u);
+
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_DEPLOYED, fdir->result);
+    TEST_ASSERT_TRUE(fdir->safe_mode_requested);
+    TEST_ASSERT_FALSE(fdir->degraded_telecom);
+    TEST_ASSERT_FALSE(fdir->knife_on);
+    TEST_ASSERT_EQUAL_UINT8(1u, fdir->attempts);
+
+    deploy_fdir_step(STATE_INIT, 1000000u);
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_DEPLOYED, fdir->result);
+    TEST_ASSERT_EQUAL_UINT8(1u, fdir->attempts);
+}
+
+/* The reaction is "active only in INITIALIZATION MODE": outside STATE_INIT it
+ * must never fire the knife nor count an activation. */
+void test_fdir_inactive_outside_initialization(void)
+{
+    const obw_state_t others[] = { STATE_OFF, STATE_CRIT, STATE_READY, STATE_ACTIVE };
+    uint32_t i;
+    uint32_t t;
+
+    host_gpio_force_input(PB1, SW_STOWED);
+    for (i = 0u; i < (sizeof(others) / sizeof(others[0])); i++) {
+        for (t = 0u; t < 100000u; t += FDIR_STEP_MS) {
+            deploy_fdir_step(others[i], t);
+        }
+    }
+
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_IDLE, fdir->result);
+    TEST_ASSERT_EQUAL_UINT8(0u, fdir->attempts);
+    TEST_ASSERT_FALSE(fdir->knife_on);
+    TEST_ASSERT_FALSE(fdir->safe_mode_requested);
+    TEST_ASSERT_EQUAL_INT(0, knife_on_calls);
+}
+
+/* Started in INITIALIZATION, but the mode leaves it without a deploy reading:
+ * the reaction stops where it is (no further activation) and does not force
+ * SAFE MODE — the mode change came from elsewhere (ground). */
+void test_fdir_aborts_when_leaving_initialization(void)
+{
+    uint32_t t;
+
+    host_gpio_force_input(PB1, SW_STOWED);
+
+    /* Two activations start (attempt 1 at t=0, attempt 2 at t=10000). */
+    for (t = 0u; t <= 10000u; t += FDIR_STEP_MS) {
+        deploy_fdir_step(STATE_INIT, t);
+    }
+    TEST_ASSERT_EQUAL_UINT8(2u, fdir->attempts);
+
+    for (t = 10100u; (t <= FDIR_LIMIT_MS) && !fdir_ended(); t += FDIR_STEP_MS) {
+        deploy_fdir_step(STATE_READY, t);
+    }
+
+    TEST_ASSERT_TRUE(fdir_ended());
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_ABORTED, fdir->result);
+    TEST_ASSERT_EQUAL_UINT8(2u, fdir->attempts);   /* no third activation */
+    TEST_ASSERT_FALSE(fdir->knife_on);
+    TEST_ASSERT_FALSE(fdir->safe_mode_requested);
+    TEST_ASSERT_EQUAL_INT(2, knife_on_calls);
+}
+
+/* Exit condition "Telecommand received from ground" stops the retries. */
+void test_fdir_ground_command_stops_retrying(void)
+{
+    host_gpio_force_input(PB1, SW_STOWED);
+    deploy_fdir_step(STATE_INIT, 0u);
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_RETRYING, fdir->result);
+
+    deploy_fdir_ground_command();
+
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_ABORTED, fdir->result);
+    TEST_ASSERT_FALSE(fdir->knife_on);
+    TEST_ASSERT_EQUAL_UINT8(1u, fdir->attempts);
+
+    deploy_fdir_step(STATE_INIT, FDIR_LIMIT_MS);
+    TEST_ASSERT_EQUAL_INT(DEPLOY_FDIR_ABORTED, fdir->result);
+    TEST_ASSERT_EQUAL_UINT8(1u, fdir->attempts);
+}
+
+/* The activation schedule is that of the configuration in force, including the
+ * ceiling: a config change moves the schedule, it is not ignored. */
+void test_fdir_activation_schedule_follows_config(void)
+{
+    deploy_fdir_config_t cfg = *deploy_fdir_default_config();
+
+    TEST_ASSERT_EQUAL_UINT32(5000u, deploy_fdir_activation_ms(1u));
+    TEST_ASSERT_EQUAL_UINT32(50000u, deploy_fdir_activation_ms(10u));
+    TEST_ASSERT_EQUAL_UINT32(deploy_fdir_activation_ms(1u), deploy_fdir_activation_ms(0u));
+
+    cfg.activation_ms      = 1000u;
+    cfg.activation_step_ms = 1000u;
+    cfg.activation_max_ms  = 8000u;
+    TEST_ASSERT_TRUE(deploy_fdir_configure(&cfg));
+    TEST_ASSERT_EQUAL_UINT32(1000u, deploy_fdir_activation_ms(1u));
+    TEST_ASSERT_EQUAL_UINT32(5000u, deploy_fdir_activation_ms(5u));
+    TEST_ASSERT_EQUAL_UINT32(8000u, deploy_fdir_activation_ms(8u));
+    TEST_ASSERT_EQUAL_UINT32(8000u, deploy_fdir_activation_ms(20u));  /* capped */
+}
+
+/* A retry budget of zero or a zero-length activation would silently disable
+ * the reaction: refused, configuration unchanged. */
+void test_fdir_invalid_config_rejected(void)
+{
+    deploy_fdir_config_t cfg = *deploy_fdir_default_config();
+
+    TEST_ASSERT_FALSE(deploy_fdir_configure(NULL));
+
+    cfg.max_attempts = 0u;
+    TEST_ASSERT_FALSE(deploy_fdir_configure(&cfg));
+
+    cfg = *deploy_fdir_default_config();
+    cfg.activation_ms = 0u;
+    TEST_ASSERT_FALSE(deploy_fdir_configure(&cfg));
+
+    TEST_ASSERT_EQUAL_UINT8(10u, deploy_fdir_config()->max_attempts);
 }
