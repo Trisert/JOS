@@ -198,3 +198,11 @@
     :exception_on_fail: TRUE
     :fail_under_line: 90
     :fail_under_branch: 75
+
+# =============================================================================
+# App/obsw/beacon.c - housekeeping beacon wire format
+# =============================================================================
+# beacon.c is pure C (no HAL, no RTOS, no globals), so it is picked up by the
+# existing ../App/obsw :source: entry above and linked into every test binary
+# with no extra configuration. test/test_beacon.c pins the byte offsets of the
+# fields against the literal positions in SW_DATA_TYPES.xlsx sheet "HB".
