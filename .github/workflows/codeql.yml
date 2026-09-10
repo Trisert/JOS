@@ -74,16 +74,19 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           queries: security-and-quality
-          # Vendored trees are on the include path but NEVER on the source
-          # path: never analyse STM32 HAL/CMSIS, FreeRTOS, or vendored
-          # RadioLib headers as code we own. Path-scoped `paths-ignore` is the
-          # CodeQL-native equivalent of cppcheck's
-          # `--suppress=*:$(CPPCHECK_PREFIX)Drivers/*` style exclusion:
-          # no query-pack id is ever switched off repo-wide.
-          paths-ignore:
-            - JOS/Drivers/**
-            - JOS/Middlewares/**
-            - JOS/Core/Inc/RadioLib/**
+          # Analysis scope lives in a config FILE, not here: `paths-ignore`
+          # is NOT a valid `init` input, and putting it in this block made
+          # the whole workflow unparseable ("Invalid workflow file ...
+          # A sequence was not expected"), so every run died at startup with
+          # zero jobs and the gate never actually ran. `config-file` is the
+          # supported mechanism; the file keeps the exact same exclusions.
+          config-file: ./.github/codeql/codeql-config.yml
+          # Manual build: the ARM Cortex-M4 tree is cross-compiled with
+          # `arm-none-eabi-gcc` and its include paths/defines live in
+          # JOS/Makefile, so CodeQL's autobuild cannot drive it. In v4 this
+          # is a first-class input (the old CODEQL_EXTRACTOR_C_BUILD_MODE
+          # env var is not consulted any more).
+          build-mode: manual
 
       # MANUAL BUILD MODE.
       #
@@ -104,6 +107,10 @@ jobs:
       # which changes the source-code view the extractor sees.
       - name: Manual build (make -C JOS)
         env:
+          # Belt-and-braces: `build-mode: manual` on the init step is the v4
+          # mechanism, and the extractor also honours this variable when it
+          # is set. Keeping both means a future v4/v5 shuffle of the input
+          # name cannot silently turn this back into an autobuild attempt.
           CODEQL_EXTRACTOR_C_BUILD_MODE: manual
           # Match build.yml:139 — the toolchain is installed into
           # /opt/... and appended to $GITHUB_PATH so every subsequent

@@ -1,0 +1,19 @@
+# CodeQL analysis scope for JOS.
+#
+# FIRST-PARTY CODE ONLY. The vendored trees (STM32 HAL + CMSIS under
+# JOS/Drivers, FreeRTOS under JOS/Middlewares, vendored RadioLib headers under
+# JOS/Core/Inc/RadioLib) are on the include path so first-party headers
+# resolve, but they are NEVER analysed as code we own. This mirrors the policy
+# the cppcheck gate in build.yml already implements
+# (`--suppress=*:$(CPPCHECK_PREFIX)Drivers/*` etc.).
+#
+# This lives in a config FILE, not in the `with:` block of
+# codeql-action/init, because `paths-ignore` is not a valid `init` input: it
+# made `.github/workflows/codeql.yml` fail to parse, so every run died at
+# startup with zero jobs ("Invalid workflow file ... A sequence was not
+# expected"). `init` accepts a file path through `config-file`; the config
+# schema is CodeQL's own, and `paths-ignore` is valid there.
+paths-ignore:
+  - JOS/Drivers/**
+  - JOS/Middlewares/**
+  - JOS/Core/Inc/RadioLib/**
