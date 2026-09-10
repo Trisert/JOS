@@ -94,9 +94,18 @@
 # temp.c is the only host-compilable file in App/payloads (the rest pulls
 # stm32l4xx_hal.h), so it is listed as a single file here — the directory
 # itself must never go on :paths: :source:.
+#
+# eps_fdir.c (FDIR-EPS-EL-03/-05/-04, RED_FDIR_V2.xlsx sheet 'EPS') is listed
+# for the same reason: it is the one host-compilable translation unit in
+# App/bms — pure detection/recovery logic with no HAL, I2C or GPIO — while
+# bms.c next to it configures SPI2 through the real CubeMX struct layout and
+# must stay off the host build. Listing the single file covers it in
+# `ceedling test:all` (and in the gcov thresholds) without putting App/bms on
+# :source:, which would drag bms.c into every test binary.
 :files:
   :source:
     - ../App/payloads/temp.c
+    - ../App/bms/eps_fdir.c
 
 :defines:
   :test:
