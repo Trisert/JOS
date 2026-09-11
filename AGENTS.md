@@ -46,9 +46,16 @@ reconstructing it from the code.
 
 CI is the authoritative gate. Its jobs are `static-analysis` (cppcheck),
 `Firmware build (arm-none-eabi)`, `Host unit tests (Ceedling)`, `Workflow lint
-(actionlint)` and `CodeQL`. Everything below is the local equivalent of exactly
-what CI runs — there is one definition of each gate, and it lives in
-`JOS/Makefile`, never in a workflow `run:` block.
+(actionlint)` and `CodeQL`. The commands below are what those jobs actually run,
+so a local run and CI cannot drift:
+
+- **Makefile-owned** — the firmware build and the entire cppcheck gate. CI only
+  ever calls `make -C JOS …`, so there is exactly one definition of them.
+- **Workflow-owned** — the Ceedling suite and the coverage gate (CI runs
+  `ceedling test:all` and `ceedling gcov:all` in `JOS/test`; `make test` and
+  `make coverage` wrap those same commands) and `actionlint -color` (installed
+  and invoked by the workflow). When you change one of these, read
+  `.github/workflows/build.yml` — the Makefile is not the authority for it.
 
 ```sh
 cd JOS                       # all commands below run from JOS/, not the repo root
@@ -70,7 +77,6 @@ make cppcheck-print          # print the fully expanded cppcheck command line
 - `-fanalyzer` (GCC static analyser, `APP_ANALYZER`) runs on every **first-party**
   C translation unit during a normal build — a clean build is also a clean
   analyzer run for `App/` and hand-written `Core/Src`.
-- Workflow edits add one more gate: `actionlint -color` (pinned 1.7.7 in CI).
 - Toolchain: CI pins **Arm GNU Toolchain 14.3.Rel1** (the STM32CubeIDE 2.x
   reference) and the Ceedling suite builds with the **host** gcc. Local
   shortcuts differ on purpose — `nix develop` ships gcc-arm-embedded-13 and the
@@ -93,8 +99,8 @@ gate *and* add the proof-of-life that shows it can still fail — in the same PR
 
 | Path | What it is |
 |---|---|
-| `JOS/App/` | **All first-party code.** This is what you edit: `obsw/`, `comms/`, `memory/`, `bms/`, `aocs/`, `payloads/` |
-| `JOS/Core/` | CubeMX-generated sources + hand-written glue; `JOS/JOS.ioc` is the pin/peripheral source of truth (subject to §1) |
+| `JOS/App/` | **Primary application code** — the modules you edit: `obsw/`, `comms/`, `memory/`, `bms/`, `aocs/`, `payloads/` |
+| `JOS/Core/` | CubeMX-generated sources **plus hand-written glue**: the hand-written part is first-party too (§2 gives it the same analyser scope), while the generated part is only edited inside `/* USER CODE BEGIN */` blocks. `JOS/JOS.ioc` holds the pin/peripheral configuration (subject to §1) |
 | `JOS/test/` | Host unit tests (Ceedling), hand-written doubles in `support/`, target-header stand-ins in `fakes/` |
 | `JOS/tools/` | `fw_crc_stamp.py`, CRC self-test |
 | `JOS/simulation/` | Dual-ESP32 HIL harness (development aid, not flight code) |
@@ -102,6 +108,9 @@ gate *and* add the proof-of-life that shows it can still fail — in the same PR
 | `TASKS.md` | Human-readable source of truth for work tracking (replaces the archived kanban DB) |
 | `REVIEWS.md` | The contract Kilo Code Reviewer follows: static analysis + reporting only |
 | `JOS/Drivers/`, `JOS/Middlewares/`, `JOS/Core/Inc/RadioLib/` | **Vendored.** STM32 HAL/CMSIS, FreeRTOS, RadioLib headers — never edited, never analysed |
+
+First-party means `JOS/App/`, the hand-written `JOS/Core/Src` sources, and
+`JOS/test/`. Everything else is vendored or generated.
 
 ---
 
