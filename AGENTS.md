@@ -191,10 +191,11 @@ git worktree add .worktrees/<task> -b <type>/<slug> origin/main
   `.worktrees/` (git-ignored). Never commit to `main`, never work in the shared
   checkout of another task.
 - Branch types: `feat/`, `fix/`, `docs/`, `test/`, `ci/`, `integration/`.
-- Commits: Conventional Commits with a module scope —
-  `feat(comms): …`, `fix(obsw): …`, `docs(aocs): …`, `test(coverage): …`,
-  `ci(codeql): …`. Scopes in use: `obsw`, `comms`, `bms`, `aocs`, `memory`,
-  `payloads`, `ci`, `test`, `docs`, `tasks`.
+- Commits: Conventional Commits — `<type>(<scope>): …`, or `<type>: …` for
+  repo-wide changes. The scope is the module/area touched, never the tool:
+  `comms`, `obsw`, `bms`, `aocs`, `memory`, `fram`, `payloads`, `test`, `ci`,
+  `docs`, `tasks`, `qual`. Examples taken from the history: `fix(comms): …`,
+  `feat(bms): …`, `docs(aocs): …`, `test(comms): …`, `ci: …`.
 - **PR body must contain**: what changed and why; the document reference (§1) it
   implements; the exact commands you ran and what they returned; anything you
   did **not** verify; and any open question or contradiction you hit.
