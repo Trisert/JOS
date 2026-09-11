@@ -5,31 +5,40 @@ on an STM32L496VGTx. It will fly. A silent bug is not a failed test run, it is a
 lost mission, so the default here is **explicit, verifiable, spec-anchored work**
 — never "looks right" or "probably fine".
 
-Read this file before your first edit. When it disagrees with the code, the spec
-and CI win; open an issue instead of silently picking a side.
+Read this file before your first edit. When it disagrees with the code, the
+project documentation and CI win; open an issue instead of silently picking a
+side.
 
 ---
 
 ## 1. Order of authority
 
-1. **SPF v3** (system specification + operational database), `SW_DATA_TYPES.xlsx`,
-   the **OBC V2.0 netlist** and the published FDIR tables.
+1. **The project documentation set on SharePoint, taken as a whole** — SPF v3
+   (system specification + operational database), `SW_DATA_TYPES.xlsx`, the OBC
+   V2.0 netlist, the published FDIR tables, the ICDs, the BOM, the interface
+   documents, the review records. The SPF is **one document inside that set**,
+   not a standalone authority, and it is not the newest one by definition.
 2. This file and the docs in `JOS/docs/`.
 3. The existing code.
 
-**The spec beats the code.** If a value in code disagrees with a spec-pinned
-value (coding rate, beacon period, frame layout, threshold, pin), the code is
-wrong.
+**The delivered documents beat the code.** If a value in code disagrees with a
+value the documentation set fixes (coding rate, beacon period, frame layout,
+threshold, pin), the code is wrong.
 
-**If the spec does not define the interface, stop and ask.** Do not invent a
+**The whole set beats any single document.** If two delivered documents
+contradict each other, do not pick the one that suits the change you are making:
+flag the contradiction (§7) and escalate it.
+
+**If the documents do not define the interface, stop and ask.** Do not invent a
 protocol, a register map, a frame layout, a pin assignment or an endianness.
 Interfaces currently in this state (EPS↔OBC frame format, the AOCS↔OBC SPI
 transport, the 32-byte PDT header payload) are tracked as blockers at the bottom
 of `TASKS.md`. Coding them blind means fabricating an interface that the flight
 model will not implement.
 
-Same rule for contradictions inside the spec: **annotate them, do not resolve
-them privately** (see §7).
+**The document set is not in this repo.** Cite document + section/row, never a
+recollection of one; if a document you need is missing, ask for it rather than
+reconstructing it from the code.
 
 ---
 
@@ -85,7 +94,7 @@ gate *and* add the proof-of-life that shows it can still fail — in the same PR
 | Path | What it is |
 |---|---|
 | `JOS/App/` | **All first-party code.** This is what you edit: `obsw/`, `comms/`, `memory/`, `bms/`, `aocs/`, `payloads/` |
-| `JOS/Core/` | CubeMX-generated sources + hand-written glue; `JOS/JOS.ioc` is the pin/peripheral source of truth |
+| `JOS/Core/` | CubeMX-generated sources + hand-written glue; `JOS/JOS.ioc` is the pin/peripheral source of truth (subject to §1) |
 | `JOS/test/` | Host unit tests (Ceedling), hand-written doubles in `support/`, target-header stand-ins in `fakes/` |
 | `JOS/tools/` | `fw_crc_stamp.py`, CRC self-test |
 | `JOS/simulation/` | Dual-ESP32 HIL harness (development aid, not flight code) |
@@ -128,7 +137,8 @@ gate *and* add the proof-of-life that shows it can still fail — in the same PR
   OBC V2.0 netlist; never hand-fix a pin the netlist does not support.
 - Compile-time `static_assert` for every spec-pinned size, offset or frame
   length you introduce or touch (beacons, LastStates entries, TT&C frames).
-- Cite the source of any magic number in a comment: `/* SPF §3.7.5.3.1 Tab. 3.28 */`.
+- Cite the source of any magic number in a comment, with document and section:
+  `/* SPF §3.7.5.3.1 Tab. 3.28 */`.
 
 ### Hardware facts you may rely on
 
@@ -185,9 +195,9 @@ git worktree add .worktrees/<task> -b <type>/<slug> origin/main
   `feat(comms): …`, `fix(obsw): …`, `docs(aocs): …`, `test(coverage): …`,
   `ci(codeql): …`. Scopes in use: `obsw`, `comms`, `bms`, `aocs`, `memory`,
   `payloads`, `ci`, `test`, `docs`, `tasks`.
-- **PR body must contain**: what changed and why; the spec reference it
+- **PR body must contain**: what changed and why; the document reference (§1) it
   implements; the exact commands you ran and what they returned; anything you
-  did **not** verify; and any open question or spec contradiction you hit.
+  did **not** verify; and any open question or contradiction you hit.
 - Stacked PRs are allowed and gated (CI has no base-branch filter).
 - **Do not merge your own PR.** Merge happens on explicit human approval.
 - Reviews: **Kilo Code Reviewer** follows `REVIEWS.md` (reporting only, no
@@ -214,6 +224,9 @@ git worktree add .worktrees/<task> -b <type>/<slug> origin/main
 - **Unresolved** items stay visible: annotate them in the module doc and in the
   `TASKS.md` "open decisions" list, and name them in the PR body. That is the
   opposite of a silent TODO.
+- Contradictions inside the SharePoint set (two documents disagreeing on a value,
+  a part, a priority) are recorded here or in `TASKS.md` with both readings and
+  both sources — never resolved by picking one.
 
 ---
 
@@ -227,7 +240,7 @@ A change is done when **all** of these hold:
       suppression
 - [ ] new behaviour has tests, and those tests were shown to fail without the
       change
-- [ ] every spec-pinned number in the diff cites its source
+- [ ] every pinned number in the diff cites its document and section
 - [ ] `docs/` and `TASKS.md` reflect reality
 - [ ] the PR body lists evidence, unverified items and open questions
 - [ ] CI is green on the exact head commit that is proposed for merge
