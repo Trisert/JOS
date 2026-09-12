@@ -30,15 +30,16 @@ contradict each other, do not pick the one that suits the change you are making:
 flag the contradiction (§7) and escalate it.
 
 **If the documents do not define the interface, stop and ask.** Do not invent a
-protocol, a register map, a frame layout, a pin assignment or an endianness.
-Interfaces currently in this state (EPS↔OBC frame format, the AOCS↔OBC SPI
-transport, the 32-byte PDT header payload) are tracked as blockers at the bottom
-of `TASKS.md`. Coding them blind means fabricating an interface that the flight
-model will not implement.
+protocol, a register map, a frame layout, a pin assignment or an endianness. The
+interfaces currently in this state — the **EPS↔OBC frame format** and the
+**AOCS↔OBC frame format** (their *transports* are documented: subsystem SPI, OBC
+master, both the other boards as slaves, chip-selects through an I2C GPIO
+expander) — are tracked as blockers at the bottom of `TASKS.md`. Coding them
+blind means fabricating an interface that the flight model will not implement.
 
-**The document set is not in this repo.** Cite document + section/row, never a
-recollection of one; if a document you need is missing, ask for it rather than
-reconstructing it from the code.
+**The document set is not in this repo.** Cite document + section/row/table,
+never a recollection of one; if a document you need is missing, ask for it rather
+than reconstructing it from the code.
 
 ---
 
@@ -112,7 +113,7 @@ proof-of-life that shows it can still fail — in the same PR.
 | `JOS/simulation/` | Project-owned dual-ESP32 HIL harness (host/Target code, development aid — not flight code, and outside the gate scope) |
 | `JOS/docs/` | `api/` module contracts, `dev/` developer guides, `arch/` system design, `qual/` baselines |
 | `TASKS.md` | Human-readable source of truth for work tracking (replaces the archived kanban DB) |
-| `REVIEWS.md` | The contract Kilo Code Reviewer follows: static analysis + reporting only |
+| `REVIEWS.md` | The code-review contract this repo applies on every PR — severity, focus areas, standards mapping. Reporting only, no auto-fix |
 | `JOS/Drivers/`, `JOS/Middlewares/`, `JOS/Core/Inc/RadioLib/` | **Vendored**, third-party. STM32 HAL/CMSIS, FreeRTOS, RadioLib headers — never edited, never analysed |
 
 **Ownership and analysis scope are two different sets — do not conflate them:**
@@ -157,12 +158,12 @@ proof-of-life that shows it can still fail — in the same PR.
 - In CubeMX-generated files, keep edits inside `/* USER CODE BEGIN */` blocks.
   Peripheral/pin changes belong in `JOS.ioc` **and** must be reconciled with the
   OBC V2.0 netlist; never hand-fix a pin the netlist does not support.
-- Compile-time `static_assert` for every spec-pinned size, offset or frame
-  length you introduce or touch (beacons, LastStates entries, TT&C frames).
+- Compile-time `static_assert` for every size, offset or frame length a document
+  fixes and you introduce or touch (beacons, LastStates entries, TT&C frames).
 - Cite the source of any magic number in a comment, with document and section:
   `/* SPF §3.7.5.3.1 Tab. 3.28 */`.
 
-### Hardware facts you may rely on
+### Hardware and interface facts you may rely on
 
 - **MCU** STM32L496VGTx, Cortex-M4F @ 80 MHz; 1 MB Flash (512 KB reserved for
   the image), 320 KB SRAM (256 + 64).
@@ -172,21 +173,32 @@ proof-of-life that shows it can still fail — in the same PR.
   `CSELR`; this L4 has no DMAMUX). I2C2 is the camera bus.
 - **Timebase**: HAL timebase on TIM6, SysTick for FreeRTOS only. Do not move
   `HAL_GetTick()` back onto SysTick.
+- **Subsystem SPI bus**: the OBC is master; **AOCS and EPS are slaves on that
+  same bus**, each with a dedicated chip-select. The CS lines are **driven by an
+  external GPIO expander over I2C** (`I2C_EXT`), not by native OBC GPIOs, and
+  the subsystem MCUs raise asynchronous events on `INT1`/`INT2`
+  (`ELE_DREP_Architecture_V01`, SPF V3 Tab. 3.9).
 - **AOCS is a separate board with its own MCU**, linked over the subsystem SPI
-  as a slave. The OBC does not run attitude control; it consumes the pinned
-  telemetry contract.
-- **EPS** is a separate MCU board reached over the subsystem SPI (the OBC is
-  master, SPI2). Note the documents disagree on the exact part (SPF/docs say
-  STM32L1, `App/bms/bms.c` says STM32L496) — do not silently pick one. Its frame
-  format is **not specified** — see §1.
+  as a slave; the physical link is the Y-sliding plate with pogo-pins. The OBC
+  does not run attitude control; it consumes the pinned telemetry contract.
+- **EPS** is a separate MCU board on the same subsystem SPI. The documents
+  disagree on the part number — SPF V3 Tab. 3.9 says `STM32L496VGT3` ("the three
+  primary subsystem boards … are all built around the same STM32L4 family"),
+  while an older paragraph of the SPF and `SW_DREP` say STM32L1 (and
+  `docs/arch/README.md` repeats L1). **Do not silently pick one**: it is open
+  decision 5 in `TASKS.md`.
+- **Beacons are 128 B**: 96 B of sensor telemetry + 32 B of timestamp/system
+  parameters (SPF V3 §3.5, Table 3.15 – OBDH quick facts). The "32-byte PDT
+  header" does not exist — `PDT` (*Payload Data Transmission*) is an operational
+  phase of s4 (SPF V3 §1.5), not a packet format.
 
 ---
 
 ## 5. Tests
 
 - **Every behavioural change ships with a host test.** Bug fix → a test that
-  fails before the fix and passes after. New spec-conformant behaviour → tests
-  for the normal path **and** the error/refusal path.
+  fails before the fix and passes after. New document-conformant behaviour →
+  tests for the normal path **and** the error/refusal path.
 - **Prove the test can fail.** Revert the fix (or mutate the code) locally and
   confirm the new test goes red. A test that cannot fail is not evidence.
 - Use the existing doubles (`test/support/`) and header stand-ins (`test/fakes/`).
@@ -223,9 +235,17 @@ git worktree add .worktrees/<task> -b <type>/<slug> origin/main
   did **not** verify; and any open question or contradiction you hit.
 - Stacked PRs are allowed and gated (CI has no base-branch filter).
 - **Do not merge your own PR.** Merge happens on explicit human approval.
-- Reviews: **Kilo Code Reviewer** follows `REVIEWS.md` (reporting only, no
-  auto-fix). **CodeRabbit** does not auto-review this repo automatically — ask
-  for it with an `@coderabbitai review` comment when you want a second pass.
+- Reviews: `REVIEWS.md` is the review contract — the in-house reviewer (subagent
+  or human) applies it on every PR, and it is what we hand to an external
+  reviewer. **CodeRabbit** does not auto-review this repo automatically (under 10
+  stars): ask for it with an `@coderabbitai review` comment, one review per hour
+  on the free tier.
+- **Kilo Code Reviewer is filtered out.** Its runs end in `Review failed: The
+  model output limit was reached` and publish no review, so its comments and its
+  red check carry no information: ignore them — never read them as a verdict,
+  never hold a merge for them, never open a PR "to fix" them, and when reporting
+  the checks say it failed because the model output limit was reached and
+  produced no review text; do not use it as a merge gate.
 - Every PR that touches flight behaviour earns a reviewer verdict **before**
   it is merged — an approval you cannot attribute to a specific review of that
   head commit is not a verdict.

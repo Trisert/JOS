@@ -1,8 +1,17 @@
-# REVIEWS.md — Kilo Code Review guidelines for RedPill OBSW (JOS)
+# REVIEWS.md — review guidelines for RedPill OBSW (JOS)
 
-These conventions are read by Kilo Code Reviewer on every automated PR review.
-They scope the review to **static analysis and reporting only** — the reviewer must
-NOT modify code, spawn Cloud Agents, or offer to open fix PRs.
+These conventions define how a **code review of this repository is performed and
+reported** — by the in-house reviewer (subagent or human) on any PR, and by any
+external reviewer we ask for. They scope the review to **static analysis and
+reporting only** — the reviewer must NOT modify code, spawn Cloud Agents, or
+offer to open fix PRs.
+
+> History: this file was written as the instruction set for Kilo Code Reviewer.
+> Kilo is **filtered out**: the app stays installed on the repository (removing it
+> is an account-owner action) but its runs end in `Review failed: The model
+> output limit was reached` with no review published, so its comments and its red
+> check are ignored — never read as a verdict, never a merge blocker. The content
+> below is the review contract we apply ourselves and hand to CodeRabbit.
 
 ## Mode
 - **Review only.** Report findings as structured comments with severity. Do NOT
