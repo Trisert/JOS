@@ -188,8 +188,9 @@ proof-of-life that shows it can still fail — in the same PR.
   `docs/arch/README.md` repeats L1). **Do not silently pick one**: it is open
   decision 5 in `TASKS.md`.
 - **Beacons are 128 B**: 96 B of sensor telemetry + 32 B of timestamp/system
-  parameters (SPF V3). The "32-byte PDT header" does not exist — `PDT` is an
-  operational phase of s4, not a packet format.
+  parameters (SPF V3 §3.5, Table 3.15 – OBDH quick facts). The "32-byte PDT
+  header" does not exist — `PDT` (*Payload Data Transmission*) is an operational
+  phase of s4 (SPF V3 §1.5), not a packet format.
 
 ---
 
@@ -243,7 +244,8 @@ git worktree add .worktrees/<task> -b <type>/<slug> origin/main
   model output limit was reached` and publish no review, so its comments and its
   red check carry no information: ignore them — never read them as a verdict,
   never hold a merge for them, never open a PR "to fix" them, and when reporting
-  the checks say it produced no text rather than calling it a pass or a failure.
+  the checks say it failed because the model output limit was reached and
+  produced no review text; do not use it as a merge gate.
 - Every PR that touches flight behaviour earns a reviewer verdict **before**
   it is merged — an approval you cannot attribute to a specific review of that
   head commit is not a verdict.
