@@ -13,8 +13,11 @@ It replaces the old Hermes kanban board (SQLite), which was archived on
   each in its **own git worktree** (`JOS/.worktrees/<task>`) on its own branch.
 - Subagents do **not** share a state DB — the only shared write surface is git
   itself (branch + PR), which is designed for concurrent, conflict-safe merges.
-- Results land as **GitHub PRs**; `kilo-review-loop` drives each PR through
-  Kilo Code Review until clean, then merge.
+- Results land as **GitHub PRs**; each PR is reviewed under the `REVIEWS.md`
+  contract (in-house reviewer on every PR) plus CodeRabbit on explicit trigger
+  (`@coderabbitai review` comment; one review per hour on the free tier), then
+  merged on human approval with CI green. (The old `kilo-review-loop` workflow
+  is retired: Kilo publishes no reviews — see row 43.)
 - `max_concurrent_children = 3` (RAM is not the limit on this Pi; the cap
   protects the `hy3:free` API rate limit and `state.db` write contention).
 
@@ -48,7 +51,7 @@ It replaces the old Hermes kanban board (SQLite), which was archived on
 | 19 | blocked | **T36 — FRAM DMA SPI2**: dopo decisione architettura radio e FRAM bus (T23/T25), configurare DMA2 per SPI2 se FRAM su SPI2. Dipende da decisione. | — | Dipende da decisione Nicola su FRAM bus (SPI2 vs I2C1). Stale fino a decisione. |
 || 20 | todo | **TBD — Power mode sleep/wakeup**: verificare supporto sleep mode compatibile con STM32L4 (SPF §3.6.4). | — | Da fare. |
 
-| 21 | done | **T-PAY-verify (SPF §3.2 vs App/payloads)**: 11 gap. CRYSTALS: mancano H-bridge ±, driver I2C camera, macchina a stati 4-stati, interlock heater. CLOUD: MCP23017 assente, ADC MAX11228-vs-11128 da chiarire (SPF incoerente: §3.2.2.1 dice 11228, §3.6.4.2 dice 11128), 2ª faccia non indirizzata, breach non monotonico. CLEAR: 12 LED vs 3 banchi, nessuna fusione MAG/IMU, header 32B mancanti. | — | Report-only, nessuna modifica. Dettagli nel thread #JOS 08-09. |
+| 21 | done | **T-PAY-verify (SPF §3.2 vs App/payloads)**: 11 gap reported, **10 standing** (1 withdrawn — see CLEAR). CRYSTALS: mancano H-bridge ±, driver I2C camera, macchina a stati 4-stati, interlock heater. CLOUD: MCP23017 assente, ADC MAX11228-vs-11128 da chiarire (SPF incoerente: §3.2.2.1 dice 11228, §3.6.4.2 dice 11128), 2ª faccia non indirizzata, breach non monotonico. CLEAR: 12 LED vs 3 banchi, nessuna fusione MAG/IMU. ~~header 32B mancanti~~ — **withdrawn 2026-09-12**: no PDT header exists in SPF V3 §3.5 Tab. 3.15 (PDT is an operational phase of s4, not a packet format; the 32 B are the beacon timestamp tail — see row 42). | — | Report-only, nessuna modifica. Dettagli nel thread #JOS 08-09. |
 | 22 | done | **T-AOCS-verify (SPF §3.3/§3.4 vs App/aocs, App/bms)**: AOCS quasi tutto placeholder (no B-dot, no EKF, task mai avviato, docs/api incoerente). BMS: SoC=100 fissi, BQ76905 mai interrogata, soglie 60/40 inventate (SPF fissa solo B_OPOK≈80%, B_SCRIT≈25%), mancano gate s3→s4 e s4→s2, SoH assente. | — | Report-only, nessuna modifica. |
 | 23 | done | **T-COMMS-verify (SPF §3.7 TT&C vs App/comms)**: parametri LoRa, beacon, encryption/CRC/NACK/chunking. | [#68](https://github.com/Trisert/JOS/issues/68) | 5 gap: (1) ❌ **CR=4/9 bug** — `radiolib_driver.cpp:60` `cr=5` → `4/9` non standard, SPF vuole 4/8 (`cr=4`). (2) ❌ Power 22 vs 31.6 dBm. (3) ❌ Packet size 64 B vs SPF 128 B (chunk condiviso). (4) ❌ NACK/retransmission assente. (5) ❌ Encryption assente (CRC unkeyed — documentato). Beacon 1-16 min ✅, SF10 ✅, BW 125 ✅, F=436 ✅. |
 | 24 | done | **T-SM-verify (SPF §1.5 modi/transizioni + §3.6.5 memoria vs state_machine.c + memory.c)**: trigger, gate SoC, LastStates pool, budget FRAM. | [#69](https://github.com/Trisert/JOS/issues/69) | Stati s0-s4 ✅ (5 state, s2 CRIT, s3 READY, s4 ACTIVE). **❌ Manca `TRIGGER_TASK_COMPLETE`** (s4→s3 per completamento task, SPF Tab.3.21). Gate SoC s2↔s3 ✅ (b_opok=80%, b_scrit definito). LastStates pool 128 B × max entry ✅ (static assert), FRAM 64 KB ciclica ✅ (FM24VN ×4), dual-bank Flash ✅, mutex lock ✅. ❌ **SoC hardcoded=100** (`state_machine.c:64`) in testing. |
