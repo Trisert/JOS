@@ -74,9 +74,15 @@ make cppcheck-includes-proof # proves that include gate cannot be silenced
 make cppcheck-print          # print the fully expanded cppcheck command line
 ```
 
-- `-fanalyzer` (GCC static analyser, `APP_ANALYZER`) runs on every **first-party**
-  C translation unit during a normal build — a clean build is also a clean
-  analyzer run for `App/` and hand-written `Core/Src`.
+- `-fanalyzer` (GCC static analyser, `APP_ANALYZER`) is applied to
+  `$(BUILD_DIR)/App/%` and `$(BUILD_DIR)/Core/Src/%` only. It is **C-only**: the
+  two C++ translation units (`App/comms/radiolib_driver.cpp`,
+  `radiolib_hal.cpp`) are outside it, and so is everything under `JOS/tools/`
+  and `JOS/simulation/`. A clean build is not coverage of those files.
+- Scope caveat worth knowing: the analyser also runs over the few CubeMX/ST
+  generated files inside `Core/Src` (`system_stm32l4xx.c`, `stm32l4xx_it.c`,
+  `stm32l4xx_msp.c`, `freertos.c`), so its output is not a pure first-party
+  signal — but it is always warnings-only, never `-Werror`.
 - Toolchain: CI pins **Arm GNU Toolchain 14.3.Rel1** (the STM32CubeIDE 2.x
   reference) and the Ceedling suite builds with the **host** gcc. Local
   shortcuts differ on purpose — `nix develop` ships gcc-arm-embedded-13 and the
@@ -90,8 +96,8 @@ that head commit, and never report a PR as merged without verifying its state.
 
 **Never silence a gate.** No new `--suppress`, no disabling a check id, no
 `paths-ignore`, no `|| true`, no weakened coverage threshold to make a PR green.
-If a gate produces a false positive on first-party code, fix the code or fix the
-gate *and* add the proof-of-life that shows it can still fail — in the same PR.
+If a gate produces a false positive, fix the code or fix the gate *and* add the
+proof-of-life that shows it can still fail — in the same PR.
 
 ---
 
@@ -100,17 +106,24 @@ gate *and* add the proof-of-life that shows it can still fail — in the same PR
 | Path | What it is |
 |---|---|
 | `JOS/App/` | **Primary application code** — the modules you edit: `obsw/`, `comms/`, `memory/`, `bms/`, `aocs/`, `payloads/` |
-| `JOS/Core/` | CubeMX-generated sources **plus hand-written glue**: the hand-written part is first-party too (§2 gives it the same analyser scope), while the generated part is only edited inside `/* USER CODE BEGIN */` blocks. `JOS/JOS.ioc` holds the pin/peripheral configuration (subject to §1) |
+| `JOS/Core/` | CubeMX-generated sources **plus hand-written glue**; the hand-written part is project code, the generated part is only edited inside `/* USER CODE BEGIN */` blocks. `JOS/JOS.ioc` holds the pin/peripheral configuration (subject to §1) |
 | `JOS/test/` | Host unit tests (Ceedling), hand-written doubles in `support/`, target-header stand-ins in `fakes/` |
-| `JOS/tools/` | `fw_crc_stamp.py`, CRC self-test |
-| `JOS/simulation/` | Dual-ESP32 HIL harness (development aid, not flight code) |
+| `JOS/tools/` | Project-owned helper sources — `crc_selftest.c`, `fw_crc_stamp.py` (outside the gate scope, see below) |
+| `JOS/simulation/` | Project-owned dual-ESP32 HIL harness (host/Target code, development aid — not flight code, and outside the gate scope) |
 | `JOS/docs/` | `api/` module contracts, `dev/` developer guides, `arch/` system design, `qual/` baselines |
 | `TASKS.md` | Human-readable source of truth for work tracking (replaces the archived kanban DB) |
 | `REVIEWS.md` | The contract Kilo Code Reviewer follows: static analysis + reporting only |
-| `JOS/Drivers/`, `JOS/Middlewares/`, `JOS/Core/Inc/RadioLib/` | **Vendored.** STM32 HAL/CMSIS, FreeRTOS, RadioLib headers — never edited, never analysed |
+| `JOS/Drivers/`, `JOS/Middlewares/`, `JOS/Core/Inc/RadioLib/` | **Vendored**, third-party. STM32 HAL/CMSIS, FreeRTOS, RadioLib headers — never edited, never analysed |
 
-First-party means `JOS/App/`, the hand-written `JOS/Core/Src` sources, and
-`JOS/test/`. Everything else is vendored or generated.
+**Ownership and analysis scope are two different sets — do not conflate them:**
+
+- **Owned by this repo** (tracked, maintained here, never treated as vendored):
+  `JOS/App/`, the hand-written `JOS/Core/Src` glue, `JOS/test/`, `JOS/tools/`,
+  `JOS/simulation/`.
+- **Covered by the firmware gates** (cppcheck `CPPCHECK_SRC` and `-fanalyzer`
+  in `JOS/Makefile`): `App` and `Core/Src` only. `JOS/tools/` and
+  `JOS/simulation/` are owned but **outside** that scope, and so are the two
+  C++ TUs. Never read a clean gate as coverage of files it does not compile.
 
 ---
 
