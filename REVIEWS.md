@@ -7,10 +7,11 @@ reporting only** — the reviewer must NOT modify code, spawn Cloud Agents, or
 offer to open fix PRs.
 
 > History: this file was written as the instruction set for Kilo Code Reviewer.
-> Kilo is no longer a gate: the app is still installed on the repository but its
-> runs end in `Review failed: The model output limit was reached` with no review
-> published, so nothing is gated on it (see `TASKS.md`). The content below
-> survives as the review contract we apply ourselves and hand to CodeRabbit.
+> Kilo is **filtered out**: the app stays installed on the repository (removing it
+> is an account-owner action) but its runs end in `Review failed: The model
+> output limit was reached` with no review published, so its comments and its red
+> check are ignored — never read as a verdict, never a merge blocker. The content
+> below is the review contract we apply ourselves and hand to CodeRabbit.
 
 ## Mode
 - **Review only.** Report findings as structured comments with severity. Do NOT
