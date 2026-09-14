@@ -10,7 +10,9 @@ report — see §7).
 **Verdict: capability yes, implementation no.** The MCU offers Sleep, Stop,
 Standby and Shutdown (`ELE_DREP`, MCU table). The specification asks the OBSW
 for "low-power idle modes compatible with STM32L4 sleep states" (SPF V3
-§3.6.3, repeated in `RED_SPF` and `SW_DREP` §3.1) and puts s3 READY in
+§3.6.4 "OBSW Design Description" in `RED_SPF_V3`; the same section is numbered
+§3.6.3 in the chapter-3 extract — numbering clash, see §3), repeated in
+`SW_DREP` §3.1) and puts s3 READY in
 "low-power mode". The firmware today runs the FreeRTOS idle task in Run mode:
 the idle hook body is empty, tickless idle is disabled by default, and the
 single `__WFI` in the project is an IRQ wait inside the SPI1 DMA transfer
@@ -53,7 +55,7 @@ on the board as configured.
 
 | Requirement | Source |
 |-------------|--------|
-| FreeRTOS "…low-power idle modes compatible with STM32L4 sleep states" | SPF V3 §3.6.3 "OBSW Design Description" (`SYS_SPF_V3Chapter3Paragraph3.6.docx.txt:45-46`); identical sentence in `RED_SPF_V3.docx.txt:2257` (Table 3.18) and `SW_DREP_Architecture_V01.docx.txt:136` (§3.1) |
+| FreeRTOS "…low-power idle modes compatible with STM32L4 sleep states" | SPF V3 "OBSW Design Description" — `RED_SPF_V3.docx.txt:96` (ToC: §3.6.4) and `:2257` (body, Table 3.18); the same section is numbered §3.6.3 in the chapter-3 extract (`SYS_SPF_V3Chapter3Paragraph3.6.docx.txt:45-46`, where §3.6.4 is Memory Budget) — see §3. Identical sentence in `SW_DREP_Architecture_V01.docx.txt:136` (§3.1) |
 | s3 READY — "Post-task idle; available for uplink; controllers in low-power mode" | `SYS_SPF…3.6.docx.txt:137`; `SW_DREP…:202`; `RED_SPF…:2348` |
 | s3 READY — "Post-task idle state; low-power mode"; operational constraint "Low-power mode; payload execution not active" | `RED_SPF_V3.docx.txt:700` (Tab. 1.8) and `:708` |
 | s4 ACTIVE — "controllers in medium-power mode" | `SYS_SPF…3.6.docx.txt:141`; `SW_DREP…:206`; `RED_SPF…:2352` |
@@ -74,16 +76,36 @@ wake-up phase" — `RED_SPF_V3.docx.txt:630`, `SW_DREP…:194`, `SYS_SPF…:129`
 As written, the requirement is satisfiable by the *shallowest* Sleep
 implementation; Stop/Standby are an engineering choice, not a spec mandate.
 
-## 3. Reference correction: T20 cites SPF §3.6.4, which is "Memory Budget"
+## 3. Section numbering: the SPF does not number §3.6 the same way twice
 
 T20 reads "verificare supporto sleep mode compatibile con STM32L4 (SPF
-§3.6.4)". In SPF V3, **§3.6.4 is "Memory Budget"**
-(`SYS_SPF_V3Chapter3Paragraph3.6.docx.txt:230`). The power-mode requirement
-lives in **§3.6.3 "OBSW Design Description"** (`:45-46`), echoed by `SW_DREP`
-§3.1 and by the s1/s3/s4 rows of the state tables. T20's citation should be
-read as §3.6.3; the row in `TASKS.md` is corrected in the same PR. (Same
-class of finding as the day-1 "header PDT 32 B" withdrawal: the citation, not
-the technical content, was wrong.)
+§3.6.4)". **That citation is correct as written.** The correction this section
+originally carried is withdrawn: the two copies of the SPF in the recovered
+corpus disagree on the sub-numbering of §3.6, and the first draft of this
+report read only one of them.
+
+| Copy | Section holding the power-mode requirement | Evidence |
+|------|-------------------------------------------|----------|
+| `RED_SPF_V3.docx.txt` — the full SPF V3 | **§3.6.4 "OBSW Design Description"**; §3.6.5 is Memory Budget | ToC `:96-97`; body heading immediately before the requirement sentence at `:2257` |
+| `SYS_SPF_V3Chapter3Paragraph3.6.docx.txt` — the chapter-3 deliverable | **§3.6.3 "OBSW Design Description"**; §3.6.4 is Memory Budget | `:45` (heading), `:46` (requirement), `:230` (Memory Budget) |
+
+The full document's own cross-reference sides with the *extract*: a
+memory-budget sentence points at "3.6.4" (`RED_SPF_V3.docx.txt:514`) although
+its ToC makes that section §3.6.5. The inconsistency is therefore **inside the
+delivered documents**, not in T20's citation.
+
+Consequences, stated exactly:
+
+- T20's original "SPF §3.6.4" **stands**; no renumbering is owed by the board.
+- The clash is a second documentation-integrity item for SYS/ELE (alongside
+  the EPS MCU identity tracked in issue #94): someone implementing against the
+  chapter-3 extract alone would cite the wrong section for both the OBSW
+  design description and the memory budget. It is recorded here and in the
+  `TASKS.md` row; filing it with SYS/ELE is a decision for the team, not a
+  change this PR makes on its own.
+
+(Closest precedent: the day-1 "header PDT 32 B" withdrawal — same class of
+finding, a citation read from a single copy of the corpus.)
 
 ## 4. (c) What JOS does today — code evidence
 
@@ -164,7 +186,9 @@ TIM6 tick.
 ## 6. (e) Recommendation
 
 1. **Close T20 as a verification** (this PR): capability present,
-   implementation gap documented, section reference corrected to SPF §3.6.3.
+   implementation gap documented, and the citation "SPF §3.6.4" confirmed
+   correct against the full SPF — the §3.6 numbering clash between the two
+   delivered copies is recorded in §3.
 2. **Next minimal implementable step** (new firmware work item, requires the
    ARM toolchain + HIL): Sleep in the idle path, with an explicit tick
    decision —
