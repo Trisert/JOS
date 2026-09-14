@@ -2,11 +2,11 @@
 
 ## FRAM Cyclic Buffer (`App/memory/fram.c`, `cyclic_buffer.c`)
 
-4 MB external FRAM (SPI2) — primary payload data sink.
+512 KB external FRAM (4 × FM24VN10-G on I2C1, PB8/PB9) — primary payload data sink.
 
 | Function | Purpose |
 |----------|---------|
-| `fram_init()` | Init SPI2 FRAM |
+| `fram_init()` | Init I2C1 FRAM |
 | `cyclic_buffer_write(uint8_t *row, size_t len)` | Append; overwrite oldest on wrap |
 | `cyclic_buffer_read(...)` | Retrieve for downlink |
 

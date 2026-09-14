@@ -48,7 +48,7 @@ docs/
 - **MCU:** STM32L496VGTx (Cortex-M4 @ 80 MHz)
 - **Flash:** 1024 KB (firmware reserves 512 KB; LastStates pool 8 KB @ `0x08080000`)
 - **SRAM:** 320 KB (256 + 64)
-- **FRAM:** 4 MB external (SPI2)
+- **FRAM:** 512 KB external (4 × FM24VN10-G on I2C1, PB8/PB9)
 
 ## Module Overview
 
