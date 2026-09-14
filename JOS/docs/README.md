@@ -11,6 +11,7 @@ Welcome to the JOS (RedPill) On-Board Software documentation.
 | Fault tolerance (boot CRC, watchdog) | [docs/dev/hardening.md](dev/hardening.md) |
 | SRAM2 parity / critical data | [docs/dev/sram2_parity.md](dev/sram2_parity.md) |
 | SEU mitigation / RAM scrubbing | [docs/dev/seu_mitigation.md](dev/seu_mitigation.md) |
+| Power modes / sleep-wakeup gap (T20) | [docs/dev/power_modes.md](dev/power_modes.md) |
 | Understanding modules | [docs/api/](api/) |
 | System design | [docs/arch/README.md](arch/README.md) |
 | Operating the satellite | [docs/user/README.md](user/README.md) |
@@ -35,6 +36,7 @@ docs/
 │   ├── hardening.md    # Boot CRC32 integrity + task watchdog monitoring
 │   ├── sram2_parity.md # SRAM2 parity NMI for critical data (W2-3)
 │   ├── seu_mitigation.md # Periodic RAM scrubbing + SEU counters (W2-5)
+│   ├── power_modes.md  # MCU low-power capability vs OBSW requirement (T20)
 │   ├── coding_standards.md
 │   └── debugging.md
 └── user/               # User manual (ground operators)
