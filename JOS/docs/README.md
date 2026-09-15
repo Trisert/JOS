@@ -11,6 +11,7 @@ Welcome to the JOS (RedPill) On-Board Software documentation.
 | Fault tolerance (boot CRC, watchdog) | [docs/dev/hardening.md](dev/hardening.md) |
 | SRAM2 parity / critical data | [docs/dev/sram2_parity.md](dev/sram2_parity.md) |
 | SEU mitigation / RAM scrubbing | [docs/dev/seu_mitigation.md](dev/seu_mitigation.md) |
+| Power modes / sleep-wakeup gap (T20) | [docs/dev/power_modes.md](dev/power_modes.md) |
 | Understanding modules | [docs/api/](api/) |
 | System design | [docs/arch/README.md](arch/README.md) |
 | Operating the satellite | [docs/user/README.md](user/README.md) |
@@ -35,6 +36,7 @@ docs/
 │   ├── hardening.md    # Boot CRC32 integrity + task watchdog monitoring
 │   ├── sram2_parity.md # SRAM2 parity NMI for critical data (W2-3)
 │   ├── seu_mitigation.md # Periodic RAM scrubbing + SEU counters (W2-5)
+│   ├── power_modes.md  # MCU low-power capability vs OBSW requirement (T20)
 │   ├── coding_standards.md
 │   └── debugging.md
 └── user/               # User manual (ground operators)
@@ -46,7 +48,7 @@ docs/
 - **MCU:** STM32L496VGTx (Cortex-M4 @ 80 MHz)
 - **Flash:** 1024 KB (firmware reserves 512 KB; LastStates pool 8 KB @ `0x08080000`)
 - **SRAM:** 320 KB (256 + 64)
-- **FRAM:** 4 MB external (SPI2)
+- **FRAM:** 512 KB external (4 × FM24VN10-G on I2C1, PB8/PB9)
 
 ## Module Overview
 
