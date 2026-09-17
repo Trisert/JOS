@@ -99,6 +99,15 @@ It replaces the old Hermes kanban board (SQLite), which was archived on
 
 Issue aperta: **#54 (HIL)** — richiede hardware. **#49** (grant RedPill-T) chiusa con nota: **prima del flight freeze va riverificato che il relicense sia effettivo** su `radiolib_driver.cpp`/`radiolib_hal.cpp`. Decisioni ancora aperte su netlist: strapping A2/A1 FRAM, cablaggio radio al connettore J6, CR 4/8 JOS vs 4/5 upstream TT&C.*
 
+## Direct review follow-up
+
+- **In review — R1–R6 safety corrections** (`fix/direct-review-safety`): validity
+  gate for READY→ACTIVE, storage-independent low-battery containment, no repeated
+  autonomous CRIT logging, radio TX cleanup/RX rearm, post-restore normalization,
+  truthful opcode execution verdicts. Seven additional host tests plus native
+  radio lifecycle test. See `JOS/docs/qual/direct-review-safety.md` for scope,
+  evidence and remaining integration/HIL limitations. Not merged or flight-qualified.
+
 ## Notes
 
 - Tasks 2–3 are children of task 1 (PR #31 epic). They unblock task 1 when done.

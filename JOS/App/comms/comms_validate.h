@@ -159,12 +159,14 @@ typedef enum {
     COMMS_TC_ERR_PARAM_RANGE,   /**< numeric parameter outside min/max bounds */
     COMMS_TC_ERR_MAC,           /**< missing or invalid HMAC tag (appended last
                                      so all existing verdict values are stable) */
-    COMMS_TC_ERR_PHY            /**< radio rejected the frame below the validator
+    COMMS_TC_ERR_PHY,           /**< radio rejected the frame below the validator
                                      (oversize PHY payload, read error). Never
                                      returned by comms_validate_tc() — only
                                      accounted by the RX task via
                                      comms_rx_account() so PHY drops are not a
                                      stat blind spot. */
+    COMMS_TC_ERR_EXECUTION,     /**< valid command refused by its owner */
+    COMMS_TC_ERR_UNSUPPORTED    /**< valid command not implemented */
 } comms_tc_result_t;
 
 /** RX acceptance/rejection counters (telemetry + ground diagnostics). */

@@ -196,6 +196,10 @@ jobs:
         working-directory: JOS/test
         run: ceedling test:all
 
+      - name: Radio driver lifecycle regression
+        working-directory: JOS/test
+        run: make native
+
       # Enforced gate: JOS/test/project.yml sets :fail_under_line /
       # :fail_under_branch together with :exception_on_fail, so this step exits
       # non-zero when coverage of the modules under test drops below the

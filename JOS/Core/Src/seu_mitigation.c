@@ -853,6 +853,9 @@ void seu_mitigation_init(void)
 
     seu_initialised = 1U;
 
+    /* Commit must be enabled before normalizing the restored live/shadow pair. */
+    state_machine_boot_restore_complete();
+
     if (seu_stats.registration_failures != 0U) {
         seu_log(SEU_EVENT_REGISTER_FAILED, NULL, 0U, 0U, 0U, 0U, 0xFFFFFFFFU);
     }

@@ -93,7 +93,9 @@ extern "C" int lora_tx(const uint8_t* data, size_t len)
     g_tx_wait_handle = osThreadGetId();
     int16_t s = radio.startTransmit(data, (uint8_t)len);  /* async; DIO1 -> TX_DONE */
     if (s != RADIOLIB_ERR_NONE) {
+        (void)radio.finishTransmit();
         g_tx_wait_handle = NULL;
+        (void)radio.startReceive();
         return -1;
     }
     return 0;
@@ -103,8 +105,13 @@ extern "C" int lora_tx(const uint8_t* data, size_t len)
 extern "C" int lora_tx_wait_done(uint32_t timeout_ms)
 {
     uint32_t flags = osThreadFlagsWait(LORA_FLAG_TX_DONE, osFlagsWaitAny, timeout_ms);
+    /* Both success and timeout leave TX explicitly, clear its IRQ status,
+     * and restore continuous RX. Otherwise the next uplink cannot wake RX. */
+    int16_t finish = radio.finishTransmit();
     g_tx_wait_handle = NULL;
-    return (flags == LORA_FLAG_TX_DONE) ? 0 : -1;
+    int16_t receive = radio.startReceive();
+    return ((flags == LORA_FLAG_TX_DONE) && (finish == RADIOLIB_ERR_NONE) &&
+            (receive == RADIOLIB_ERR_NONE)) ? 0 : -1;
 }
 
 extern "C" int lora_rx(uint8_t* buf, size_t* len)

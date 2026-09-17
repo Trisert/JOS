@@ -372,6 +372,8 @@ const char *comms_tc_result_str(comms_tc_result_t result)
     case COMMS_TC_ERR_PARAM_RANGE:  return "PARAM_RANGE";
     case COMMS_TC_ERR_MAC:          return "MAC";
     case COMMS_TC_ERR_PHY:          return "PHY";
+    case COMMS_TC_ERR_EXECUTION:    return "EXECUTION";
+    case COMMS_TC_ERR_UNSUPPORTED:  return "UNSUPPORTED";
     default:                        return "UNKNOWN";
     }
 }
@@ -412,6 +414,9 @@ void comms_rx_account(comms_tc_result_t result)
     case COMMS_TC_ERR_PHY:
         rx_stats.rejected_phy++;
         break;
+    case COMMS_TC_ERR_EXECUTION:
+    case COMMS_TC_ERR_UNSUPPORTED:
+        break; /* Valid structure; only the aggregate rejection count changes. */
     default:
         rx_stats.rejected_malformed++;
         break;
