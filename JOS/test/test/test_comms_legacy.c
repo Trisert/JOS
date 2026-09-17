@@ -66,6 +66,25 @@ static size_t build_auth_frame(uint8_t opcode, const uint8_t *payload, uint8_t l
 void setUp(void)   { memset(frame_buf, 0, sizeof(frame_buf)); }
 void tearDown(void) { }
 
+void test_execution_refusal_is_not_counted_as_accepted(void)
+{
+    comms_rx_stats_t before, after;
+    comms_rx_get_stats(&before);
+    state_machine_request_transition_ExpectAndReturn(STATE_READY, TRIGGER_GROUND_CMD, -1);
+    size_t n = build_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_EXECUTION, comms_rx_handle_frame(frame_buf, n));
+    comms_rx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.accepted, after.accepted);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected + 1u, after.rejected);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_malformed, after.rejected_malformed);
+}
+
+void test_unimplemented_send_data_is_rejected(void)
+{
+    size_t n = build_frame(COMMS_TC_SEND_DATA, NULL, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_UNSUPPORTED, comms_rx_handle_frame(frame_buf, n));
+}
+
 /* A well-formed legacy frame dispatches when enforcement is relaxed. */
 void test_relaxed_gate_dispatches_legacy_frame(void)
 {

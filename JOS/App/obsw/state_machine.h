@@ -10,6 +10,10 @@
 /* Initialise the state machine (call once before osKernelStart) */
 void state_machine_init(void);
 
+/* Pre-scheduler only, after FRAM restore: retain CRIT, discard nominal state
+ * and invalidate pre-reset battery telemetry. */
+void state_machine_boot_restore_complete(void);
+
 /* Create the state machine FreeRTOS task */
 osThreadId_t state_machine_task_create(void);
 

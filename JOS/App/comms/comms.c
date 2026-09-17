@@ -812,26 +812,24 @@ comms_tc_result_t comms_rx_handle_ttc_frame(const uint8_t *frame, size_t len)
  * opcode whitelist, per-opcode payload size and parameter ranges).
  * Exporting it would make the validation gate bypassable.
  */
-static void comms_dispatch_command_unchecked(uint8_t cmd_id,
+static comms_tc_result_t comms_dispatch_command_unchecked(uint8_t cmd_id,
                                              const uint8_t *payload,
                                              size_t len)
 {
     switch (cmd_id) {
     case COMMS_TC_RESET:
+        comms_rx_account(COMMS_TC_OK); /* Reset cannot return to the RX gate. */
         NVIC_SystemReset();
-        break;
+        return COMMS_TC_OK; /* Host reset double returns; hardware does not. */
     case COMMS_TC_EXIT_STATE:
-        state_machine_request_transition(STATE_READY, TRIGGER_GROUND_CMD);
-        break;
+        return state_machine_request_transition(STATE_READY, TRIGGER_GROUND_CMD) == 0
+               ? COMMS_TC_OK : COMMS_TC_ERR_EXECUTION;
     case COMMS_TC_SET_CONFIG:
-        /* TODO: apply config from payload */
-        break;
     case COMMS_TC_SEND_DATA:
-        /* TODO: read FRAM and send chunked */
-        break;
+        return COMMS_TC_ERR_UNSUPPORTED;
     case COMMS_TC_ACTIVATE_PAYLOAD:
-        state_machine_request_transition(STATE_ACTIVE, TRIGGER_GROUND_CMD);
-        break;
+        return state_machine_request_transition(STATE_ACTIVE, TRIGGER_GROUND_CMD) == 0
+               ? COMMS_TC_OK : COMMS_TC_ERR_EXECUTION;
     case COMMS_TC_SET_BEACON_INTERVAL:
         if ((payload != NULL) && (len >= 4U)) {
             uint32_t interval_ms = ((uint32_t)payload[0] << 24) |
@@ -844,7 +842,8 @@ static void comms_dispatch_command_unchecked(uint8_t cmd_id,
             if ((interval_ms == 0UL) ||
                 ((interval_ms >= COMMS_TC_BEACON_MIN_MS) &&
                  (interval_ms <= COMMS_TC_BEACON_MAX_MS))) {
-                state_machine_set_beacon_interval(interval_ms);
+                return state_machine_set_beacon_interval(interval_ms) == 0
+                       ? COMMS_TC_OK : COMMS_TC_ERR_EXECUTION;
             }
         }
         break;
@@ -853,6 +852,7 @@ static void comms_dispatch_command_unchecked(uint8_t cmd_id,
          * rejected by the whitelist. Kept as a defensive no-op. */
         break;
     }
+    return COMMS_TC_ERR_EXECUTION;
 }
 
 /* ---------- Uplink validation gate ---------- */
@@ -906,14 +906,14 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len)
 #endif
     }
 
-    comms_rx_account(result);
-
-    if (result != COMMS_TC_OK) {
-        return result;   /* rejected — do NOT dispatch */
+    if (result == COMMS_TC_OK) {
+        result = comms_dispatch_command_unchecked(opcode, payload, payload_len);
+        if (opcode == COMMS_TC_RESET) {
+            return result; /* Defensive host-return path: already accounted. */
+        }
     }
-
-    comms_dispatch_command_unchecked(opcode, payload, payload_len);
-    return COMMS_TC_OK;
+    comms_rx_account(result);
+    return result;
 }
 
 /* ---------- Beacon TX task ---------- */

@@ -227,7 +227,8 @@ static int try_transition(obw_state_t target, uint8_t trigger)
         /* s3→s4: scheduled task / ground command */
         /* s2→s4: ground command + stable battery */
         if (obsw_state.current_state == STATE_READY) {
-            ok = 1;
+            bms = obsw_bms_snapshot();
+            ok = bms_soc_allows_payload(&bms, &default_thresholds);
         } else if (obsw_state.current_state == STATE_CRIT) {
             bms = obsw_bms_snapshot();
             /* Manual payload activation requires SoC >= B_OPOK
@@ -440,7 +441,12 @@ static int check_battery_autonomous(void)
     bms_soc_band_t   band = bms_soc_band(&bms, &default_thresholds);
 
     if (bms_soc_is_low(band)) {
-        return (try_transition(STATE_CRIT, TRIGGER_BATTERY_LOW) == 0);
+        if (obsw_state.current_state == STATE_CRIT) {
+            return 0; /* Already contained: do not churn Flash/FRAM at 10 Hz. */
+        }
+        /* Containment must not depend on writable diagnostic storage. */
+        (void)enter_safe_state(TRIGGER_BATTERY_LOW);
+        return 1;
     } else if (obsw_state.current_state == STATE_CRIT &&
                bms_soc_allows_payload(&bms, &default_thresholds)) {
         /* No parity check here any more: it lives in try_transition(), which
@@ -605,6 +611,17 @@ void state_machine_init(void)
        snapshot; the commit here is a no-op before that point and keeps the
        shadow in step if the state machine is ever re-initialised. */
     (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+}
+
+void state_machine_boot_restore_complete(void)
+{
+    seu_mitigation_lock();
+    if (obsw_state.current_state != STATE_CRIT) {
+        obsw_state.current_state = STATE_OFF;
+    }
+    obsw_state.bms.valid = false;
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+    seu_mitigation_unlock();
 }
 
 osThreadId_t state_machine_task_create(void)

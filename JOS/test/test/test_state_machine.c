@@ -175,6 +175,7 @@ void setUp(void)
     TEST_ASSERT_EQUAL_INT(BOOT_CRC_OK, boot_crc_verify());
 
     state_machine_init();
+    bms_set_soc_stub(100u); /* Explicit nominal fixture; unknown tests clear it. */
     TEST_ASSERT_EQUAL_INT(STATE_OFF, (int)state_machine_get_state());
 }
 
@@ -428,6 +429,52 @@ void test_crit_to_active_refused_when_soc_low_or_wrong_trigger(void)
     TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_ACTIVE,
                                                           TRIGGER_BATTERY_OK));
     TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
+}
+
+void test_ready_activation_requires_valid_sufficient_soc(void)
+{
+    boot_to_ready();
+    bms_set_soc_stub(100u);
+    bms_clear_soc_stub();
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_ACTIVE, TRIGGER_GROUND_CMD));
+    bms_set_soc_stub(79u);
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_ACTIVE, TRIGGER_GROUND_CMD));
+    bms_set_soc_stub(80u);
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_ACTIVE, TRIGGER_GROUND_CMD));
+}
+
+void test_low_battery_contains_even_when_flash_is_unavailable(void)
+{
+    boot_to_active();
+    bms_set_soc_stub(10u);
+    laststates_pool_lock_set_result_for_test(LASTSTATES_LOCK_FAILED);
+    run_task_until_delay(3);
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, state_machine_get_state());
+}
+
+void test_persistent_low_battery_logs_only_the_entry_to_crit(void)
+{
+    bms_set_soc_stub(10u);
+    run_task_until_delay(8);
+    TEST_ASSERT_EQUAL_UINT32(3u, laststates_count());
+}
+
+void test_boot_restore_discards_nominal_state_and_battery_validity(void)
+{
+    boot_to_active(); /* Model a restored, previously valid ACTIVE snapshot. */
+    state_machine_boot_restore_complete();
+    TEST_ASSERT_EQUAL_INT(STATE_OFF, state_machine_get_state());
+    boot_to_ready();
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_ACTIVE, TRIGGER_GROUND_CMD));
+}
+
+void test_boot_restore_preserves_crit_without_stale_recovery(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_CRIT, TRIGGER_CRIT_EVENT));
+    state_machine_boot_restore_complete();
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, state_machine_get_state());
+    run_task_until_delay(3);
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, state_machine_get_state());
 }
 
 /* ---------- Confinement gates ---------- */
