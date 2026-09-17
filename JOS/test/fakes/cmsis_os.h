@@ -110,6 +110,7 @@ osStatus_t   osDelay(uint32_t ticks);
 #define osFlagsWaitAll    0x00000001U
 #define osFlagsNoClear    0x00000002U
 uint32_t osThreadFlagsWait(uint32_t flags, uint32_t options, uint32_t timeout);
+uint32_t osThreadFlagsClear(uint32_t flags);
 osStatus_t osThreadFlagsSet(osThreadId_t thread_id, uint32_t flags);
 
 /* ---------- Mutexes ---------- */

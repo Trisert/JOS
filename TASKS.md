@@ -106,7 +106,10 @@ Issue aperta: **#54 (HIL)** — richiede hardware. **#49** (grant RedPill-T) chi
   autonomous CRIT logging, radio TX cleanup/RX rearm, post-restore normalization,
   truthful opcode execution verdicts. Seven additional host tests plus native
   radio lifecycle test. See `JOS/docs/qual/direct-review-safety.md` for scope,
-  evidence and remaining integration/HIL limitations. Not merged or flight-qualified.
+  evidence and remaining integration/HIL limitations. PR [#99](https://github.com/Trisert/JOS/pull/99).
+  CodeRabbit follow-up: DIO1-masked mode transitions, stale-event drainage,
+  explicit IRQ routing, failed-start cleanup assertion; five mutation checks.
+  Not merged or flight-qualified; task-level radio serialization remains open.
 
 ## Notes
 

@@ -31,6 +31,51 @@ SX1268   radio(&radioModule);
 #define LORA_FLAG_RX_DONE 0x02U
 
 static osThreadId_t g_tx_wait_handle = NULL;
+enum class DioRoute { Idle, Tx, Rx };
+static volatile DioRoute g_dio_route = DioRoute::Idle;
+
+/* Mask only the dedicated PB0/EXTI0 radio interrupt. SPI DMA and TIM6 must
+ * remain live during RadioLib calls. Never clear pending IRQs on exit: a
+ * completion produced by the newly armed operation belongs to that operation. */
+class Dio1Guard {
+public:
+    Dio1Guard() : enabled(NVIC_GetEnableIRQ(EXTI0_IRQn)) {
+        NVIC_DisableIRQ(EXTI0_IRQn);
+        __DSB();
+        __ISB();
+    }
+    ~Dio1Guard() {
+        if (enabled != 0U) { NVIC_EnableIRQ(EXTI0_IRQn); }
+    }
+    Dio1Guard(const Dio1Guard&) = delete;
+    Dio1Guard& operator=(const Dio1Guard&) = delete;
+private:
+    uint32_t enabled;
+};
+
+/* Only after standby + radio IRQ clear succeeded, BEFORE arming new work.
+ * SX126x::finishReceive() stops the source before clearing its IRQ status;
+ * finishTransmit() alone clears before standby and leaves a race window. */
+static int quiesce_dio1(void)
+{
+    g_dio_route = DioRoute::Idle;
+    int16_t result = radio.finishReceive();
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_INT_Pin);
+    NVIC_ClearPendingIRQ(EXTI0_IRQn);
+    return (result == RADIOLIB_ERR_NONE) ? 0 : -1;
+}
+
+/* Called with DIO1 masked and its old source quiesced. */
+static int arm_receive(void)
+{
+    int16_t result = radio.startReceive();
+    if (result == RADIOLIB_ERR_NONE) {
+        g_dio_route = DioRoute::Rx;
+        return 0;
+    }
+    (void)quiesce_dio1();
+    return -1;
+}
 /* RX task handle, registered by lora_rx_task_create() so the DIO1 ISR can wake
    the correct task on RX_DONE. NULL until the RX task has started. */
 static osThreadId_t g_rx_handle = NULL;
@@ -90,28 +135,41 @@ extern "C" int lora_tx(const uint8_t* data, size_t len)
     if (len > 255U) {
         return -1;
     }
-    g_tx_wait_handle = osThreadGetId();
-    int16_t s = radio.startTransmit(data, (uint8_t)len);  /* async; DIO1 -> TX_DONE */
+    osThreadId_t self = osThreadGetId();
+    if (self == NULL || g_tx_wait_handle != NULL) { return -1; }
+    Dio1Guard guard;
+    if (quiesce_dio1() != 0) { return -1; }
+    if ((osThreadFlagsClear(LORA_FLAG_TX_DONE) & 0x80000000U) != 0U) {
+        return -1;
+    }
+    g_tx_wait_handle = self;
+    int16_t s = radio.startTransmit(data, (uint8_t)len);
     if (s != RADIOLIB_ERR_NONE) {
         (void)radio.finishTransmit();
         g_tx_wait_handle = NULL;
-        (void)radio.startReceive();
+        if (quiesce_dio1() == 0) { (void)arm_receive(); }
         return -1;
     }
+    g_dio_route = DioRoute::Tx;
     return 0;
 }
 
-/* Block the calling task until DIO1 signals TX_DONE (or timeout). */
+/* The TX owner calls once: success OR timeout closes the transfer. */
 extern "C" int lora_tx_wait_done(uint32_t timeout_ms)
 {
+    if (g_tx_wait_handle == NULL || g_tx_wait_handle != osThreadGetId()) {
+        return -1;
+    }
     uint32_t flags = osThreadFlagsWait(LORA_FLAG_TX_DONE, osFlagsWaitAny, timeout_ms);
-    /* Both success and timeout leave TX explicitly, clear its IRQ status,
-     * and restore continuous RX. Otherwise the next uplink cannot wake RX. */
+    Dio1Guard guard;
+    g_dio_route = DioRoute::Idle;
     int16_t finish = radio.finishTransmit();
+    int quiet = quiesce_dio1();
+    uint32_t cleared = osThreadFlagsClear(LORA_FLAG_TX_DONE);
     g_tx_wait_handle = NULL;
-    int16_t receive = radio.startReceive();
+    int receive = (quiet == 0) ? arm_receive() : -1;
     return ((flags == LORA_FLAG_TX_DONE) && (finish == RADIOLIB_ERR_NONE) &&
-            (receive == RADIOLIB_ERR_NONE)) ? 0 : -1;
+            ((cleared & 0x80000000U) == 0U) && (receive == 0)) ? 0 : -1;
 }
 
 extern "C" int lora_rx(uint8_t* buf, size_t* len)
@@ -147,8 +205,10 @@ extern "C" int lora_rx(uint8_t* buf, size_t* len)
 
 extern "C" int lora_start_receive(void)
 {
-    int16_t s = radio.startReceive();
-    return (s == RADIOLIB_ERR_NONE) ? 0 : -1;
+    if (g_tx_wait_handle != NULL) { return -1; }
+    Dio1Guard guard;
+    if (quiesce_dio1() != 0) { return -1; }
+    return arm_receive();
 }
 
 /*
@@ -158,11 +218,11 @@ extern "C" int lora_start_receive(void)
  */
 extern "C" void lora_on_dio1_irq(void)
 {
-    /* Heuristic: if a TX is pending, it's TX_DONE; else assume RX_DONE.
-       A tighter check would read the SX1268 IRQ status register. */
-    if (g_tx_wait_handle != NULL) {
+    /* No SPI from ISR. Idle suppresses callbacks during failed transitions;
+     * the task publishes routing only after the new mode is armed. */
+    if (g_dio_route == DioRoute::Tx && g_tx_wait_handle != NULL) {
         osThreadFlagsSet(g_tx_wait_handle, LORA_FLAG_TX_DONE);
-    } else if (g_rx_handle != NULL) {
+    } else if (g_dio_route == DioRoute::Rx && g_rx_handle != NULL) {
         osThreadFlagsSet(g_rx_handle, LORA_FLAG_RX_DONE);
     }
 }
