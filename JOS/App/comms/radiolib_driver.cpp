@@ -5,7 +5,10 @@
  *   lora_init(), lora_tx(), lora_rx(), lora_tx_wait_done(), lora_on_dio1_irq().
  *
  * Ported/adapted from Marco-42/RedPill-T (satellite/stm32_lora/Core/Src/COMMS.cpp).
- * See radiohal.h for licensing + pin-mapping notes.
+ * SPDX-License-Identifier: MIT
+ * RedPill-T provenance is retained; the source is under common project-owner
+ * control and this JOS adaptation is covered by the repository MIT License.
+ * See radiolib_hal.h for the full provenance and pin-mapping note.
  *
  * LoRa params match SPF v3 Table 3.28 + RedPill-T: 436 MHz, BW125, SF10, CR4/8
  * (RadioLib cr=8 is the direct denominator: SX1268.h:36, codingRate reg=cr-4),

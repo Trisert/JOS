@@ -6,12 +6,14 @@
  *
  * Ported from Marco-42/RedPill-T (satellite/stm32_lora/Core/Inc/STM32Hal.h),
  * adapted for JOS (Trisert/JOS, STM32L496VGTX).
+ * SPDX-License-Identifier: MIT
  *
- * PROVENANCE / LICENSING NOTE (DO NOT IGNORE):
- *   RedPill-T is published on GitHub WITHOUT an explicit license ("license: null"
- *   on the repo metadata) => default "all rights reserved". Vendoring this adapter
- *   into a flight OBSW requires an explicit grant or license alignment with JOS.
- *   Tracked in redpill/jos-radiolib-plan (gbrain).
+ * PROVENANCE / LICENSING NOTE:
+ *   RedPill-T provenance is retained for traceability. The RedPill-T source
+ *   and JOS are under common project-owner control; this JOS adaptation is
+ *   distributed under the repository MIT License (see LICENSE), with no
+ *   third-party permission dependency. Keep the provenance note when
+ *   moving or splitting this adapter.
  *
  * PIN MAPPING — JOS uses a SEPARATE COMMS board (LoRa1268F30 module) wired to the
  * OBC through a 20-pin connector. Signal names are from RED_SPF_V3 (pag 90/95).

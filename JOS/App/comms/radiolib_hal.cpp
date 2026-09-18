@@ -2,7 +2,10 @@
  * radiohal.cpp — STM32 HAL adapter implementation for RadioLib.
  *
  * Ported from Marco-42/RedPill-T (satellite/stm32_lora/Core/Src/STM32Hal.cpp),
- * adapted for JOS. See radiohal.h for licensing + pin-mapping notes.
+ * adapted for JOS. SPDX-License-Identifier: MIT
+ * RedPill-T provenance is retained; this JOS adaptation is covered by the
+ * repository MIT License under common project-owner control. See radiolib_hal.h
+ * for the full provenance and pin-mapping note.
  *
  * SPI uses REAL DMA: HAL_SPI_TransmitReceive_DMA on SPI1 (DMA1 Channel2 RX /
  * Channel3 TX, CSELR mapping per RM0351 Table 46 — STM32L496 has no DMAMUX),
