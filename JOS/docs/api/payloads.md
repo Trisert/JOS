@@ -9,8 +9,13 @@ trigger ArduCam (camera MCU) for transmittance, read photodiode pairs
 ## CLOUD (`cloud.c`)
 
 Sub-mm debris sensor: 16 copper resistive stripes × 2 faces (+Y/−Y).
-`cloud_acquire()` reads 16-bit stripe word via SPI1, writes 16×2 matrix
-(boolean + 32-bit timestamp) to FRAM on breach only.
+`cloud_acquire()` samples both faces under the shared SPI1 ownership lock,
+releases that lock before breach calculation and the FRAM cyclic-buffer write,
+and writes the 16×2 matrix (boolean + 32-bit timestamp) only when a new breach
+is found. `last_sample` is the historical state: an ongoing breach retains its
+first-breach timestamp and is not counted again. The CLOUD task is not called
+from production `main()` yet; this API and its host test do not prove payload
+hardware wiring or flight integration.
 
 ## CLEAR (`clear.c`)
 

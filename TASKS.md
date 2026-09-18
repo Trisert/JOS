@@ -101,6 +101,29 @@ Issue aperta: **#54 (HIL)** — richiede hardware. **#49** (grant RedPill-T) chi
 
 ## Direct review follow-up
 
+- **Task-level radio ownership concurrency fix** (`fix/radio-task-ownership`,
+  based on PR99 `3aeba90`): statically allocated priority-inheritance mutexes
+  serialize radio state and physical SPI1 access; async TX retains explicit
+  ownership through completion, while RX/read/rearm and competing TX callers
+  fail closed on bounded acquisition. Guard teardown precedes mutex release;
+  failed HAL bus acquisition cannot assert radio CS or use SPI; failed radio
+  initialization remains unready until an explicit retry; CLOUD releases the
+  SPI1 lock before calculations and I2C FRAM persistence. Native adversarial
+  production-driver tests cover re-entry, RX-during-TX, non-owner completion,
+  error cleanup, IRQ restoration at the release boundary, and mutex-init/readiness
+  failures. Evidence: `make -C JOS/test native` and `make -C JOS test`.
+  Remaining limit: the real HAL refusal path and multi-device electrical bus
+  behavior still require target/HIL verification; native lifecycle doubles do
+  not prove STM32 DMA or CS electrical timing.
+
+- **CLOUD independent-review fixes** (2026-09-17): `cloud_acquire()` now keeps
+  the SPI1 ownership window limited to ADC transfers and uses the existing
+  static `last_sample` for first-breach history, so ongoing breaches retain
+  their original timestamp and are not recounted. Focused native regression:
+  `JOS/test/native/test_cloud.c`. The CLOUD task remains unwired from
+  production `main()`; no protocol or hardware assignment was added. Target
+  and HIL verification of the ADC, face selection and FRAM path remain open.
+
 - **In review — R1–R6 safety corrections** (`fix/direct-review-safety`): validity
   gate for READY→ACTIVE, storage-independent low-battery containment, no repeated
   autonomous CRIT logging, radio TX cleanup/RX rearm, post-restore normalization,
@@ -110,6 +133,9 @@ Issue aperta: **#54 (HIL)** — richiede hardware. **#49** (grant RedPill-T) chi
   CodeRabbit follow-up: DIO1-masked mode transitions, stale-event drainage,
   explicit IRQ routing, failed-start cleanup assertion; five mutation checks.
   Not merged or flight-qualified; task-level radio serialization remains open.
+
+*Task-level radio ownership update: 2026-09-17 — see the direct review
+follow-up entry above; the older board footer remains historical context.*
 
 ## Notes
 

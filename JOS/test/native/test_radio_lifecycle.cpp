@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include "cmsis_os.h"
 #define RLIB_NSS 0
 #define RLIB_RESET 1
@@ -20,10 +21,14 @@
 #define LoRa_Busy_Pin 4
 #define GPIO_PIN_SET 1
 #define RADIOLIB_ERR_NONE 0
+#define SPI_XFER_OK 0
 extern "C" void lora_on_dio1_irq(void);
+extern "C" int lora_rx(uint8_t*, size_t*);
 #define EXTI0_IRQn 6
 static bool irq_enabled=true, exti_pending=false, nvic_pending=false;
 static bool late_finish=false, immediate_tx=false, immediate_rx=false;
+static bool reentrant_rx=false;
+static int reentrant_rx_result=0;
 static unsigned rx_notifications=0;
 static void deliver_irq() {
  if(irq_enabled && (nvic_pending || exti_pending)) {
@@ -46,15 +51,18 @@ public:
  void addPin(int,int,int) {}
  void configureResetPin() {}
  void pulseReset() {}
+ void spiClearError() {}
+ unsigned spiLastError() { return 0; }
 };
 class Module { public: Module(STM32Hal*,int,int,int,int) {} };
 class SX1268 {
 public:
  enum Mode { Sleep, Rx, Tx, Standby } mode=Sleep;
  int tx_error=0, finish_error=0, rx_error=0, quiet_error=0;
+ int begin_error=0;
  unsigned finishes=0, receives=0;
  explicit SX1268(Module*) {}
- int begin(float,float,int,int,int,int,int,float,bool) { return 0; }
+ int begin(float,float,int,int,int,int,int,float,bool) { return begin_error; }
  int sleep() { mode=Sleep; return 0; }
  int startTransmit(const uint8_t*,uint8_t) {
   mode=Tx; if(immediate_tx) dio_edge(); return tx_error;
@@ -62,11 +70,41 @@ public:
  int finishTransmit() {
   ++finishes; if(late_finish) dio_edge(); mode=Standby; return finish_error;
  }
- int finishReceive() { mode=Standby; return quiet_error; }
+ int finishReceive() {
+  mode=Standby;
+  if(reentrant_rx) { uint8_t b=0; size_t n=1; reentrant_rx_result=lora_rx(&b,&n); }
+  return quiet_error;
+ }
  int startReceive() { ++receives; mode=Rx; if(immediate_rx) dio_edge(); return rx_error; }
  size_t getPacketLength() { return 1; }
  int readData(uint8_t*,size_t) { return 0; }
 };
+static int mutex_new_calls=0, mutex_fail_call=0;
+static bool radio_mutex_taken=false, bus_mutex_taken=false;
+static bool check_release_irq=false, expected_irq_at_release=true;
+static osMutexId_t radio_mutex_id=(void*)3, bus_mutex_id=(void*)4;
+static osKernelState_t kernel_state=osKernelRunning;
+osKernelState_t osKernelGetState() { return kernel_state; }
+osMutexId_t osMutexNew(const osMutexAttr_t *attr) {
+ assert(attr != nullptr && attr->cb_mem != nullptr);
+ assert((attr->attr_bits & osMutexPrioInherit) != 0U);
+ assert(attr->cb_size == sizeof(StaticSemaphore_t));
+ ++mutex_new_calls;
+ if (mutex_new_calls == mutex_fail_call) return nullptr;
+ return (mutex_new_calls == 1) ? radio_mutex_id : bus_mutex_id;
+}
+osStatus_t osMutexAcquire(osMutexId_t id, uint32_t) {
+ bool *taken = (id == radio_mutex_id) ? &radio_mutex_taken : &bus_mutex_taken;
+ if (*taken) return osErrorTimeout;
+ if (id == radio_mutex_id) expected_irq_at_release=irq_enabled;
+ *taken=true; return osOK;
+}
+osStatus_t osMutexRelease(osMutexId_t id) {
+ bool *taken = (id == radio_mutex_id) ? &radio_mutex_taken : &bus_mutex_taken;
+ if (!*taken) return osErrorResource;
+ if (id == radio_mutex_id && check_release_irq) assert(irq_enabled == expected_irq_at_release);
+ *taken=false; return osOK;
+}
 /* Stateful thread-flag double: flags persist until consumed by a matching
  * wait, exactly like CMSIS-RTOS2. This is what makes a DIO1 that races the
  * wait timeout observable: the flag it set survives into the next transmit. */
@@ -101,11 +139,47 @@ uint32_t osThreadFlagsWait(uint32_t want,uint32_t,uint32_t) {
  return 0xFFFFFFFEu; /* matches no single flag bit: timeout */
 }
 #include "../../App/comms/radiolib_driver.cpp"
-int main() {
+int main(int argc, char **argv) {
+ if ((argc > 1) && (std::strcmp(argv[1], "init-fail") == 0)) {
+  mutex_fail_call=2;
+  assert(lora_init()==-1);
+  assert(mutex_new_calls==2 && !radio_mutex_taken && !bus_mutex_taken);
+  mutex_fail_call=0;
+  assert(lora_init()==0);
+  assert(mutex_new_calls==3); /* the successful static control block was retained */
+  puts("radio lifecycle: static mutex init failure FAIL-CLOSED PASS");
+  return 0;
+ }
+ if ((argc > 1) && (std::strcmp(argv[1], "radio-fail") == 0)) {
+  radio.begin_error=-1;
+  assert(lora_init()==-1);
+  radio.begin_error=0;
+  uint8_t failed_byte=0;
+  assert(lora_start_receive()==-1);
+  assert(lora_tx(&failed_byte,1)==-1);
+  assert(lora_init()==0); /* explicit retry is the recovery path */
+  assert(lora_start_receive()==0);
+  puts("radio lifecycle: failed begin readiness latch and retry PASS");
+  return 0;
+ }
  uint8_t byte=0;
  assert(lora_init()==0);
  lora_rx_task_register(rx_sentinel);
+ /* Every radio-operation mutex release must restore the caller's IRQ state,
+  * including TX finish/error cleanup and callers that entered disabled. */
+ check_release_irq=true;
  assert(lora_start_receive()==0);
+
+ /* Model a higher-priority waiter becoming runnable at mutex release. */
+ assert(lora_start_receive()==0);
+
+ /* Quiesce/readData re-entry is an adversarial stand-in for another task
+  * being scheduled at the transition boundary. The radio operation mutex
+  * refuses the nested read before it reaches RadioLib. */
+ reentrant_rx=true;
+ assert(lora_start_receive()==0);
+ assert(reentrant_rx_result==-1);
+ reentrant_rx=false;
 
  /* TX success: DIO1 completes it; teardown restores RX. */
  assert(lora_tx(&byte,1)==0);
@@ -124,6 +198,23 @@ int main() {
  assert(lora_tx(&byte,1)==-1);
  assert(radio.finishes==3 && radio.mode==SX1268::Rx);
  radio.tx_error=0;
+
+ /* The async TX owns the radio operation mutex until its matching wait. A
+  * competing TX and RX/readData therefore fail without touching RadioLib. */
+ assert(lora_tx(&byte,1)==0);
+ unsigned finishes_before=radio.finishes;
+ assert(lora_tx(&byte,1)==-1);
+ size_t rx_len=1;
+ assert(lora_rx(&byte,&rx_len)==-1);
+ assert(radio.finishes==finishes_before);
+ assert(lora_tx_wait_done(2000)==-1);
+
+ /* A non-owner cannot close another task's async transfer. */
+ assert(lora_tx(&byte,1)==0);
+ osThreadId_t saved=self; self=(void*)9;
+ assert(lora_tx_wait_done(2000)==-1);
+ self=saved;
+ assert(lora_tx_wait_done(2000)==-1);
 
  /* finishTransmit failure is reported, RX still re-armed. */
  radio.finish_error=-1;
@@ -163,8 +254,9 @@ int main() {
  irq_enabled=false; dio_edge(); thread_flags=1;
  assert(lora_tx(&byte,1)==0);
  assert(!irq_enabled && !exti_pending && !nvic_pending && thread_flags==0);
- NVIC_EnableIRQ(EXTI0_IRQn);
  assert(lora_tx_wait_done(2000)==-1);
+ assert(!irq_enabled);
+ NVIC_EnableIRQ(EXTI0_IRQn);
 
  /* A new completion before startTransmit returns must NOT be discarded. */
  immediate_tx=true;

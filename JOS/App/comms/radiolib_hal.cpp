@@ -17,6 +17,7 @@
 
 #include "radiolib_hal.h"
 #include "spi_dma_sched.h"
+#include "radio_ownership.h"
 
 /* DMA completion state, written by the ISR callbacks below, read by the
  * waiting spiTransfer(). Plain volatile bytes: single-writer (ISR) /
@@ -60,7 +61,8 @@ void STM32Hal::spiClearError(void)
 
 STM32Hal::STM32Hal(SPI_HandleTypeDef* spiHandle)
     : RadioLibHal(/*input*/1, /*output*/0, /*low*/0, /*high*/1, /*rising*/2, /*falling*/3),
-      _spi(spiHandle)
+      _spi(spiHandle),
+      _bus_locked(false)
 {
     for (int i = 0; i < MAX_PINS; i++) {
         _pinMap[i].port = nullptr;
@@ -102,6 +104,10 @@ void STM32Hal::pinMode(uint32_t pin, uint32_t mode)
 
 void STM32Hal::digitalWrite(uint32_t pin, uint32_t value)
 {
+    /* Do not select the radio after a refused physical-bus acquisition. */
+    if ((pin == RLIB_NSS) && (value == 0U) && !_bus_locked) {
+        return;
+    }
     Stm32Pin* p = getStmPin(pin);
     if (p == nullptr || p->port == nullptr) {
         return;
@@ -132,6 +138,11 @@ void STM32Hal::spiEnd()          { /* nothing to release */ }
 
 void STM32Hal::spiBeginTransaction()
 {
+    _bus_locked = (lora_spi_bus_acquire(RADIO_OWNERSHIP_TIMEOUT_TICKS) == 0);
+    if (!_bus_locked) {
+        s_spi_last_error = (uint32_t)SPI_XFER_DMA_START;
+        return;
+    }
     /* One-time init: MX_SPI1_Init() already configured the peripheral at
      * boot; re-running HAL_SPI_Init() (hence MspInit: HAL_DMA_Init + NVIC)
      * on every transaction is racy against an in-flight transfer (a
@@ -142,7 +153,14 @@ void STM32Hal::spiBeginTransaction()
     }
 }
 
-void STM32Hal::spiEndTransaction() { /* CS de-asserted by RadioLib after xfer */ }
+void STM32Hal::spiEndTransaction()
+{
+    /* CS is de-asserted by RadioLib before this callback. */
+    if (_bus_locked) {
+        lora_spi_bus_release();
+        _bus_locked = false;
+    }
+}
 
 /* Decode the programmed BaudRatePrescaler to its divisor (RM0351 §40.4.2). */
 static uint32_t spi_presc_div(uint32_t prescaler)
@@ -162,7 +180,13 @@ static uint32_t spi_presc_div(uint32_t prescaler)
 
 void STM32Hal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
 {
-    if (_spi == nullptr || out == nullptr || in == nullptr) {
+    if (!_bus_locked || _spi == nullptr || out == nullptr || in == nullptr) {
+        if (in != nullptr) {
+            for (size_t i = 0U; i < len; i++) { in[i] = 0U; }
+        }
+        if (!_bus_locked) {
+            s_spi_last_error = (uint32_t)SPI_XFER_DMA_START;
+        }
         return;
     }
     if (len == 0U) {
@@ -175,9 +199,8 @@ void STM32Hal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
     const uint32_t pclk  = HAL_RCC_GetPCLK2Freq();
     const uint32_t div   = spi_presc_div(_spi->Init.BaudRatePrescaler);
     size_t         done  = 0U;
-    bool           failed = false;
 
-    while ((done < len) && !failed) {
+    while (done < len) {
         size_t   left  = len - done;
         uint32_t chunk = (left > (size_t)SPI_DMA_MAX_CHUNK)
                          ? (uint32_t)SPI_DMA_MAX_CHUNK : (uint32_t)left;
@@ -188,7 +211,6 @@ void STM32Hal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
         if (HAL_SPI_TransmitReceive_DMA(_spi, &out[done], &in[done],
                                         (uint16_t)chunk) != HAL_OK) {
             s_spi_last_error = (uint32_t)SPI_XFER_DMA_START;
-            failed = true;
             break;
         }
         /* Sleep until the DMA IRQ (or the TIM6 tick) wakes us; the tick
@@ -212,15 +234,11 @@ void STM32Hal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
             s_spi_last_error = (s_dma_state == 3U)
                                ? (uint32_t)SPI_XFER_DMA_ERROR
                                : (uint32_t)SPI_XFER_DMA_TIMEOUT;
-            failed = true;
             break;
         }
         done += chunk;
     }
     s_dma_state = 0U;
-    if (!failed) {
-        s_spi_last_error = (uint32_t)SPI_XFER_OK;
-    }
 }
 
 /* ----------------------------- Time ----------------------------- */

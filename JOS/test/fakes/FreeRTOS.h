@@ -17,6 +17,9 @@ typedef long     BaseType_t;
 /* 32 bits, matching the flight target: the host's native `unsigned long`
    would be 64 bits wide and CMock would compare the wrong width. */
 typedef uint32_t UBaseType_t;
+typedef struct {
+    uint8_t opaque[80];
+} StaticSemaphore_t;
 
 #define pdTRUE                  ((BaseType_t)1)
 #define pdFALSE                 ((BaseType_t)0)

@@ -54,6 +54,33 @@ No mid-sequence watchdog kick is needed: the task is monitored against its
 1..16 min cadence and flagged only after 3× the period (≥ 3 min), so the block
 sits two orders of magnitude inside the monitor window.
 
+## Task-level ownership
+
+`radioOp` is a statically allocated, priority-inheritance RTOS mutex created
+by `lora_init()` before task creation. TX holds it from `lora_tx()` through the
+owner-only `lora_tx_wait_done()` cleanup; RX/read/rearm and competing TX calls
+use the same mutex with a bounded 10 ms acquisition (10 RTOS ticks at the
+configured 1 kHz tick rate) and refuse on failure.
+DIO1 ISRs never acquire it or perform SPI.
+
+SPI1 physical-bus ownership is a separate statically allocated mutex. The
+RadioLib HAL holds it only for one SPI transaction, and the CLOUD task holds
+it only while sampling the ADC faces; calculations and the subsequent I2C FRAM
+write occur after release. This covers the first-party SPI1 users
+currently present; any future SPI1 device must use the exported
+`lora_spi_bus_acquire()` / `lora_spi_bus_release()` pair. DMA and TIM6 are not
+masked. The mutexes are initialized before `osKernelInitialize()` because the
+existing boot sequence initializes the radio before the scheduler and creates
+tasks only afterward; pre-scheduler initialization is single-threaded.
+`cloud_init()` is a boot-only ADC setup/baseline path, but the current
+production `main()` does not call `cloud_init()` or create the CLOUD task. If
+CLOUD is integrated later, its initialization must remain before concurrent
+tasks and its sampling path must use the exported bus lock.
+
+The supplied UML (`SW_OBC.mdj`, Activity1) records SPI mutual-exclusion intent
+but does not define this complete algorithm. HIL validation of concurrent
+STM32/SX1268/DMA behavior remains open.
+
 ## Downlink Packet Types
 
 `ACK` (8 B), `NACK` (8 B), `BEACON` (128 B), `TELEMETRY` (var),

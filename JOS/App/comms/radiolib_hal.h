@@ -58,8 +58,8 @@ extern SPI_HandleTypeDef hspi1;
 
 /* spiTransfer() outcome codes (spiLastError()). A failed chunk is
  * zero-filled in in[] so RadioLib never parses a half-shifted frame as
- * valid; the code tells ground WHY. Cleared on the next fully successful
- * transfer or via spiClearError(). */
+ * valid; the code tells ground WHY. Errors are sticky across later successful
+ * transfers and clear only via spiClearError(). */
 enum SpiXferStatus {
     SPI_XFER_OK         = 0,   /* last transfer (or all chunks) complete */
     SPI_XFER_DMA_START  = 1,   /* TransmitReceive_DMA refused (HAL_BUSY/ERR) */
@@ -124,6 +124,7 @@ public:
 
 private:
     SPI_HandleTypeDef* _spi;
+    bool               _bus_locked;
     static const int   MAX_PINS = 8;
     Stm32Pin           _pinMap[MAX_PINS];
     Stm32Pin* getStmPin(uint32_t pinId);
