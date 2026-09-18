@@ -11,11 +11,14 @@
  * TWO DIFFERENT THINGS are pinned here, and the tests keep them apart:
  *   - AOCS_STATUS, the 4-valued SUBSYSTEM STATE from SW_DATA_TYPES.xlsx
  *     (OFF, DET, POINTING, FAULT, 2 bit in the beacon STATUS byte);
+ *     the source names the states but does not assign numeric wire codes.
  *   - T_AOCS_MODE, the 2-valued TELEMETRY field from the SPF (0/1), plus
  *     the explicit 4->2 projection that maps the two OFF/FAULT states down.
  *
- * These assertions deliberately restate the literals rather than referencing
- * the macros on both sides: comparing a macro to itself proves nothing.
+ * These assertions deliberately restate the SPF literals rather than
+ * referencing the macros on both sides: comparing a macro to itself proves
+ * nothing. AOCS_STATUS tests below check only source-pinned width/state
+ * coverage and keep the current enum order visibly provisional.
  *
  * The AOCS DRIVER is not tested here because it does not exist: the SPI
  * frame format is not specified in the delivered documentation (see the
@@ -52,25 +55,32 @@ void test_aocs_mode_telemetry_codes_are_two_valued(void)
 }
 
 /* AOCS_STATUS is a FOUR-valued state, not the 2-valued telemetry field. The
- * codes are pinned as literals because they are what lands in the beacon
- * STATUS byte (bits 3..4): reordering this enum silently changes the wire
- * encoding of the subsystem state, and a missing FAULT is what this whole
- * correction is about. */
-void test_aocs_status_has_four_states_with_specified_codes(void)
+ * source names the four states and assigns a 2-bit field, but does not assign
+ * numeric wire codes. Keep this test about coverage/range rather than making
+ * the current 0..3 declaration look like a released encoding. */
+void test_aocs_status_has_four_distinct_in_range_states(void)
 {
-    TEST_ASSERT_EQUAL_UINT32(0U, AOCS_STATE_OFF);
-    TEST_ASSERT_EQUAL_UINT32(1U, AOCS_STATE_DET);
-    TEST_ASSERT_EQUAL_UINT32(2U, AOCS_STATE_POINTING);
-    TEST_ASSERT_EQUAL_UINT32(3U, AOCS_STATE_FAULT);
+    TEST_ASSERT_TRUE(AOCS_STATE_OFF < (1U << AOCS_STATUS_BITS));
+    TEST_ASSERT_TRUE(AOCS_STATE_DET < (1U << AOCS_STATUS_BITS));
+    TEST_ASSERT_TRUE(AOCS_STATE_POINTING < (1U << AOCS_STATUS_BITS));
+    TEST_ASSERT_TRUE(AOCS_STATE_FAULT < (1U << AOCS_STATUS_BITS));
+    TEST_ASSERT_NOT_EQUAL_UINT32(AOCS_STATE_OFF, AOCS_STATE_DET);
+    TEST_ASSERT_NOT_EQUAL_UINT32(AOCS_STATE_OFF, AOCS_STATE_POINTING);
+    TEST_ASSERT_NOT_EQUAL_UINT32(AOCS_STATE_OFF, AOCS_STATE_FAULT);
+    TEST_ASSERT_NOT_EQUAL_UINT32(AOCS_STATE_DET, AOCS_STATE_POINTING);
+    TEST_ASSERT_NOT_EQUAL_UINT32(AOCS_STATE_DET, AOCS_STATE_FAULT);
+    TEST_ASSERT_NOT_EQUAL_UINT32(AOCS_STATE_POINTING, AOCS_STATE_FAULT);
 }
 
-/* AOCS_STATUS is exactly 2 bits (SW_DATA_TYPES.xlsx), so the four states are
- * the whole space and FAULT must fit without spilling into the OBC_STATUS
- * bits that follow it in the same beacon byte. */
+/* AOCS_STATUS is exactly 2 bits (SW_DATA_TYPES.xlsx), so four distinct
+ * implementation states must fit in that field. Numeric wire codes remain
+ * unassigned by the source set. */
 void test_aocs_status_is_two_bits_and_covers_all_four_states(void)
 {
     TEST_ASSERT_EQUAL_UINT32(2U, AOCS_STATUS_BITS);
-    TEST_ASSERT_EQUAL_UINT32(3U, AOCS_STATE_FAULT);   /* 0b11 */
+    TEST_ASSERT_TRUE(AOCS_STATE_OFF < (1U << AOCS_STATUS_BITS));
+    TEST_ASSERT_TRUE(AOCS_STATE_DET < (1U << AOCS_STATUS_BITS));
+    TEST_ASSERT_TRUE(AOCS_STATE_POINTING < (1U << AOCS_STATUS_BITS));
     TEST_ASSERT_TRUE(AOCS_STATE_FAULT < (1U << AOCS_STATUS_BITS));
 }
 
@@ -91,10 +101,10 @@ void test_aocs_status_hb_bit_range_matches_width(void)
  * POINTING. */
 void test_aocs_state_to_tlm_mode_projection_table(void)
 {
-    TEST_ASSERT_EQUAL_UINT32(0U, aocs_state_to_tlm_mode((aocs_state_t)0)); /* OFF */
-    TEST_ASSERT_EQUAL_UINT32(0U, aocs_state_to_tlm_mode((aocs_state_t)1)); /* DET */
-    TEST_ASSERT_EQUAL_UINT32(1U, aocs_state_to_tlm_mode((aocs_state_t)2)); /* POINTING */
-    TEST_ASSERT_EQUAL_UINT32(0U, aocs_state_to_tlm_mode((aocs_state_t)3)); /* FAULT */
+    TEST_ASSERT_EQUAL_UINT32(0U, aocs_state_to_tlm_mode(AOCS_STATE_OFF));
+    TEST_ASSERT_EQUAL_UINT32(0U, aocs_state_to_tlm_mode(AOCS_STATE_DET));
+    TEST_ASSERT_EQUAL_UINT32(1U, aocs_state_to_tlm_mode(AOCS_STATE_POINTING));
+    TEST_ASSERT_EQUAL_UINT32(0U, aocs_state_to_tlm_mode(AOCS_STATE_FAULT));
 }
 
 /* Explicitly: FAULT and OFF are never reported as Nadir-Pointing. If this
@@ -113,20 +123,19 @@ void test_aocs_fault_and_off_never_report_nadir_pointing(void)
  * NOT recoverable from T_AOCS_MODE (read AOCS_STATUS instead). */
 void test_aocs_tlm_mode_to_state_is_two_valued_only(void)
 {
-    TEST_ASSERT_EQUAL_UINT32(1U, aocs_tlm_mode_to_state(0U)); /* -> DET */
-    TEST_ASSERT_EQUAL_UINT32(2U, aocs_tlm_mode_to_state(1U)); /* -> POINTING */
-    TEST_ASSERT_NOT_EQUAL_UINT32(3U, aocs_tlm_mode_to_state(0U)); /* never FAULT */
-    TEST_ASSERT_NOT_EQUAL_UINT32(3U, aocs_tlm_mode_to_state(1U));
+    TEST_ASSERT_EQUAL_UINT32(AOCS_STATE_DET, aocs_tlm_mode_to_state(0U));
+    TEST_ASSERT_EQUAL_UINT32(AOCS_STATE_POINTING, aocs_tlm_mode_to_state(1U));
+    TEST_ASSERT_NOT_EQUAL_UINT32(AOCS_STATE_FAULT, aocs_tlm_mode_to_state(0U));
+    TEST_ASSERT_NOT_EQUAL_UINT32(AOCS_STATE_FAULT, aocs_tlm_mode_to_state(1U));
 }
 
-/* Out-of-range state bytes. aocs_state_t only names 0..3, but the function
- * takes the enum by value, so a corrupted or uninitialised caller can pass
- * any integer 4..255. That is exactly what the `default:` arm of the switch
- * is for — and until this test it was never exercised (guaranteed by the
- * code, not demonstrated by the tests). An unknown state must fall back to
- * DETUMBLING (0), never to Nadir-Pointing: reporting a state we do not
- * recognise as "under control" is the failure this whole correction exists
- * to prevent. */
+/* Out-of-range state values. aocs_state_t names four states in a 2-bit
+ * field; any value at or above that field's range is unknown. That is exactly
+ * what the `default:` arm of the switch is for — and until this test it was
+ * never exercised (guaranteed by the code, not demonstrated by the tests).
+ * An unknown state must fall back to DETUMBLING (0), never to Nadir-Pointing:
+ * reporting a state we do not recognise as "under control" is the failure this
+ * whole correction exists to prevent. */
 void test_aocs_state_to_tlm_mode_out_of_range_falls_back_to_detumbling(void)
 {
     TEST_ASSERT_EQUAL_UINT32(0U, aocs_state_to_tlm_mode((aocs_state_t)4));
@@ -142,10 +151,10 @@ void test_aocs_state_to_tlm_mode_out_of_range_falls_back_to_detumbling(void)
  * implicit `else` arm of the ternary, untested until now. */
 void test_aocs_tlm_mode_to_state_out_of_range_falls_back_to_det(void)
 {
-    TEST_ASSERT_EQUAL_UINT32(1U, aocs_tlm_mode_to_state(2U));
-    TEST_ASSERT_EQUAL_UINT32(1U, aocs_tlm_mode_to_state(255U));
-    TEST_ASSERT_NOT_EQUAL_UINT32(2U, aocs_tlm_mode_to_state(2U));
-    TEST_ASSERT_NOT_EQUAL_UINT32(2U, aocs_tlm_mode_to_state(255U));
+    TEST_ASSERT_EQUAL_UINT32(AOCS_STATE_DET, aocs_tlm_mode_to_state(2U));
+    TEST_ASSERT_EQUAL_UINT32(AOCS_STATE_DET, aocs_tlm_mode_to_state(255U));
+    TEST_ASSERT_NOT_EQUAL_UINT32(AOCS_STATE_POINTING, aocs_tlm_mode_to_state(2U));
+    TEST_ASSERT_NOT_EQUAL_UINT32(AOCS_STATE_POINTING, aocs_tlm_mode_to_state(255U));
 }
 
 /* T_ANGULAR_RATE — position 21, 6 B = 3 axes x 2 B, signed. The internal
