@@ -35,7 +35,9 @@ Semtech SX1268 on SPI1.
 
 `RESET`, `EXIT_STATE`, `SET_CONFIG`, `SET_DOWNLINK`, `SEND_CONFIG`,
 `SEND_DATA`, `SEND_TELEMETRY`, `ACTIVATE_PAYLOAD`. Each packet may carry a
-set-delay field for out-of-view scheduling.
+set-delay field for out-of-view scheduling. `SET_CONFIG` and `SEND_DATA` are
+currently reserved but rejected by the dispatcher as `UNSUPPORTED`; their
+hardware/protocol execution contracts are not implemented yet.
 
 ## Downlink framing
 

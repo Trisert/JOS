@@ -22,7 +22,7 @@ Scope: findings R1–R6 from the direct review of `7f0aabd`.
 
 ## Verification
 
-Existing host suite plus seven new tests: 411 tests. The state-machine tests
+Existing host suite plus seven new tests: 412 tests. The state-machine tests
 exercise validity, the 79/80 threshold boundary, failed Flash containment,
 repeated low-battery loops and the post-restore normalization API. SEU itself
 is target-only in this suite: full physical restore/first-scrub behavior still
