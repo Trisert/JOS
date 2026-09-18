@@ -1011,17 +1011,21 @@ void lora_rx_task(void *arg)
     /* Tell the driver which task to wake on RX_DONE. */
     lora_rx_task_register(osThreadGetId());
 
-    /* Arm continuous RX so the DIO1 IRQ fires on the next downlink. */
-    (void)lora_start_receive();
+    /* Arm continuous RX so the DIO1 IRQ fires on the next downlink. A failed
+       arm is not liveness: keep retrying at the poll cadence, but let the
+       watchdog see the task as unhealthy until the receiver is armed again. */
+    bool rx_armed = (lora_start_receive() == 0);
 
     for (;;) {
         /* Block on the DIO1 RX_DONE flag (with timeout) and kick the watchdog
            inside the loop so the blocking wait never arms a false 'hung' flag.
            The 100 ms poll granularity keeps the monitor happy. */
         uint32_t flags = osThreadFlagsWait(LORA_RX_FLAG, osFlagsWaitAny, 100U);
-        watchdog_alive_self();
+        if (rx_armed) {
+            watchdog_alive_self();
+        }
 
-        if (flags == LORA_RX_FLAG) {
+        if ((flags == LORA_RX_FLAG) && rx_armed) {
             size_t rx_len = 0U;
             uint8_t *rx = comms_rx_buffer(&rx_len);
 
@@ -1043,7 +1047,14 @@ void lora_rx_task(void *arg)
             }
 
             /* Re-arm RX for the next frame. */
-            (void)lora_start_receive();
+            rx_armed = (lora_start_receive() == 0);
+        }
+
+        if (!rx_armed) {
+            /* A timeout also provides the retry cadence when boot arm or a
+               post-frame rearm failed. Until this succeeds, the task does not
+               report liveness and the watchdog remains the recovery path. */
+            rx_armed = (lora_start_receive() == 0);
         }
     }
 }

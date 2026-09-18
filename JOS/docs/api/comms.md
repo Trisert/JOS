@@ -61,7 +61,10 @@ by `lora_init()` before task creation. TX holds it from `lora_tx()` through the
 owner-only `lora_tx_wait_done()` cleanup; RX/read/rearm and competing TX calls
 use the same mutex with a bounded 10 ms acquisition (10 RTOS ticks at the
 configured 1 kHz tick rate) and refuse on failure.
-DIO1 ISRs never acquire it or perform SPI.
+DIO1 ISRs never acquire it or perform SPI. The boot path records the `lora_init()`
+result and does not create the beacon task after an init failure; the RX task
+retries receive arming and withholds watchdog liveness until the receiver is
+armed, so persistent failure remains fail-closed for watchdog recovery.
 
 SPI1 physical-bus ownership is a separate statically allocated mutex. The
 RadioLib HAL holds it only for one SPI transaction, and the CLOUD task holds

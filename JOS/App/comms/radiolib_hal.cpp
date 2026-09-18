@@ -27,6 +27,7 @@
 namespace {
 volatile uint8_t s_dma_state = 0U;   /* 0 idle, 1 busy, 2 done, 3 error */
 volatile uint32_t s_spi_last_error = 0U;
+volatile bool s_spi_abort_failed = false;
 }
 
 /* HAL callbacks: C linkage, SPI1 only. TX/RX complete share one flag because
@@ -57,6 +58,16 @@ uint32_t STM32Hal::spiLastError(void)
 void STM32Hal::spiClearError(void)
 {
     s_spi_last_error = (uint32_t)SPI_XFER_OK;
+}
+
+static bool spi_abort_transfer(SPI_HandleTypeDef *spi)
+{
+    if (HAL_SPI_Abort(spi) == HAL_OK) {
+        return true;
+    }
+    s_spi_abort_failed = true;
+    s_spi_last_error = (uint32_t)SPI_XFER_DMA_ABORT;
+    return false;
 }
 
 STM32Hal::STM32Hal(SPI_HandleTypeDef* spiHandle)
@@ -138,6 +149,11 @@ void STM32Hal::spiEnd()          { /* nothing to release */ }
 
 void STM32Hal::spiBeginTransaction()
 {
+    if (s_spi_abort_failed) {
+        _bus_locked = false;
+        s_spi_last_error = (uint32_t)SPI_XFER_DMA_ABORT;
+        return;
+    }
     _bus_locked = (lora_spi_bus_acquire(RADIO_OWNERSHIP_TIMEOUT_TICKS) == 0);
     if (!_bus_locked) {
         s_spi_last_error = (uint32_t)SPI_XFER_DMA_START;
@@ -184,7 +200,9 @@ void STM32Hal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
         if (in != nullptr) {
             for (size_t i = 0U; i < len; i++) { in[i] = 0U; }
         }
-        if (!_bus_locked) {
+        if (s_spi_abort_failed) {
+            s_spi_last_error = (uint32_t)SPI_XFER_DMA_ABORT;
+        } else if (!_bus_locked) {
             s_spi_last_error = (uint32_t)SPI_XFER_DMA_START;
         }
         return;
@@ -210,11 +228,13 @@ void STM32Hal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
         s_dma_state = 1U;
         if (HAL_SPI_TransmitReceive_DMA(_spi, &out[done], &in[done],
                                         (uint16_t)chunk) != HAL_OK) {
-            HAL_SPI_Abort(_spi);
+            const bool abort_ok = spi_abort_transfer(_spi);
             for (uint32_t i = 0U; i < chunk; i++) {
                 in[done + i] = 0U;
             }
-            s_spi_last_error = (uint32_t)SPI_XFER_DMA_START;
+            if (abort_ok) {
+                s_spi_last_error = (uint32_t)SPI_XFER_DMA_START;
+            }
             break;
         }
         /* Sleep until the DMA IRQ (or the TIM6 tick) wakes us; the tick
@@ -231,13 +251,15 @@ void STM32Hal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
              * stop the peripheral so the next transfer starts clean, then
              * quarantine this chunk: zero-fill, never hand RadioLib a
              * half-shifted frame that could parse as valid. */
-            HAL_SPI_Abort(_spi);
+            const bool abort_ok = spi_abort_transfer(_spi);
             for (uint32_t i = 0U; i < chunk; i++) {
                 in[done + i] = 0U;
             }
-            s_spi_last_error = (s_dma_state == 3U)
-                               ? (uint32_t)SPI_XFER_DMA_ERROR
-                               : (uint32_t)SPI_XFER_DMA_TIMEOUT;
+            if (abort_ok) {
+                s_spi_last_error = (s_dma_state == 3U)
+                                   ? (uint32_t)SPI_XFER_DMA_ERROR
+                                   : (uint32_t)SPI_XFER_DMA_TIMEOUT;
+            }
             break;
         }
         done += chunk;

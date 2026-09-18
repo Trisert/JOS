@@ -66,6 +66,8 @@ extern void            radiolib_stub_tx_reset(void);
    TX_DONE wait. Armed by the abort-path tests, cleared by _reset(). */
 extern void            radiolib_stub_tx_fail_at_index(size_t i);
 extern void            radiolib_stub_tx_fail_wait_done(int fail);
+extern void            radiolib_stub_start_receive_fail_next(unsigned count);
+extern unsigned        radiolib_stub_start_receive_count(void);
 /* Direct stub entry points (the past-cap loud-fail test calls lora_tx). */
 extern int             lora_tx(const uint8_t *data, size_t len);
 
@@ -1624,6 +1626,18 @@ void test_lora_rx_task_loops_forever_kicking_watchdog_each_iteration(void)
     watchdog_alive_self_Stub(alive_escape_cb);
 
     run_task_until_escape(lora_rx_task, &alive_calls);
+}
+
+void test_lora_rx_task_retries_after_receive_arm_failure(void)
+{
+    radiolib_stub_start_receive_fail_next(1U);
+    osThreadGetId_ExpectAndReturn(RX_TH);
+    osThreadFlagsWait_IgnoreAndReturn(0U);
+    watchdog_alive_self_Stub(alive_escape_cb);
+
+    run_task_until_escape(lora_rx_task, &alive_calls);
+
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT(2U, radiolib_stub_start_receive_count());
 }
 
 /* First iteration: the task narrows its monitored period from the bootstrap

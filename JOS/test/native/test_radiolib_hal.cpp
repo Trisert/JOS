@@ -20,6 +20,7 @@ static bool acquire_ok;
 static bool dma_start_ok;
 static bool dma_complete;
 static bool dma_error;
+static bool abort_ok;
 static unsigned acquire_count;
 static unsigned release_count;
 static unsigned dma_count;
@@ -39,6 +40,7 @@ static void reset_trace(void)
     dma_start_ok = true;
     dma_complete = true;
     dma_error = false;
+    abort_ok = true;
     acquire_count = 0U;
     release_count = 0U;
     dma_count = 0U;
@@ -140,7 +142,7 @@ extern "C" int HAL_SPI_Abort(SPI_HandleTypeDef *)
 {
     ++abort_count;
     event("dma-abort");
-    return HAL_OK;
+    return abort_ok ? HAL_OK : HAL_ERROR;
 }
 
 extern "C" uint32_t HAL_RCC_GetPCLK2Freq(void) { return 80000000U; }
@@ -286,6 +288,33 @@ static void test_dma_error_is_quarantined(void)
     assert(release_count == 1U);
 }
 
+static void test_abort_failure_latches_spi_unavailable(void)
+{
+    reset_trace();
+    dma_start_ok = false;
+    abort_ok = false;
+    STM32Hal hal = make_hal();
+    uint8_t out = 0x33U;
+    uint8_t in = 0xCCU;
+
+    hal.spiBeginTransaction();
+    hal.spiTransfer(&out, 1U, &in);
+    hal.spiEndTransaction();
+    assert(in == 0U);
+    assert(abort_count == 1U);
+    assert(hal.spiLastError() != SPI_XFER_OK);
+
+    abort_ok = true;
+    hal.spiClearError();
+    in = 0xCCU;
+    hal.spiBeginTransaction();
+    hal.spiTransfer(&out, 1U, &in);
+    hal.spiEndTransaction();
+    assert(in == 0U);
+    assert(dma_count == 1U);
+    assert(hal.spiLastError() != SPI_XFER_OK);
+}
+
 int main(void)
 {
     test_refused_transaction_is_quarantined();
@@ -294,6 +323,7 @@ int main(void)
     test_error_stays_until_explicit_clear();
     test_dma_timeout_is_quarantined();
     test_dma_error_is_quarantined();
+    test_abort_failure_latches_spi_unavailable();
     puts("real radiolib_hal: ownership, CS, DMA ordering, quarantine, sticky error PASS");
     return 0;
 }

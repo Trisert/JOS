@@ -59,12 +59,15 @@ extern SPI_HandleTypeDef hspi1;
 /* spiTransfer() outcome codes (spiLastError()). A failed chunk is
  * zero-filled in in[] so RadioLib never parses a half-shifted frame as
  * valid; the code tells ground WHY. Errors are sticky across later successful
- * transfers and clear only via spiClearError(). */
+ * transfers and clear only via spiClearError(). An abort failure additionally
+ * latches SPI1 unavailable until reset; clearing the diagnostic does not
+ * re-enable a peripheral whose DMA/BSY/FIFO quiescence was not proven. */
 enum SpiXferStatus {
     SPI_XFER_OK         = 0,   /* last transfer (or all chunks) complete */
     SPI_XFER_DMA_START  = 1,   /* TransmitReceive_DMA refused (HAL_BUSY/ERR) */
     SPI_XFER_DMA_TIMEOUT = 2,  /* chunk exceeded its baud-derived timeout */
-    SPI_XFER_DMA_ERROR  = 3    /* DMA transfer-error flag (TE) via callback */
+    SPI_XFER_DMA_ERROR  = 3,   /* DMA transfer-error flag (TE) via callback */
+    SPI_XFER_DMA_ABORT  = 4    /* abort failed; SPI1 latched unavailable */
 };
 
 struct Stm32Pin {

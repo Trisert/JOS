@@ -107,8 +107,10 @@ Issue aperta: **#54 (HIL)** — richiede hardware. **#49** (grant RedPill-T) chi
   ownership through completion, while RX/read/rearm and competing TX callers
   fail closed on bounded acquisition. Guard teardown precedes mutex release;
   failed HAL bus acquisition cannot assert radio CS or use SPI; failed radio
-  initialization remains unready until an explicit retry; CLOUD releases the
-  SPI1 lock before calculations and I2C FRAM persistence. Native adversarial
+  initialization gates beacon-task creation, while the RX task retries failed
+  arms and does not feed liveness until RX is actually armed (watchdog is the
+  fail-closed recovery path); CLOUD releases the SPI1 lock before calculations
+  and I2C FRAM persistence. Native adversarial
   production-driver tests cover re-entry, RX-during-TX, non-owner completion,
   error cleanup, IRQ restoration at the release boundary, and mutex-init/readiness
   failures. Evidence: `make -C JOS/test native` and `make -C JOS test`.
