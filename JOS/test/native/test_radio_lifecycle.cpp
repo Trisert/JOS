@@ -25,6 +25,10 @@
 extern "C" void lora_on_dio1_irq(void);
 extern "C" int lora_rx(uint8_t*, size_t*);
 #define EXTI0_IRQn 6
+static float begin_frequency;
+static float begin_bandwidth;
+static int begin_spreading_factor;
+static int begin_coding_rate;
 static bool irq_enabled=true, exti_pending=false, nvic_pending=false;
 static bool late_finish=false, immediate_tx=false, immediate_rx=false;
 static bool reentrant_rx=false;
@@ -62,7 +66,14 @@ public:
  int begin_error=0;
  unsigned finishes=0, receives=0;
  explicit SX1268(Module*) {}
- int begin(float,float,int,int,int,int,int,float,bool) { return begin_error; }
+ int begin(float frequency, float bandwidth, int spreading_factor,
+           int coding_rate, int, int, int, float, bool) {
+  begin_frequency = frequency;
+  begin_bandwidth = bandwidth;
+  begin_spreading_factor = spreading_factor;
+  begin_coding_rate = coding_rate;
+  return begin_error;
+ }
  int sleep() { mode=Sleep; return 0; }
  int startTransmit(const uint8_t*,uint8_t) {
   mode=Tx; if(immediate_tx) dio_edge(); return tx_error;
@@ -164,6 +175,10 @@ int main(int argc, char **argv) {
  }
  uint8_t byte=0;
  assert(lora_init()==0);
+ assert(begin_frequency == 436.0f);
+ assert(begin_bandwidth == 125.0f);
+ assert(begin_spreading_factor == 10);
+ assert(begin_coding_rate == 8);
  lora_rx_task_register(rx_sentinel);
  /* Every radio-operation mutex release must restore the caller's IRQ state,
   * including TX finish/error cleanup and callers that entered disabled. */
