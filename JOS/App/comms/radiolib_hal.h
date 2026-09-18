@@ -38,13 +38,16 @@
 #define RLIB_BUSY  3
 
 /*
- * PLACEHOLDER GPIO bindings — replace with the real OBC-schematic assignments.
- * Naming follows the SPF COMMS signal names so the mapping is self-documenting.
+ * OBC V2.0 software-defined ICD bindings, corroborated by the recovered
+ * COMMS connector pinout in RED_SPF_V3 and by Core/Inc/main.h + JOS.ioc.
+ * The target-board electrical behavior is still HIL-gated: in particular,
+ * verify the PB1 DEPLOY_SENSE/LoRa_NRST multiplexing and reset safety before
+ * flight qualification.
  *   CS_TTC     -> SX1268 NSS      (COMMS conn pin 14)
  *   LoRa_Busy  -> SX1268 BUSY     (COMMS conn pin 13)
  *   GPIO_INT   -> SX1268 DIO1/IRQ (COMMS conn pin 15, route to EXTI)
- * LoRa_NRST is NOT defined here: it is LoRa_NRST_GPIO_Port/LoRa_NRST_Pin from
- * main.h (PB1, MULTIPLEXED w/ DEPLOY_SENSE, COMMS conn pin 4).
+ * LoRa_NRST is not defined here: it is LoRa_NRST_GPIO_Port/LoRa_NRST_Pin
+ * from main.h (PB1, multiplexed with DEPLOY_SENSE, COMMS conn pin 4).
  */
 #define CS_TTC_GPIO_Port    GPIOA          /* SPI1 NSS, OBC V2.0 netlist */
 #define CS_TTC_Pin          GPIO_PIN_4
