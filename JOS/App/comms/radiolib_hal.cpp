@@ -210,6 +210,10 @@ void STM32Hal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
         s_dma_state = 1U;
         if (HAL_SPI_TransmitReceive_DMA(_spi, &out[done], &in[done],
                                         (uint16_t)chunk) != HAL_OK) {
+            HAL_SPI_Abort(_spi);
+            for (uint32_t i = 0U; i < chunk; i++) {
+                in[done + i] = 0U;
+            }
             s_spi_last_error = (uint32_t)SPI_XFER_DMA_START;
             break;
         }

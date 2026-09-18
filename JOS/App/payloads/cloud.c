@@ -68,13 +68,14 @@ int cloud_acquire(cloud_sample_t *out)
 {
     int new_breaches = 0;
     uint16_t raw[CLOUD_FACES][CLOUD_STRIPES];
-    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t now;
 
     if (out == NULL ||
         lora_spi_bus_acquire(RADIO_OWNERSHIP_TIMEOUT_TICKS) != 0) {
         return -1;
     }
 
+    now = xTaskGetTickCount() * portTICK_PERIOD_MS;
     memset(out, 0, sizeof(*out));
     out->timestamp = now;
 

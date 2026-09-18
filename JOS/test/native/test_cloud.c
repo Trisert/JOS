@@ -12,6 +12,7 @@ GPIO_TypeDef native_cloud_gpio_b;
 SPI_HandleTypeDef hspi1;
 
 static uint32_t fake_tick;
+static uint32_t bus_wait_ticks;
 static unsigned adc_reads;
 static int bus_held;
 static int bus_released_before_fram;
@@ -36,6 +37,8 @@ int lora_spi_bus_acquire(uint32_t timeout_ticks)
 {
     expect(timeout_ticks == RADIO_OWNERSHIP_TIMEOUT_TICKS);
     expect(!bus_held);
+    fake_tick += bus_wait_ticks;
+    bus_wait_ticks = 0U;
     bus_held = 1;
     return 0;
 }
@@ -123,16 +126,17 @@ static void test_breach_history_and_spi_scope(void)
     cloud_init();
 
     fake_tick = 100U;
+    bus_wait_ticks = 25U;
     expect(cloud_acquire(&first) == 1);
     expect(first.face[0].stripes[0].breached == 1U);
-    expect(first.face[0].stripes[0].timestamp == 100U);
+    expect(first.face[0].stripes[0].timestamp == 125U);
     expect(bus_released_before_fram == 1);
     expect(fram_writes == 1U);
 
     fake_tick = 200U;
     expect(cloud_acquire(&second) == 0);
     expect(second.face[0].stripes[0].breached == 1U);
-    expect(second.face[0].stripes[0].timestamp == 100U);
+    expect(second.face[0].stripes[0].timestamp == 125U);
     expect(fram_writes == 1U);
 }
 
