@@ -54,7 +54,7 @@ static void fill_distinct(beacon_hb_state_t *st)
 {
     st->bat_status   = 1u;
     st->lines_fault  = 1u;
-    st->aocs_status  = BEACON_AOCS_POINTING; /* = 2 -> bits 5..4 = 0b10 */
+    st->aocs_status  = (beacon_aocs_status_t)2u; /* raw 2 -> bits 5..4 = 0b10 */
     st->obc_status   = 0xAu;                  /* bits 3..0 = 0b1010      */
     st->i_bat_chg    = 0x11u;
     st->i_bat_dsg    = 0x22u;
@@ -150,7 +150,7 @@ void test_row1_fields_at_literal_offsets(void)
     /* Byte 1 = STATUS, "Bit 1" = MSB:
      *   BAT_STATUS  = 1 -> bit 7 (0x80)
      *   LINES_FAULT = 1 -> bit 6 (0x40)
-     *   AOCS POINTING = 2 -> bits 5..4 (0x20)
+     *   AOCS raw field = 2 -> bits 5..4 (0x20)
      *   obc_status = 0xA -> bits 3..0 (0x0A)
      *  -> 0b1110_1010 = 0xEA. */
     TEST_ASSERT_EQUAL_HEX8(0xEAu, out[0]);
@@ -367,17 +367,27 @@ void test_all_six_gps_components_two_bytes_each(void)
 void test_status_bit_positions_are_literal(void)
 {
     /* Bit 1 BAT_STATUS (MSB) -> 0x80 */
-    TEST_ASSERT_EQUAL_HEX8(0x80u, beacon_status_pack(1u, 0u, BEACON_AOCS_OFF, 0u));
+    TEST_ASSERT_EQUAL_HEX8(0x80u, beacon_status_pack(1u, 0u,
+                                                      (beacon_aocs_status_t)0u, 0u));
     /* Bit 2 LINES_FAULT -> 0x40 */
-    TEST_ASSERT_EQUAL_HEX8(0x40u, beacon_status_pack(0u, 1u, BEACON_AOCS_OFF, 0u));
-    /* Bits 3-4 AOCS_STATUS: DET(1) -> 0x10, POINTING(2) -> 0x20, FAULT(3) -> 0x30 */
-    TEST_ASSERT_EQUAL_HEX8(0x10u, beacon_status_pack(0u, 0u, BEACON_AOCS_DET, 0u));
-    TEST_ASSERT_EQUAL_HEX8(0x20u, beacon_status_pack(0u, 0u, BEACON_AOCS_POINTING, 0u));
-    TEST_ASSERT_EQUAL_HEX8(0x30u, beacon_status_pack(0u, 0u, BEACON_AOCS_FAULT, 0u));
+    TEST_ASSERT_EQUAL_HEX8(0x40u, beacon_status_pack(0u, 1u,
+                                                      (beacon_aocs_status_t)0u, 0u));
+    /* Bits 3-4 AOCS_STATUS are a raw 2-bit field: raw 1 -> 0x10,
+     * raw 2 -> 0x20, raw 3 -> 0x30. The source does not assign these
+     * numeric values to the four state names. */
+    TEST_ASSERT_EQUAL_HEX8(0x10u, beacon_status_pack(0u, 0u,
+                                                     (beacon_aocs_status_t)1u, 0u));
+    TEST_ASSERT_EQUAL_HEX8(0x20u, beacon_status_pack(0u, 0u,
+                                                     (beacon_aocs_status_t)2u, 0u));
+    TEST_ASSERT_EQUAL_HEX8(0x30u, beacon_status_pack(0u, 0u,
+                                                     (beacon_aocs_status_t)3u, 0u));
     /* Bits 5-8 OBC_STATUS (least significant nibble): 0x1 -> 0x01, 0x8 -> 0x08, 0xF -> 0x0F */
-    TEST_ASSERT_EQUAL_HEX8(0x01u, beacon_status_pack(0u, 0u, BEACON_AOCS_OFF, 0x1u));
-    TEST_ASSERT_EQUAL_HEX8(0x08u, beacon_status_pack(0u, 0u, BEACON_AOCS_OFF, 0x8u));
-    TEST_ASSERT_EQUAL_HEX8(0x0Fu, beacon_status_pack(0u, 0u, BEACON_AOCS_OFF, 0xFu));
+    TEST_ASSERT_EQUAL_HEX8(0x01u, beacon_status_pack(0u, 0u,
+                                                      (beacon_aocs_status_t)0u, 0x1u));
+    TEST_ASSERT_EQUAL_HEX8(0x08u, beacon_status_pack(0u, 0u,
+                                                      (beacon_aocs_status_t)0u, 0x8u));
+    TEST_ASSERT_EQUAL_HEX8(0x0Fu, beacon_status_pack(0u, 0u,
+                                                      (beacon_aocs_status_t)0u, 0xFu));
 }
 
 /* Round trip over the full documented range of every sub-field. */
@@ -410,16 +420,20 @@ void test_status_round_trip_all_values(void)
  * neighbour (0xFF bat_status must not light up LINES_FAULT). */
 void test_status_pack_masks_to_field_width(void)
 {
-    TEST_ASSERT_EQUAL_HEX8(0x80u, beacon_status_pack(0xFFu, 0u, BEACON_AOCS_OFF, 0u));
-    TEST_ASSERT_EQUAL_HEX8(0x40u, beacon_status_pack(0u, 0xFFu, BEACON_AOCS_OFF, 0u));
-    TEST_ASSERT_EQUAL_HEX8(0x0Fu, beacon_status_pack(0u, 0u, BEACON_AOCS_OFF, 0xFFu));
+    TEST_ASSERT_EQUAL_HEX8(0x80u, beacon_status_pack(0xFFu, 0u,
+                                                      (beacon_aocs_status_t)0u, 0u));
+    TEST_ASSERT_EQUAL_HEX8(0x40u, beacon_status_pack(0u, 0xFFu,
+                                                      (beacon_aocs_status_t)0u, 0u));
+    TEST_ASSERT_EQUAL_HEX8(0x0Fu, beacon_status_pack(0u, 0u,
+                                                      (beacon_aocs_status_t)0u, 0xFFu));
 }
 
 /* The unpack helper tolerates NULL output pointers per field. */
 void test_status_unpack_accepts_null_outputs(void)
 {
-    /* 1<<7 | 3<<4 | 0x5 = 0xB5 */
-    uint8_t status = beacon_status_pack(1u, 0u, BEACON_AOCS_FAULT, 0x5u);
+    /* 1<<7 | raw AOCS field 3<<4 | 0x5 = 0xB5 */
+    uint8_t status = beacon_status_pack(1u, 0u,
+                                        (beacon_aocs_status_t)3u, 0x5u);
 
     beacon_status_unpack(status, NULL, NULL, NULL, NULL);
     TEST_ASSERT_EQUAL_HEX8(0xB5u, status); /* unchanged, no crash */
@@ -429,12 +443,18 @@ void test_status_unpack_accepts_null_outputs(void)
  * 9. AOCS_STATUS - the four enumerated states
  * ===================================================================== */
 
-void test_aocs_status_has_four_ordered_values(void)
+void test_aocs_status_has_four_distinct_in_range_values(void)
 {
-    TEST_ASSERT_EQUAL_INT(0, (int)BEACON_AOCS_OFF);
-    TEST_ASSERT_EQUAL_INT(1, (int)BEACON_AOCS_DET);
-    TEST_ASSERT_EQUAL_INT(2, (int)BEACON_AOCS_POINTING);
-    TEST_ASSERT_EQUAL_INT(3, (int)BEACON_AOCS_FAULT);
+    TEST_ASSERT_TRUE(BEACON_AOCS_OFF < (1u << AOCS_STATUS_BITS));
+    TEST_ASSERT_TRUE(BEACON_AOCS_DET < (1u << AOCS_STATUS_BITS));
+    TEST_ASSERT_TRUE(BEACON_AOCS_POINTING < (1u << AOCS_STATUS_BITS));
+    TEST_ASSERT_TRUE(BEACON_AOCS_FAULT < (1u << AOCS_STATUS_BITS));
+    TEST_ASSERT_NOT_EQUAL_UINT32(BEACON_AOCS_OFF, BEACON_AOCS_DET);
+    TEST_ASSERT_NOT_EQUAL_UINT32(BEACON_AOCS_OFF, BEACON_AOCS_POINTING);
+    TEST_ASSERT_NOT_EQUAL_UINT32(BEACON_AOCS_OFF, BEACON_AOCS_FAULT);
+    TEST_ASSERT_NOT_EQUAL_UINT32(BEACON_AOCS_DET, BEACON_AOCS_POINTING);
+    TEST_ASSERT_NOT_EQUAL_UINT32(BEACON_AOCS_DET, BEACON_AOCS_FAULT);
+    TEST_ASSERT_NOT_EQUAL_UINT32(BEACON_AOCS_POINTING, BEACON_AOCS_FAULT);
 }
 
 /* Each of the four AOCS states survives pack -> unpack through bits 5-4. */
@@ -449,8 +469,9 @@ void test_aocs_status_all_four_values_round_trip(void)
         uint8_t status = beacon_status_pack(0u, 0u, states[i], 0u);
         beacon_aocs_status_t back = BEACON_AOCS_OFF;
 
-        /* The 2-bit field is masked to bits 5-4 of the byte. */
-        TEST_ASSERT_EQUAL_HEX8((uint8_t)((unsigned)i << 4), status);
+        /* The 2-bit field is masked to bits 5-4 of the byte. The source
+         * does not define which state name owns each raw two-bit value. */
+        TEST_ASSERT_EQUAL_HEX8((uint8_t)(((unsigned)states[i] & 0x3u) << 4), status);
 
         beacon_status_unpack(status, NULL, NULL, &back, NULL);
         TEST_ASSERT_EQUAL_INT((int)states[i], (int)back);
@@ -462,10 +483,10 @@ void test_aocs_status_unpack_never_exceeds_enum(void)
 {
     unsigned v;
 
-    for (v = 0u; v < 4u; v++) {
+    for (v = 0u; v < (1u << AOCS_STATUS_BITS); v++) {
         beacon_aocs_status_t a = (beacon_aocs_status_t)0xFF;
         beacon_status_unpack((uint8_t)(v << 4), NULL, NULL, &a, NULL);
-        TEST_ASSERT_TRUE(((int)a >= 0) && ((int)a <= 3));
+        TEST_ASSERT_TRUE(((unsigned)a) < (1u << AOCS_STATUS_BITS));
     }
 }
 
