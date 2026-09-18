@@ -5,6 +5,7 @@
 #include "obsw_delay.h"
 #include "MAX11128.h"
 #include "main.h"
+#include "radio_ownership.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <string.h>
@@ -66,26 +67,43 @@ void cloud_init(void)
 int cloud_acquire(cloud_sample_t *out)
 {
     int new_breaches = 0;
-    uint16_t raw[CLOUD_STRIPES];
-    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint16_t raw[CLOUD_FACES][CLOUD_STRIPES];
+    uint32_t now;
 
+    if (out == NULL ||
+        lora_spi_bus_acquire(RADIO_OWNERSHIP_TIMEOUT_TICKS) != 0) {
+        return -1;
+    }
+
+    now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    memset(out, 0, sizeof(*out));
     out->timestamp = now;
 
     for (int f = 0; f < CLOUD_FACES; f++) {
-        cloud_read_face(f, raw);
+        cloud_read_face(f, raw[f]);
+    }
+    /* The physical SPI1 lock covers ADC transfers only. Calculations and the
+     * FRAM cyclic-buffer write use other resources and must not extend the
+     * radio/ADC exclusion window. */
+    lora_spi_bus_release();
 
+    for (int f = 0; f < CLOUD_FACES; f++) {
         for (int s = 0; s < CLOUD_STRIPES; s++) {
-            int32_t delta = (int32_t)raw[s] - (int32_t)baseline[f][s];
+            int32_t delta = (int32_t)raw[f][s] - (int32_t)baseline[f][s];
             if (delta < 0) delta = -delta;
 
             int breached = (delta > CLOUD_THRESH) ? 1 : 0;
 
             /* Only mark first breach */
-            if (breached && !out->face[f].stripes[s].breached) {
+            if (breached && !last_sample.face[f].stripes[s].breached) {
                 out->face[f].stripes[s].breached = 1;
                 out->face[f].stripes[s].timestamp = now;
                 new_breaches++;
-            } else if (!breached) {
+            } else if (breached) {
+                out->face[f].stripes[s].breached = 1;
+                out->face[f].stripes[s].timestamp =
+                    last_sample.face[f].stripes[s].timestamp;
+            } else {
                 out->face[f].stripes[s].breached = 0;
                 out->face[f].stripes[s].timestamp = 0;
             }

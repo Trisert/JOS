@@ -22,7 +22,7 @@ Scope: findings R1–R6 from the direct review of `7f0aabd`.
 
 ## Verification
 
-Existing host suite plus seven new tests: 411 tests. The state-machine tests
+Existing host suite plus seven new tests: 412 tests. The state-machine tests
 exercise validity, the 79/80 threshold boundary, failed Flash containment,
 repeated low-battery loops and the post-restore normalization API. SEU itself
 is target-only in this suite: full physical restore/first-scrub behavior still
@@ -58,8 +58,9 @@ was invented. Their documented integration blockers remain. No pin assignments,
 vendored libraries, authentication enforcement or coverage thresholds changed.
 DIO1 transition interleavings are now covered by host tests. Shared TX/RX task
 and SPI serialization still need HIL/concurrency review: EXTI masking is not a
-mutex and does not solve the entire radio ownership architecture. A failed rearm is reported as failure;
-there is no new automatic recovery policy for a permanently failed radio.
+mutex and does not solve the entire radio ownership architecture. A failed rearm
+is retried and does not feed watchdog liveness until RX is armed; a permanently
+failed radio remains fail-closed for watchdog recovery.
 
 The initial R1–R6 implementation was self-reviewed. CodeRabbit reviewed commit
 73473e7 and reported two radio findings addressed in this follow-up. An in-house

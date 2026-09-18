@@ -39,8 +39,8 @@ It replaces the old Hermes kanban board (SQLite), which was archived on
 | 6 | done    | **Evaluate PR #17 (SEU mitigation) — closed, unmerged** | [#38](https://github.com/Trisert/JOS/issues/38) | CLOSED: superseded by #14 (sram2 parity NMI) + #16 (SEU scrub). No unique code to recover. |
 | 8 | done    | **scrub.c const-correctness (cppcheck constVariablePointer, 2.17.1)** | — | PR [#44](https://github.com/Trisert/JOS/pull/44) | MERGED. `scrub_sync()` lookup result marked `const`. cppcheck 2.17.1 now reports 0 findings on `main`. |
 | 9 | done    | **RadioLib SX1268 (LoRa1268F30) integration — B1 scaffolding + B2/B3/B4 wiring** | PR [#47](https://github.com/Trisert/JOS/pull/47) | MERGED 2026-08-13. B1 HAL wrapper + C driver (`extern "C"` verified), B2 TX chunked + beacon, B3 RX task → `comms_rx_handle_frame` + DIO1 ISR, B4 tests. Follow-ups split into tasks 10–11 below. |
-| 10 | todo   | **RedPill-T license grant** — `radiolib_driver.cpp`/`radiolib_hal.cpp` adapt code from Marco-42/RedPill-T (`license: null`, all-rights-reserved) | [#49](https://github.com/Trisert/JOS/issues/49) | Legal blocker for flight: need explicit grant or license alignment before shipping the vendored wrapper. 2026-08-24: JOS stesso ora è MIT (PR #52 merged) ma ciò NON copre il codice adattato da RedPill-T (`license: null` upstream); serve grant esplicito da Marco-42. |
-| 11 | blocked | **Radio GPIO bring-up verification** — CS_TTC/LoRa_Busy/GPIO_INT/LoRa_NRST are placeholders until the OBC schematic lands; NRST is multiplexed with DEPLOY_SENSE (`radiolib_hal.cpp:139`) → validate reset-pulse vs deploy logic in HIL (ESP32 sim) | [#54](https://github.com/Trisert/JOS/issues/54) | Waiting on: OBC schematic. Then fix pin map in `radiolib_driver.cpp:lora_init()` + CubeMX .ioc, and run HIL matrix. Acceptance criteria tracciati in #54. |
+| 10 | done | **RedPill-T provenance/license alignment** — `radiolib_driver.cpp`/`radiolib_hal.cpp` retain source provenance from the internally controlled Marco-42/RedPill-T code | [#49](https://github.com/Trisert/JOS/issues/49) | Resolved 2026-09-18: common project-owner control confirmed; the JOS adaptations carry SPDX MIT and are covered by the repository `LICENSE`. No external developer grant is required. |
+| 11 | blocked | **Radio GPIO bring-up verification** — software-defined ICD now pins CS_TTC/LoRa_Busy/GPIO_INT/LoRa_NRST to the recovered COMMS connector map and the CubeMX OBC mapping (PA4/PC4/PB0/PB1); PB1 remains multiplexed with DEPLOY_SENSE | [#54](https://github.com/Trisert/JOS/issues/54) | Source-level mapping is corroborated by `RED_SPF_V3`, `JOS/Core/Inc/main.h`, `JOS/JOS.ioc` and `radiolib_hal.h`. Remaining acceptance is target HIL: cold boot, init, TX, RX/DIO1, reset, deployment-sense sampling, board revision and proof that reset cannot create a false deployment indication. |
 | 12 | done    | **Unblock Ceedling CI** — root cause found: `test_lora_rx_task_loop_delays_at_the_registered_period` spins forever because the RX task is event-driven (no `osDelay` since PR #47); every Ceedling run since 2026-08-14 died at the 6 h timeout | PR [#50](https://github.com/Trisert/JOS/pull/50) | MERGED 2026-08-22. All 4 checks green on the PR (Ceedling 28 s vs 6 h hang). Local verify: 142/142 host tests on aarch64. Follow-up [#51](https://github.com/Trisert/JOS/pull/51) also MERGED: shared escape scaffold + SIGALRM hang ceiling (30 s, mutation-tested) — no more 6 h spins possible. |
 | 13 | done    | **Branch cleanup** — 12 locali + 21 remoti cancellati (tutti con PR merged/chiusa; orfani protetti da tag `archive/*`) | — | Completato 2026-08-22. Su GitHub e in locale resta solo `main` + tag `archive/pr17head`, `archive/fix/ceedling-clean`, `archive/fix/linker-comment-fix`. |
 | 14 | done    | **FRAM cyclic writes chip-boundary safe** — `fram_write` spezzato in write per-chip; rimosso guard irraggiungibile; test NULL + cross-boundary | PR [#53](https://github.com/Trisert/JOS/pull/53) | MERGED 2026-08-24. 2 round Kilo (primo: guard irraggiungibile + path NULL scoperto → fixati); tutte e 4 le check verdi sull'head finale `ddc1a19`. |
@@ -97,9 +97,34 @@ It replaces the old Hermes kanban board (SQLite), which was archived on
 6. **Gas gauge EPS**: SPF V3 Tab. 3.9 dice **BQ76905**, `SW_DREP_Architecture_V01` dice **BQ27441**. Due IC diversi, due driver diversi, stessa telemetria di batteria. Da chiarire con la subteam ELE.
 7. **Stato dei documenti recuperati**: SPF V3 e i DREP sono versioni di subteam **senza stato di release**, con campi TBD e contraddizioni interne (punti 1, 5, 6). Sono la migliore evidenza disponibile, **non una baseline approvata**: da confermare con SYS/ELE prima di trattarli come contratto — è esattamente il caso in cui `AGENTS.md` §1/§7 prescrive di annotare e chiedere. **Le conferme a SYS/ELE sono tracciate nella issue [#94](https://github.com/Trisert/JOS/issues/94).**
 
-Issue aperta: **#54 (HIL)** — richiede hardware. **#49** (grant RedPill-T) chiusa con nota: **prima del flight freeze va riverificato che il relicense sia effettivo** su `radiolib_driver.cpp`/`radiolib_hal.cpp`. Decisioni ancora aperte su netlist: strapping A2/A1 FRAM, cablaggio radio al connettore J6, CR 4/8 JOS vs 4/5 upstream TT&C.*
+Issue aperta: **#54 (HIL)** — richiede hardware. **#49 (provenance/licenza RedPill-T)** è risolta internamente: i due adapter sono sotto la MIT del repository e il controllo del codice è del progetto. Decisioni ancora aperte su netlist: strapping A2/A1 FRAM, cablaggio radio al connettore J6, CR 4/8 JOS vs 4/5 upstream TT&C.*
 
 ## Direct review follow-up
+
+- **Task-level radio ownership concurrency fix** (`fix/radio-task-ownership`,
+  based on PR99 `3aeba90`): statically allocated priority-inheritance mutexes
+  serialize radio state and physical SPI1 access; async TX retains explicit
+  ownership through completion, while RX/read/rearm and competing TX callers
+  fail closed on bounded acquisition. Guard teardown precedes mutex release;
+  failed HAL bus acquisition cannot assert radio CS or use SPI; failed radio
+  initialization gates beacon-task creation, while the RX task retries failed
+  arms and does not feed liveness until RX is actually armed (watchdog is the
+  fail-closed recovery path); CLOUD releases the SPI1 lock before calculations
+  and I2C FRAM persistence. Native adversarial
+  production-driver tests cover re-entry, RX-during-TX, non-owner completion,
+  error cleanup, IRQ restoration at the release boundary, and mutex-init/readiness
+  failures. Evidence: `make -C JOS/test native` and `make -C JOS test`.
+  Remaining limit: the real HAL refusal path and multi-device electrical bus
+  behavior still require target/HIL verification; native lifecycle doubles do
+  not prove STM32 DMA or CS electrical timing.
+
+- **CLOUD independent-review fixes** (2026-09-17): `cloud_acquire()` now keeps
+  the SPI1 ownership window limited to ADC transfers and uses the existing
+  static `last_sample` for first-breach history, so ongoing breaches retain
+  their original timestamp and are not recounted. Focused native regression:
+  `JOS/test/native/test_cloud.c`. The CLOUD task remains unwired from
+  production `main()`; no protocol or hardware assignment was added. Target
+  and HIL verification of the ADC, face selection and FRAM path remain open.
 
 - **In review — R1–R6 safety corrections** (`fix/direct-review-safety`): validity
   gate for READY→ACTIVE, storage-independent low-battery containment, no repeated
@@ -110,6 +135,9 @@ Issue aperta: **#54 (HIL)** — richiede hardware. **#49** (grant RedPill-T) chi
   CodeRabbit follow-up: DIO1-masked mode transitions, stale-event drainage,
   explicit IRQ routing, failed-start cleanup assertion; five mutation checks.
   Not merged or flight-qualified; task-level radio serialization remains open.
+
+*Task-level radio ownership update: 2026-09-17 — see the direct review
+follow-up entry above; the older board footer remains historical context.*
 
 ## Notes
 

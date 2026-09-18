@@ -5,7 +5,10 @@
  *   lora_init(), lora_tx(), lora_rx(), lora_tx_wait_done(), lora_on_dio1_irq().
  *
  * Ported/adapted from Marco-42/RedPill-T (satellite/stm32_lora/Core/Src/COMMS.cpp).
- * See radiohal.h for licensing + pin-mapping notes.
+ * SPDX-License-Identifier: MIT
+ * RedPill-T provenance is retained; the source is under common project-owner
+ * control and this JOS adaptation is covered by the repository MIT License.
+ * See radiolib_hal.h for the full provenance and pin-mapping note.
  *
  * LoRa params match SPF v3 Table 3.28 + RedPill-T: 436 MHz, BW125, SF10, CR4/8
  * (RadioLib cr=8 is the direct denominator: SX1268.h:36, codingRate reg=cr-4),
@@ -18,6 +21,7 @@
 
 #include "radiolib_hal.h"
 #include "cmsis_os.h"   /* osThreadFlagsX for TX_DONE signalling */
+#include "radio_ownership.h"
 
 /* RadioLib objects.
  * JOS-vendored RadioLib: SX1268 takes a Module* (not (hal,cs,dio1,rst,busy)).
@@ -31,8 +35,50 @@ SX1268   radio(&radioModule);
 #define LORA_FLAG_RX_DONE 0x02U
 
 static osThreadId_t g_tx_wait_handle = NULL;
+static osMutexId_t g_radio_mutex = NULL;
+static osMutexId_t g_spi_bus_mutex = NULL;
+static StaticSemaphore_t g_radio_mutex_cb;
+static StaticSemaphore_t g_spi_bus_mutex_cb;
+static bool g_radio_ready = false;
 enum class DioRoute { Idle, Tx, Rx };
 static volatile DioRoute g_dio_route = DioRoute::Idle;
+
+static int mutex_acquire(osMutexId_t mutex, uint32_t timeout_ticks)
+{
+    if (mutex == NULL) {
+        return -1;
+    }
+    return (osMutexAcquire(mutex, timeout_ticks) == osOK) ? 0 : -1;
+}
+
+static void mutex_release(osMutexId_t mutex)
+{
+    if (mutex != NULL) {
+        (void)osMutexRelease(mutex);
+    }
+}
+
+/* The boot path is single-threaded before osKernelInitialize(). RadioLib
+ * still performs SPI transactions during lora_init(), so the physical-bus
+ * lock is bypassed only in that explicitly single-threaded phase. */
+extern "C" int lora_spi_bus_acquire(uint32_t timeout_ticks)
+{
+    if (g_spi_bus_mutex == NULL) {
+        return -1;
+    }
+    if (osKernelGetState() == osKernelInactive) {
+        return 0;
+    }
+    return mutex_acquire(g_spi_bus_mutex, timeout_ticks);
+}
+
+extern "C" void lora_spi_bus_release(void)
+{
+    if ((g_spi_bus_mutex != NULL) &&
+        (osKernelGetState() != osKernelInactive)) {
+        mutex_release(g_spi_bus_mutex);
+    }
+}
 
 /* Mask only the dedicated PB0/EXTI0 radio interrupt. SPI DMA and TIM6 must
  * remain live during RadioLib calls. Never clear pending IRQs on exit: a
@@ -59,17 +105,21 @@ private:
 static int quiesce_dio1(void)
 {
     g_dio_route = DioRoute::Idle;
+    radioHal.spiClearError();
     int16_t result = radio.finishReceive();
     __HAL_GPIO_EXTI_CLEAR_IT(GPIO_INT_Pin);
     NVIC_ClearPendingIRQ(EXTI0_IRQn);
-    return (result == RADIOLIB_ERR_NONE) ? 0 : -1;
+    return ((result == RADIOLIB_ERR_NONE) &&
+            (radioHal.spiLastError() == (uint32_t)SPI_XFER_OK)) ? 0 : -1;
 }
 
 /* Called with DIO1 masked and its old source quiesced. */
 static int arm_receive(void)
 {
+    radioHal.spiClearError();
     int16_t result = radio.startReceive();
-    if (result == RADIOLIB_ERR_NONE) {
+    if ((result == RADIOLIB_ERR_NONE) &&
+        (radioHal.spiLastError() == (uint32_t)SPI_XFER_OK)) {
         g_dio_route = DioRoute::Rx;
         return 0;
     }
@@ -97,6 +147,30 @@ extern "C" uint32_t lora_rx_oversize_drops(void)
 
 extern "C" int lora_init(void)
 {
+    g_radio_ready = false;
+    static const osMutexAttr_t radio_mutex_attr = {
+        .name      = "radioOp",
+        .attr_bits = osMutexPrioInherit,
+        .cb_mem    = &g_radio_mutex_cb,
+        .cb_size   = sizeof(g_radio_mutex_cb),
+    };
+    static const osMutexAttr_t spi_bus_mutex_attr = {
+        .name      = "spi1Bus",
+        .attr_bits = osMutexPrioInherit,
+        .cb_mem    = &g_spi_bus_mutex_cb,
+        .cb_size   = sizeof(g_spi_bus_mutex_cb),
+    };
+
+    if (g_radio_mutex == NULL) {
+        g_radio_mutex = osMutexNew(&radio_mutex_attr);
+    }
+    if (g_spi_bus_mutex == NULL) {
+        g_spi_bus_mutex = osMutexNew(&spi_bus_mutex_attr);
+    }
+    if ((g_radio_mutex == NULL) || (g_spi_bus_mutex == NULL)) {
+        return -1;
+    }
+
     /* Bind virtual pins to real OBC V2.0 GPIO (radiolib_hal.h, main.h):
        CS_TTC = PA4, RESET = PB1 mux, DIO1 = PB0/EXTI0, BUSY = PC4. */
     radioHal.addPin(RLIB_NSS,   CS_TTC_GPIO_Port,     CS_TTC_Pin);
@@ -115,13 +189,21 @@ extern "C" int lora_init(void)
        Signature matches JOS-vendored RadioLib SX1268::begin().
        cr=8 -> coding rate 4/8 per SPF v3 Table 3.28 (RadioLib cr is the direct
        denominator, SX1268.h:36; SX126x_config.cpp: codingRate reg = cr-4). */
+    radioHal.spiClearError();
     int16_t s = radio.begin(436.0f, 125.0f, 10, 8, 0x12, 22, 8, 0.0f, false);
-    if (s != RADIOLIB_ERR_NONE) {
+    if ((s != RADIOLIB_ERR_NONE) ||
+        (radioHal.spiLastError() != (uint32_t)SPI_XFER_OK)) {
         return -1;
     }
 
     /* Put radio to sleep; RX is armed by the RX task via lora_start_receive(). */
-    radio.sleep();
+    radioHal.spiClearError();
+    const int16_t sleep_result = radio.sleep();
+    if ((sleep_result != RADIOLIB_ERR_NONE) ||
+        (radioHal.spiLastError() != (uint32_t)SPI_XFER_OK)) {
+        return -1;
+    }
+    g_radio_ready = true;
     return 0;
 }
 
@@ -136,22 +218,40 @@ extern "C" int lora_tx(const uint8_t* data, size_t len)
         return -1;
     }
     osThreadId_t self = osThreadGetId();
-    if (self == NULL || g_tx_wait_handle != NULL) { return -1; }
+    if ((self == NULL) || (mutex_acquire(g_radio_mutex,
+                                         RADIO_OWNERSHIP_TIMEOUT_TICKS) != 0)) {
+        return -1;
+    }
+    if (g_tx_wait_handle != NULL) {
+        mutex_release(g_radio_mutex);
+        return -1;
+    }
+    if (!g_radio_ready) { mutex_release(g_radio_mutex); return -1; }
+    int result = -1;
+    {
     Dio1Guard guard;
-    if (quiesce_dio1() != 0) { return -1; }
-    if ((osThreadFlagsClear(LORA_FLAG_TX_DONE) & 0x80000000U) != 0U) {
-        return -1;
+    if (quiesce_dio1() != 0) {
+        result = -1;
+    } else if ((osThreadFlagsClear(LORA_FLAG_TX_DONE) & 0x80000000U) != 0U) {
+        result = -1;
+    } else {
+        g_tx_wait_handle = self;
+        radioHal.spiClearError();
+        int16_t s = radio.startTransmit(data, (uint8_t)len);
+        if ((s != RADIOLIB_ERR_NONE) ||
+            (radioHal.spiLastError() != (uint32_t)SPI_XFER_OK)) {
+            (void)radio.finishTransmit();
+            g_tx_wait_handle = NULL;
+            if (quiesce_dio1() == 0) { (void)arm_receive(); }
+            result = -1;
+        } else {
+            g_dio_route = DioRoute::Tx;
+            result = 0;
+        }
     }
-    g_tx_wait_handle = self;
-    int16_t s = radio.startTransmit(data, (uint8_t)len);
-    if (s != RADIOLIB_ERR_NONE) {
-        (void)radio.finishTransmit();
-        g_tx_wait_handle = NULL;
-        if (quiesce_dio1() == 0) { (void)arm_receive(); }
-        return -1;
     }
-    g_dio_route = DioRoute::Tx;
-    return 0;
+    if (result != 0) { mutex_release(g_radio_mutex); }
+    return result;
 }
 
 /* The TX owner calls once: success OR timeout closes the transfer. */
@@ -160,16 +260,24 @@ extern "C" int lora_tx_wait_done(uint32_t timeout_ms)
     if (g_tx_wait_handle == NULL || g_tx_wait_handle != osThreadGetId()) {
         return -1;
     }
-    uint32_t flags = osThreadFlagsWait(LORA_FLAG_TX_DONE, osFlagsWaitAny, timeout_ms);
+    int result;
+    {
+    const uint32_t flags = osThreadFlagsWait(LORA_FLAG_TX_DONE, osFlagsWaitAny, timeout_ms);
     Dio1Guard guard;
     g_dio_route = DioRoute::Idle;
+    radioHal.spiClearError();
     int16_t finish = radio.finishTransmit();
+    const bool finish_spi_ok = (radioHal.spiLastError() == (uint32_t)SPI_XFER_OK);
     int quiet = quiesce_dio1();
     uint32_t cleared = osThreadFlagsClear(LORA_FLAG_TX_DONE);
     g_tx_wait_handle = NULL;
     int receive = (quiet == 0) ? arm_receive() : -1;
-    return ((flags == LORA_FLAG_TX_DONE) && (finish == RADIOLIB_ERR_NONE) &&
-            ((cleared & 0x80000000U) == 0U) && (receive == 0)) ? 0 : -1;
+    result = ((flags == LORA_FLAG_TX_DONE) && (finish == RADIOLIB_ERR_NONE) &&
+              finish_spi_ok && ((cleared & 0x80000000U) == 0U) &&
+              (receive == 0)) ? 0 : -1;
+    }
+    mutex_release(g_radio_mutex);
+    return result;
 }
 
 extern "C" int lora_rx(uint8_t* buf, size_t* len)
@@ -177,10 +285,22 @@ extern "C" int lora_rx(uint8_t* buf, size_t* len)
     if (buf == NULL || len == NULL) {
         return -1;
     }
+    if (!g_radio_ready || mutex_acquire(g_radio_mutex, RADIO_OWNERSHIP_TIMEOUT_TICKS) != 0) {
+        return -1;
+    }
+    if ((g_tx_wait_handle != NULL) || (g_dio_route != DioRoute::Rx)) {
+        mutex_release(g_radio_mutex);
+        return -1;
+    }
     /* In this RadioLib version readData() takes the length by value (no
        writeback), so query the received packet length first and report it
        back to the caller. getPacketLength() must be called BEFORE readData(). */
+    radioHal.spiClearError();
     size_t received = radio.getPacketLength();
+    if (radioHal.spiLastError() != (uint32_t)SPI_XFER_OK) {
+        mutex_release(g_radio_mutex);
+        return -1;
+    }
     if (received > *len) {
         /* Oversized PHY payload: REJECT, never deliver a truncated frame. A
            silent truncation would hand the validator a well-formed-looking
@@ -193,22 +313,41 @@ extern "C" int lora_rx(uint8_t* buf, size_t* len)
            COMMS_MAX_PACKET bytes, matching the COMMS_TC_MAX_FRAME validation
            budget. */
         g_rx_oversize_drops++;
+        mutex_release(g_radio_mutex);
         return -1;
     }
+    radioHal.spiClearError();
     int16_t s = radio.readData(buf, received);
-    if (s != RADIOLIB_ERR_NONE) {
+    if ((s != RADIOLIB_ERR_NONE) ||
+        (radioHal.spiLastError() != (uint32_t)SPI_XFER_OK)) {
+        mutex_release(g_radio_mutex);
         return -1;
     }
     *len = received;
+    mutex_release(g_radio_mutex);
     return 0;
 }
 
 extern "C" int lora_start_receive(void)
 {
-    if (g_tx_wait_handle != NULL) { return -1; }
+    if (!g_radio_ready || mutex_acquire(g_radio_mutex, RADIO_OWNERSHIP_TIMEOUT_TICKS) != 0) {
+        return -1;
+    }
+    if (g_tx_wait_handle != NULL) {
+        mutex_release(g_radio_mutex);
+        return -1;
+    }
+    int result;
+    {
     Dio1Guard guard;
-    if (quiesce_dio1() != 0) { return -1; }
-    return arm_receive();
+    if (quiesce_dio1() != 0) {
+        result = -1;
+    } else {
+        result = arm_receive();
+    }
+    }
+    mutex_release(g_radio_mutex);
+    return result;
 }
 
 /*

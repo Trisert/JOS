@@ -219,7 +219,10 @@ int main(void)
      proto board just means no temperature data). */
   deploy_mux_init();
   (void)temp_init();
-  lora_init();
+  const int radio_init_status = lora_init();
+  /* Do not schedule periodic beacon TX when radio bring-up failed. The RX
+     task remains monitored and retries arming; it withholds liveness until
+     success so the watchdog can recover a persistent boot fault. */
   state_machine_init();
   watchdog_monitor_init();
   /* SEU mitigation (W2-5): snapshot the critical structures once their
@@ -268,7 +271,10 @@ int main(void)
   }
   state_machine_task_create();
   watchdog_task_create();
-  lora_beacon_task_create();
+  if (radio_init_status == 0)
+  {
+    lora_beacon_task_create();
+  }
   lora_rx_task_create();
   /* (T1.6 scrub-unify, persistence restored) The retired App/obsw/scrub.c
    * FRAM-golden task is folded into seu_mitigation: the scrub task still

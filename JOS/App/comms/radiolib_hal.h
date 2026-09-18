@@ -6,12 +6,14 @@
  *
  * Ported from Marco-42/RedPill-T (satellite/stm32_lora/Core/Inc/STM32Hal.h),
  * adapted for JOS (Trisert/JOS, STM32L496VGTX).
+ * SPDX-License-Identifier: MIT
  *
- * PROVENANCE / LICENSING NOTE (DO NOT IGNORE):
- *   RedPill-T is published on GitHub WITHOUT an explicit license ("license: null"
- *   on the repo metadata) => default "all rights reserved". Vendoring this adapter
- *   into a flight OBSW requires an explicit grant or license alignment with JOS.
- *   Tracked in redpill/jos-radiolib-plan (gbrain).
+ * PROVENANCE / LICENSING NOTE:
+ *   RedPill-T provenance is retained for traceability. The RedPill-T source
+ *   and JOS are under common project-owner control; this JOS adaptation is
+ *   distributed under the repository MIT License (see LICENSE), with no
+ *   third-party permission dependency. Keep the provenance note when
+ *   moving or splitting this adapter.
  *
  * PIN MAPPING — JOS uses a SEPARATE COMMS board (LoRa1268F30 module) wired to the
  * OBC through a 20-pin connector. Signal names are from RED_SPF_V3 (pag 90/95).
@@ -38,13 +40,16 @@
 #define RLIB_BUSY  3
 
 /*
- * PLACEHOLDER GPIO bindings — replace with the real OBC-schematic assignments.
- * Naming follows the SPF COMMS signal names so the mapping is self-documenting.
+ * OBC V2.0 software-defined ICD bindings, corroborated by the recovered
+ * COMMS connector pinout in RED_SPF_V3 and by Core/Inc/main.h + JOS.ioc.
+ * The target-board electrical behavior is still HIL-gated: in particular,
+ * verify the PB1 DEPLOY_SENSE/LoRa_NRST multiplexing and reset safety before
+ * flight qualification.
  *   CS_TTC     -> SX1268 NSS      (COMMS conn pin 14)
  *   LoRa_Busy  -> SX1268 BUSY     (COMMS conn pin 13)
  *   GPIO_INT   -> SX1268 DIO1/IRQ (COMMS conn pin 15, route to EXTI)
- * LoRa_NRST is NOT defined here: it is LoRa_NRST_GPIO_Port/LoRa_NRST_Pin from
- * main.h (PB1, MULTIPLEXED w/ DEPLOY_SENSE, COMMS conn pin 4).
+ * LoRa_NRST is not defined here: it is LoRa_NRST_GPIO_Port/LoRa_NRST_Pin
+ * from main.h (PB1, multiplexed with DEPLOY_SENSE, COMMS conn pin 4).
  */
 #define CS_TTC_GPIO_Port    GPIOA          /* SPI1 NSS, OBC V2.0 netlist */
 #define CS_TTC_Pin          GPIO_PIN_4
@@ -58,13 +63,16 @@ extern SPI_HandleTypeDef hspi1;
 
 /* spiTransfer() outcome codes (spiLastError()). A failed chunk is
  * zero-filled in in[] so RadioLib never parses a half-shifted frame as
- * valid; the code tells ground WHY. Cleared on the next fully successful
- * transfer or via spiClearError(). */
+ * valid; the code tells ground WHY. Errors are sticky across later successful
+ * transfers and clear only via spiClearError(). An abort failure additionally
+ * latches SPI1 unavailable until reset; clearing the diagnostic does not
+ * re-enable a peripheral whose DMA/BSY/FIFO quiescence was not proven. */
 enum SpiXferStatus {
     SPI_XFER_OK         = 0,   /* last transfer (or all chunks) complete */
     SPI_XFER_DMA_START  = 1,   /* TransmitReceive_DMA refused (HAL_BUSY/ERR) */
     SPI_XFER_DMA_TIMEOUT = 2,  /* chunk exceeded its baud-derived timeout */
-    SPI_XFER_DMA_ERROR  = 3    /* DMA transfer-error flag (TE) via callback */
+    SPI_XFER_DMA_ERROR  = 3,   /* DMA transfer-error flag (TE) via callback */
+    SPI_XFER_DMA_ABORT  = 4    /* abort failed; SPI1 latched unavailable */
 };
 
 struct Stm32Pin {
@@ -124,6 +132,7 @@ public:
 
 private:
     SPI_HandleTypeDef* _spi;
+    bool               _bus_locked;
     static const int   MAX_PINS = 8;
     Stm32Pin           _pinMap[MAX_PINS];
     Stm32Pin* getStmPin(uint32_t pinId);
