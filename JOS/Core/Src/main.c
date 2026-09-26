@@ -195,6 +195,8 @@ int main(void)
      never from vApplicationMallocFailedHook() itself. Before the boot
      CRC policy below, which may reset and never return. */
   (void)fault_malloc_flush();
+  /* Same for a failed configASSERT() staged by fault_log_assert(). */
+  (void)fault_assert_flush();
   /* FRAM probe consumption (fix/fram-size review): fram_init() above latched
      any silent device select; persist it to LastStates now that the pool is
      up, before the boot-CRC policy (which may reset). No-op on a healthy

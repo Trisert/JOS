@@ -427,6 +427,100 @@ int fault_malloc_flush(void)
     return (rc == 0) ? 1 : -1;
 }
 
+/* ---------- Deferred configASSERT() record ----------
+ * Same staging pattern as the malloc-failure record above, for the same
+ * reason: a kernel assertion can fire in an ISR, inside a critical section or
+ * with the scheduler suspended, where neither the pool mutex nor a Flash
+ * program is legal. Stage, reset, commit on the next boot. */
+#define FAULT_ASSERT_MAGIC  0x46415352UL   /* "FASR" */
+
+typedef struct
+{
+    uint32_t magic;                     /* FAULT_ASSERT_MAGIC when staged      */
+    uint32_t line;                      /* __LINE__ of the failed assertion    */
+    uint32_t lr;                        /* caller of fault_log_assert()        */
+    char     file[FAULT_TASK_NAME_LEN]; /* tail of __FILE__, NUL terminated    */
+    uint32_t chk;                       /* XOR of the words above              */
+} fault_assert_stage_t;
+
+static fault_assert_stage_t s_assert_stage __attribute__((section(".noinit")));
+
+static uint32_t fault_assert_checksum(const fault_assert_stage_t *s)
+{
+    uint32_t chk = s->magic ^ s->line ^ s->lr;
+    for (uint32_t i = 0U; i < FAULT_TASK_NAME_LEN; i++) {
+        chk ^= ((uint32_t)(uint8_t)s->file[i]) << ((i & 3U) * 8U);
+    }
+    return chk;
+}
+
+void fault_log_assert(const char *file, int line)
+{
+    static volatile uint32_t s_assert_nesting = 0U;
+
+    __disable_irq();
+    if (s_assert_nesting != 0U) {
+        fault_reset_now();
+    }
+    s_assert_nesting = 1U;
+
+    memset(&s_assert_stage, 0, sizeof(s_assert_stage));
+    s_assert_stage.magic = FAULT_ASSERT_MAGIC;
+    s_assert_stage.line  = (uint32_t)line;
+    s_assert_stage.lr    = (uint32_t)__builtin_return_address(0);
+    if (file != NULL) {
+        uint32_t len = 0U;
+        uint32_t start;
+
+        while ((len < 256U) && (file[len] != '\0')) {
+            len++;
+        }
+        /* Keep the TAIL of the path: the file name is what identifies it. */
+        start = (len > (FAULT_TASK_NAME_LEN - 1U)) ? (len - (FAULT_TASK_NAME_LEN - 1U)) : 0U;
+        for (uint32_t i = 0U; (start + i) < len; i++) {
+            s_assert_stage.file[i] = file[start + i];
+        }
+    }
+    s_assert_stage.chk = fault_assert_checksum(&s_assert_stage);
+    __DSB();
+    fault_reset_now();
+}
+
+int fault_assert_flush(void)
+{
+    fault_record_t     rec;
+    laststates_entry_t entry;
+    int                rc;
+
+    if ((s_assert_stage.magic != FAULT_ASSERT_MAGIC) ||
+        (s_assert_stage.chk != fault_assert_checksum(&s_assert_stage))) {
+        s_assert_stage.magic = 0U;   /* cold boot / nothing staged */
+        return 0;
+    }
+
+    memset(&rec, 0, sizeof(rec));
+    rec.magic    = FAULT_RECORD_MAGIC;
+    rec.fault_id = (uint32_t)FAULT_ID_ASSERT;
+    rec.r0       = s_assert_stage.line;
+    rec.lr       = s_assert_stage.lr;
+    memcpy(rec.task, s_assert_stage.file, sizeof(rec.task));
+    rec.task[FAULT_TASK_NAME_LEN - 1U] = '\0';
+
+    memset(&entry, 0, sizeof(entry));
+    entry.timestamp  = 0U;
+    entry.state_from = FAULT_STATE_UNKNOWN;
+    entry.state_to   = FAULT_STATE_UNKNOWN;
+    entry.trigger    = TRIGGER_FAULT;
+    memcpy(entry.context, &rec, sizeof(rec));
+    rc = laststates_write(&entry);
+
+    /* One entry per assertion, written or not: a boot loop must not keep
+       refilling the pool with the same event. */
+    s_assert_stage.magic = 0U;
+    s_assert_stage.chk   = 0U;
+    return (rc == 0) ? 1 : -1;
+}
+
 /* ---------- Exception entry stubs ----------
  *
  * Each handler must be naked: the C prologue would push registers onto the

@@ -45,6 +45,10 @@ typedef enum {
        record the free/min-ever-free watermarks and reset into a known-good
        state (fault_log_malloc_failed()). Never encoded in an entry stub. */
     FAULT_ID_MALLOC_FAILED      = 6,
+    /* A FreeRTOS configASSERT() failed (fault_log_assert()). r0 = source line,
+       task[] = tail of the source file name. Never encoded in an entry
+       stub; appended, existing ids unchanged. */
+    FAULT_ID_ASSERT             = 7,
 } fault_id_t;
 
 typedef struct {
@@ -126,6 +130,17 @@ void fault_log_malloc_failed(void);
    mpu_fault_log_flush()). Returns 1 persisted, 0 nothing staged,
    -1 staged but the Flash write failed. */
 int fault_malloc_flush(void);
+
+/* configASSERT() sink: stage file/line in a reset-persistent .noinit slot and
+   reset the MCU. Does not return. Lock- and Flash-free, so it is safe from an
+   ISR or a critical section, where kernel assertions fire. */
+void fault_log_assert(const char *file, int line);
+
+/* Commit an assertion record staged by fault_log_assert() to LastStates
+   (trigger TRIGGER_FAULT, fault_id FAULT_ID_ASSERT). Task-level boot context
+   only, next to fault_malloc_flush(). Returns 1 persisted, 0 nothing staged,
+   -1 staged but the Flash write failed. */
+int fault_assert_flush(void);
 
 #ifdef __cplusplus
 }
