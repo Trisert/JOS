@@ -221,7 +221,7 @@ never touches first-party source.
 | `debug` (default) | `-O0 -g3` | `FATAL=1 TRUST_UNSTAMPED=0` (flight) | local GDB, full symbols |
 | `release` | `-Os -g3` | flight | size-optimized, symbols kept for backtraces |
 | `release-strip` | `-Os` (no `-g`) | flight | minimum Flash footprint check |
-| `bench` | `-O0 -g3` | `FATAL=0 TRUST_UNSTAMPED=1` | **BENCH BUILD ONLY — never flash to flight** |
+| `bench` | `-O0 -g3` | `FATAL=0 TRUST_UNSTAMPED=1`, public uplink key accepted | **BENCH BUILD ONLY — never flash to flight** |
 
 ```bash
 cd JOS
@@ -232,8 +232,20 @@ make bench          # boot-CRC relaxed; prints BENCH BUILD ONLY warning
 arm-none-eabi-size build/JOS.elf
 ```
 
-`make all` without a profile defaults to `debug`. After building, stamp the
-image CRC before flashing a flight image:
+`make all` without a profile defaults to `debug`.
+
+**Uplink key.** A flight image needs the mission HMAC key on the command line,
+from a clean tree (object files do not depend on the defines):
+
+```bash
+make clean && make release COMMS_AUTH_KEY=<8 hex digits>
+```
+
+Without it the build prints a warning and the image rejects every
+authenticated telecommand (fail closed): the only key it would know is the
+upstream default published in this repository. Never commit the key.
+
+After building, stamp the image CRC before flashing a flight image:
 
 ```bash
 make crc-stamp

@@ -30,9 +30,14 @@ live object        SRAM2 (.sram2) or SRAM1, owned by the application
 shadow copy        SRAM2 shadow pool (.sram2_noinit), a different address
 reference CRC-32   SRAM1, inside the module's region table
 golden record      FRAM (FeRAM, non-volatile): CRC-32-protected copy per
-                   region id at the top of FRAM (see `seu_mitigation.h`
-                   `SEU_FRAM_*`), written through by `seu_mitigation_sync()`
-                   after every task-context commit, restored at init
+                   region id in the reserved golden area at the top of the
+                   512 KB bank (`memory.h` FRAM_GOLDEN_BASE, 4 KB; the cyclic
+                   buffer never enters it), written through by
+                   `seu_mitigation_sync()` after every task-context commit,
+                   restored at init. The owner decides what may survive a
+                   reset: `state_machine_task()` puts `current_state` back to
+                   s0 and the battery snapshot back to "unknown" at every
+                   boot; only the beacon override is kept
 ```
 
 The shadow pool is `NOLOAD`: the SRAM2 hardware erase performed by
