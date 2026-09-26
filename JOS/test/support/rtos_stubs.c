@@ -38,9 +38,23 @@ uint32_t host_hw_watchdog_kick_count(void)
     return hw_wdg_kicks;
 }
 
+static uint32_t hw_wdg_boot_kicks;
+
+/* The host has no scheduler: every boot kick counts. */
+void hw_watchdog_boot_kick(void)
+{
+    hw_wdg_boot_kicks++;
+}
+
+uint32_t host_hw_watchdog_boot_kick_count(void)
+{
+    return hw_wdg_boot_kicks;
+}
+
 void host_hw_watchdog_reset(void)
 {
-    hw_wdg_kicks = 0u;
+    hw_wdg_kicks      = 0u;
+    hw_wdg_boot_kicks = 0u;
 }
 
 /* ---------- Dual-bank boot-OK marker ----------
