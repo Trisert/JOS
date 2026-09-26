@@ -36,7 +36,9 @@ A task silent for more than 3x its declared period is escalated:
 - if the stalled task holds the LastStates pool mutex, the record would wedge
   the monitor: the escalation is deferred and retried, at most
   `WDG_MAX_HOLDER_DEFERRALS` (60 scans, 30 s) in a row, then the OBC resets
-  without the record.
+  without the record. The count covers one stall episode: a scan with no
+  stalled task restarts it, so a task that recovers does not carry old
+  deferrals into its next, unrelated stall.
 - The IWDG (~31 s) and the STWD100 are refreshed by the monitor task every
   500 ms, unconditionally. The IWDG is reloaded whenever it has been started,
   even if its prescaler/reload did not settle. Long pre-scheduler work calls

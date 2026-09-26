@@ -28,7 +28,7 @@ exposed as `LASTSTATES` region in `STM32L496VGTX_FLASH.ld`.
 | Function | Purpose |
 |----------|---------|
 | `laststates_init()` | Re-derive the write cursor from the erase state: the first slot of the (single) erased run, i.e. right after the newest record. |
-| `laststates_write(entry)` | Append one record at the cursor. When the write fills the last slot of a 2 KB page, the **next page — the oldest in ring order — is erased immediately** (erase-ahead). If that erase fails, the next write retries it (`laststates_erase_ahead_failures()`). |
+| `laststates_write(entry)` | Append one record at the cursor. When the write fills the last slot of a 2 KB page, the **next page — the oldest in ring order — is erased immediately** (erase-ahead). If that erase fails, the next write retries it (`laststates_erase_ahead_failures()`). A program failure returns -1: if nothing reached the cells the cursor stays and the next write retries the slot; if the slot is **torn** it is consumed like a written one (cursor advanced, erase-ahead run), so a torn last free slot of a wrapped ring can never make the next write fall back to slot 0 and erase the page with the newest records. |
 | `laststates_dump_all(out, len)` / `laststates_count()` | Read back every complete record, **oldest first** (ring order from `laststates_oldest_slot()`). |
 | `laststates_oldest_slot()` | Index of the oldest record in ring order; `LASTSTATES_MAX_ENTRIES` when empty. Readers that need time order use it (dual-bank boot-fault count). |
 | `flash_write_row` / `flash_write_dword_bounded` | Double-word program bounded by the **DWT cycle counter** (not `HAL_GetTick()`), so it can never block indefinitely in a fault handler. |

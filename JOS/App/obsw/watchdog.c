@@ -99,8 +99,10 @@ static uint8_t wdg_kernel_is_running(void)
 
 /* ---------- Public functions ---------- */
 
-/* Consecutive deferrals of the SAME suspect (reset when another task stalls
-   or an escalation is carried out). */
+/* Consecutive deferrals of the SAME stall episode (reset when another task
+   stalls, when an escalation is carried out, or when a scan finds no stalled
+   task at all - so a task that recovers does not carry its count into the
+   next, unrelated episode). */
 static osThreadId_t wdg_deferred_suspect;
 static uint32_t     wdg_consecutive_deferrals;
 
@@ -523,7 +525,11 @@ static void watchdog_monitor_task(void *arg)
         }
         osMutexRelease(wdg_mutex);
 
-        if (stalled_handle != NULL) {
+        if (stalled_handle == NULL) {
+            /* No task over its deadline: any deferral episode is over. */
+            wdg_deferred_suspect      = NULL;
+            wdg_consecutive_deferrals = 0u;
+        } else {
             if (watchdog_escalate_stalled(stalled_handle, stalled_elapsed,
                                           stalled_limit, stalled_period)
                 == WDG_ESCALATE_DEFERRED) {

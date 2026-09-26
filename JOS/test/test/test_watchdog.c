@@ -656,3 +656,39 @@ void test_monitor_resets_without_record_after_bounded_deferrals(void)
 
     host_laststates_set_pool_holder((TaskHandle_t)NULL);
 }
+
+/* The deferral bound counts ONE stall episode. A task that defers
+   WDG_MAX_HOLDER_DEFERRALS - 1 times, recovers, and later stalls again inside
+   the pool lock starts a new episode: before the fix the old count carried
+   over and the second episode reset the OBC after a single further deferral. */
+void test_monitor_deferral_count_restarts_after_the_task_recovers(void)
+{
+    const uint32_t resets_before = watchdog_escalation_resets();
+
+    given_kernel_running();
+    xTaskGetTickCount_ExpectAndReturn(0u);
+    TEST_ASSERT_EQUAL_INT(0, watchdog_register_task(TH(0), 100u));
+    xTaskGetTickCount_ExpectAndReturn(0u);
+    watchdog_alive(TH(0));
+
+    capture_monitor_entry();
+    host_laststates_set_pool_holder((TaskHandle_t)TH(0));
+    uxTaskGetStackHighWaterMark_IgnoreAndReturn(64u);
+    xTaskGetTickCount_IgnoreAndReturn(1000u);
+    osDelay_Stub(osDelay_escape_cb);
+
+    run_monitor_scans((int)WDG_MAX_HOLDER_DEFERRALS - 1);
+    TEST_ASSERT_EQUAL_UINT32(resets_before, watchdog_escalation_resets());
+
+    /* The task reports again: one clean scan, no stall. */
+    watchdog_alive(TH(0));                    /* last_tick = 1000 */
+    run_monitor_scans(1);
+
+    /* A new stall inside the pool lock: it must be deferred again. */
+    xTaskGetTickCount_IgnoreAndReturn(2000u);
+    run_monitor_scans(2);
+    TEST_ASSERT_EQUAL_INT(WDG_ACTION_DEFER, watchdog_last_escalation_action());
+    TEST_ASSERT_EQUAL_UINT32(resets_before, watchdog_escalation_resets());
+
+    host_laststates_set_pool_holder((TaskHandle_t)NULL);
+}

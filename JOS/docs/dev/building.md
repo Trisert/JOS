@@ -246,6 +246,14 @@ echoed into build logs): the Makefile writes them into
 only when its content changes, so setting, changing or removing the key
 rebuilds exactly the objects that include it.
 
+The header is written **only** when `COMMS_AUTH_KEY` is on the command line
+(or when it does not exist yet). A later `make crc-stamp`, `make flash` or
+plain `make` without the key keeps the provisioned key (the build prints
+`COMMS_AUTH_KEY: reusing the key provisioned in …`) instead of relinking an
+unkeyed image. To remove a provisioned key pass it empty
+(`make … COMMS_AUTH_KEY=`) or run `make clean`. The "not set" warning reflects
+what the header actually carries, not the current command line.
+
 Without it the build prints a warning and the image rejects every
 authenticated telecommand (fail closed): the only key it would know is the
 upstream default published in this repository. Never commit the key.

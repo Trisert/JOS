@@ -1194,13 +1194,18 @@ int laststates_write(const laststates_entry_t *entry)
     }
 
     uintptr_t addr = (uintptr_t)LASTSTATES_FLASH_BASE + (uintptr_t)ls_idx * LASTSTATES_ENTRY_SIZE;
-    if (flash_write_row(addr, (const uint8_t *)entry, LASTSTATES_ENTRY_SIZE) != 0) {
-        /* The slot may now be torn: force a re-scan on the next write. */
-        ls_cursor_known = 0U;
+    const int prog_rc = flash_write_row(addr, (const uint8_t *)entry, LASTSTATES_ENTRY_SIZE);
+    if ((prog_rc != 0) && slot_is_erased(ls_idx)) {
+        /* Nothing reached the cells: the cursor is still valid, retry here. */
         laststates_pool_unlock(lock_held);
         return -1;
     }
 
+    /* A failed program that did reach the cells leaves a TORN slot. It is
+       consumed like a written one - cursor advanced, erase-ahead run - and is
+       never re-scanned: if it was the last erased slot of a wrapped ring the
+       pool would read as full, the scan would fall back to slot 0 and the
+       next write would erase page 0, which holds the NEWEST records. */
     const uint32_t next = (ls_idx + 1U) & (LASTSTATES_MAX_ENTRIES - 1U);
 
     /* Erase-ahead (see laststates_scan()): the page just filled up, so recycle
@@ -1220,11 +1225,11 @@ int laststates_write(const laststates_entry_t *entry)
        this is also safe on the parity-NMI path, which logs through here. */
     seu_mitigation_lock();
     ls_mirror.idx = next;
-    if (ls_mirror.count < LASTSTATES_MAX_ENTRIES) { ls_mirror.count++; }
+    if ((prog_rc == 0) && (ls_mirror.count < LASTSTATES_MAX_ENTRIES)) { ls_mirror.count++; }
     (void)seu_mitigation_commit(SEU_REGION_LASTSTATES);
     seu_mitigation_unlock();
     laststates_pool_unlock(lock_held);
-    return 0;
+    return (prog_rc == 0) ? 0 : -1;
 }
 
 /* Pool lock for a READER.
