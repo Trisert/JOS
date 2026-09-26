@@ -240,12 +240,10 @@ git worktree add .worktrees/<task> -b <type>/<slug> origin/main
   reviewer. **CodeRabbit** does not auto-review this repo automatically (under 10
   stars): ask for it with an `@coderabbitai review` comment, one review per hour
   on the free tier.
-- **Kilo Code Reviewer is filtered out.** Its runs end in `Review failed: The
-  model output limit was reached` and publish no review, so its comments and its
-  red check carry no information: ignore them — never read them as a verdict,
-  never hold a merge for them, never open a PR "to fix" them, and when reporting
-  the checks say it failed because the model output limit was reached and
-  produced no review text; do not use it as a merge gate.
+- **Kilo Code Reviewer has been uninstalled** (2026-09-26, account owner). It
+  never published a review on this repo (runs ended in "model output limit
+  reached" / "rate limited"). Its old comments and checks on historical PRs
+  carry no information: never read them as a verdict.
 - Every PR that touches flight behaviour earns a reviewer verdict **before**
   it is merged — an approval you cannot attribute to a specific review of that
   head commit is not a verdict.
