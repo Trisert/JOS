@@ -142,6 +142,10 @@ int host_flash_is_unlocked(void);
  * erased). Reset by host_flash_reset(). */
 void host_flash_fail_program_after(uint32_t successes);
 
+/* Make the next `count` page erases fail with HAL_ERROR without touching the
+ * pool (worn page, bounded-wait timeout). Reset by host_flash_reset(). */
+void host_flash_fail_next_erases(uint32_t count);
+
 /* Last I2C device address the code under test handed to HAL_I2C_Mem_Read/Write
  * (0xFFFF after host_flash_reset()). The HAL takes the 8-bit, already shifted
  * address, so a correct FM24VN10-G access is 0xA0/0xA2/…/0xAE (4 chips x 2
