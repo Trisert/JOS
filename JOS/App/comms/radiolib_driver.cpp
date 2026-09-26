@@ -31,6 +31,41 @@ SX1268   radio(&radioModule);
 #define LORA_FLAG_RX_DONE 0x02U
 
 static osThreadId_t g_tx_wait_handle = NULL;
+
+/* One radio, two tasks: the beacon task (lora_tx) and the RX task (lora_rx,
+   lora_start_receive) both drive the SAME SX1268, the same SPI1 and the same
+   DMA completion state in radiolib_hal.cpp. With no serialisation the RX task
+   (osPriorityNormal) could preempt the beacon task (BelowNormal) in the middle
+   of a RadioLib SPI command sequence. Every entry point that talks to the chip
+   holds this mutex for its whole command sequence. Created in lora_init(),
+   which main() calls before osKernelInitialize() (legal: osMutexNew() only
+   refuses ISR context); NULL before that, when boot is single-threaded. */
+static osMutexId_t g_radio_mutex = NULL;
+
+static void radio_lock(void)
+{
+    if ((g_radio_mutex != NULL) && (osKernelGetState() == osKernelRunning)) {
+        (void)osMutexAcquire(g_radio_mutex, osWaitForever);
+    }
+}
+
+static void radio_unlock(void)
+{
+    if ((g_radio_mutex != NULL) && (osKernelGetState() == osKernelRunning)) {
+        (void)osMutexRelease(g_radio_mutex);
+    }
+}
+
+/* osThreadFlagsWait() result carries `want` and is not an error code. Same
+   rule as comms_flags_have() in comms.c: `==` misses a wanted flag that
+   arrived together with another one. */
+static bool radio_flags_have(uint32_t flags, uint32_t want)
+{
+    if ((flags & osFlagsError) != 0U) {
+        return false;
+    }
+    return (flags & want) == want;
+}
 /* RX task handle, registered by lora_rx_task_create() so the DIO1 ISR can wake
    the correct task on RX_DONE. NULL until the RX task has started. */
 static osThreadId_t g_rx_handle = NULL;
@@ -52,6 +87,13 @@ extern "C" uint32_t lora_rx_oversize_drops(void)
 
 extern "C" int lora_init(void)
 {
+    if (g_radio_mutex == NULL) {
+        static const osMutexAttr_t attr = {
+            "radio", osMutexPrioInherit, NULL, 0U
+        };
+        g_radio_mutex = osMutexNew(&attr);
+    }
+
     /* Bind virtual pins to real OBC V2.0 GPIO (radiolib_hal.h, main.h):
        CS_TTC = PA4, RESET = PB1 mux, DIO1 = PB0/EXTI0, BUSY = PC4. */
     radioHal.addPin(RLIB_NSS,   CS_TTC_GPIO_Port,     CS_TTC_Pin);
@@ -90,13 +132,20 @@ extern "C" int lora_tx(const uint8_t* data, size_t len)
     if (len > 255U) {
         return -1;
     }
-    g_tx_wait_handle = osThreadGetId();
+    radio_lock();
     int16_t s = radio.startTransmit(data, (uint8_t)len);  /* async; DIO1 -> TX_DONE */
-    if (s != RADIOLIB_ERR_NONE) {
-        g_tx_wait_handle = NULL;
-        return -1;
+    if (s == RADIOLIB_ERR_NONE) {
+        /* Route DIO1 to this task only once the chip is transmitting: set
+           before startTransmit(), an RX_DONE still pending from the receive
+           mode was delivered as a bogus TX_DONE. A TX at SF10 lasts far
+           longer than the two statements between startTransmit() returning
+           and this store, so the real TX_DONE cannot be missed; drop any
+           stale TX_DONE bit left over from an earlier timed-out wait. */
+        (void)osThreadFlagsClear(LORA_FLAG_TX_DONE);
+        g_tx_wait_handle = osThreadGetId();
     }
-    return 0;
+    radio_unlock();
+    return (s == RADIOLIB_ERR_NONE) ? 0 : -1;
 }
 
 /* Block the calling task until DIO1 signals TX_DONE (or timeout). */
@@ -104,7 +153,7 @@ extern "C" int lora_tx_wait_done(uint32_t timeout_ms)
 {
     uint32_t flags = osThreadFlagsWait(LORA_FLAG_TX_DONE, osFlagsWaitAny, timeout_ms);
     g_tx_wait_handle = NULL;
-    return (flags == LORA_FLAG_TX_DONE) ? 0 : -1;
+    return radio_flags_have(flags, LORA_FLAG_TX_DONE) ? 0 : -1;
 }
 
 extern "C" int lora_rx(uint8_t* buf, size_t* len)
@@ -115,6 +164,7 @@ extern "C" int lora_rx(uint8_t* buf, size_t* len)
     /* In this RadioLib version readData() takes the length by value (no
        writeback), so query the received packet length first and report it
        back to the caller. getPacketLength() must be called BEFORE readData(). */
+    radio_lock();
     size_t received = radio.getPacketLength();
     if (received > *len) {
         /* Oversized PHY payload: REJECT, never deliver a truncated frame. A
@@ -128,9 +178,11 @@ extern "C" int lora_rx(uint8_t* buf, size_t* len)
            COMMS_MAX_PACKET bytes, matching the COMMS_TC_MAX_FRAME validation
            budget. */
         g_rx_oversize_drops++;
+        radio_unlock();
         return -1;
     }
     int16_t s = radio.readData(buf, received);
+    radio_unlock();
     if (s != RADIOLIB_ERR_NONE) {
         return -1;
     }
@@ -140,7 +192,16 @@ extern "C" int lora_rx(uint8_t* buf, size_t* len)
 
 extern "C" int lora_start_receive(void)
 {
+    radio_lock();
+    if (g_tx_wait_handle != NULL) {
+        /* A transmission is on the air: switching to RX now would abort it.
+           The sender re-arms RX itself once its sequence ends
+           (lora_send_chunked()). */
+        radio_unlock();
+        return -1;
+    }
     int16_t s = radio.startReceive();
+    radio_unlock();
     return (s == RADIOLIB_ERR_NONE) ? 0 : -1;
 }
 

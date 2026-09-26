@@ -52,6 +52,15 @@ typedef struct {
     bms_status_t bms;                      /* latest battery snapshot (stub)  */
 } obsw_critical_state_t;
 
+/* Fail-safe battery snapshot every boot starts from (see the initialiser
+   below and state_machine_task()). */
+static const bms_status_t bms_boot_default = {
+    .soc        = 0,
+    .temp_c     = 250,   /* 25.0 C */
+    .voltage_mv = 7400,
+    .valid      = false,
+};
+
 static SRAM2_CRITICAL obsw_critical_state_t obsw_state = {
     .magic                    = OBSW_STATE_MAGIC,
     .current_state            = STATE_OFF,
@@ -172,7 +181,30 @@ static int laststates_log(uint8_t from, uint8_t to, uint8_t trigger,
     return 0;
 }
 
-/* ---------- State transition logic ---------- */
+/* ---------- State transition logic ----------
+   try_transition() results. "Committed" means current_state now equals the
+   target; the two committed codes differ only in whether the LastStates
+   record landed. */
+#define TR_REFUSED         (-1)  /* gate refused: state unchanged              */
+#define TR_RECORDED          0   /* committed, LastStates record landed        */
+#define TR_ALREADY           1   /* already in the (containment) target: no-op */
+#define TR_UNRECORDED        2   /* committed, but the record did not land     */
+
+/* Transitions committed without their LastStates record (Flash failure).
+   Wrapping 32-bit counter for housekeeping telemetry, zero after
+   reset: the missing records are visible as a number instead of a silence. */
+static uint32_t unrecorded_transitions = 0U;
+
+uint32_t state_machine_unrecorded_transitions(void)
+{
+    return unrecorded_transitions;
+}
+
+static int tr_committed(int rc)
+{
+    return ((rc == TR_RECORDED) || (rc == TR_UNRECORDED)) ? 1 : 0;
+}
+
 static int try_transition(obw_state_t target, uint8_t trigger)
 {
     bms_status_t bms;
@@ -204,7 +236,16 @@ static int try_transition(obw_state_t target, uint8_t trigger)
         break;
 
     case STATE_CRIT:
-        /* Any state can enter CRIT on low battery / critical event */
+        /* Any state can enter CRIT on low battery / critical event.
+           Already in CRIT: nothing to do and NOTHING TO RECORD. The
+           autonomous battery check re-evaluates every 100 ms, so treating
+           CRIT -> CRIT as a transition wrote a LastStates record (and a FRAM
+           write-through) ten times a second for as long as the battery stayed
+           low - a Flash page erase every ~1.6 s, i.e. the pool worn out in
+           hours and the forensic trail flushed with noise. */
+        if (obsw_state.current_state == STATE_CRIT) {
+            return TR_ALREADY;
+        }
         ok = 1;
         break;
 
@@ -244,22 +285,30 @@ static int try_transition(obw_state_t target, uint8_t trigger)
     }
 
     if (!ok) {
-        return -1;
+        return TR_REFUSED;
     }
 
-    if (laststates_log((uint8_t)obsw_state.current_state, (uint8_t)target, trigger, NULL, 0) != 0) {
-        /* LastStates persistence failed (Flash write/erase error). The
-           transition still proceeds, but we flag it so the QM fault path
-           can record the anomaly instead of silently reporting success. */
-        return -1;
+    /* Record first, then commit: a record never describes a transition that
+       did not happen. A FAILED record, however, does NOT veto the transition
+       any more. It used to, which meant a Flash page that stopped
+       programming froze the OBSW in whatever state it was in: the boot
+       stayed in OFF (READY is not reachable from OFF), and a low battery
+       could no longer drive the autonomous entry into CRIT. The gates above
+       decide whether a transition is legal; the evidence is best effort and
+       its loss is counted (state_machine_unrecorded_transitions()). */
+    const int recorded =
+        (laststates_log((uint8_t)obsw_state.current_state, (uint8_t)target,
+                        trigger, NULL, 0) == 0);
+    if (!recorded) {
+        unrecorded_transitions++;
     }
 
     /* TEMPORAL BOUND of the Flash write above, which runs while holding
        state_mutex (documented here instead of moved out: the log-then-commit
        order is load-bearing - a record must never describe a transition that
-       did not commit, and a commit must never land without its record - so
-       the write cannot leave this critical section without changing the
-       failure semantics every caller above relies on).
+       did not commit - so the write cannot leave this critical section
+       without another writer's record landing between this record and its
+       commit).
        Worst-case hold, all terms bounded:
          - own write (laststates_write): Flash reads for the slot scan, one
            optional page erase (cycle-bounded, FLASH_PAGE_TIMEOUT_CYCLES =
@@ -298,52 +347,44 @@ static int try_transition(obw_state_t target, uint8_t trigger)
      * best-effort FRAM sync AFTER releasing state_mutex. A FRAM failure is
      * counted in seu_stats_t.fram_errors but never rolls back the committed
      * transition. */
-    return 0;
+    return recorded ? TR_RECORDED : TR_UNRECORDED;
 }
 
 /* ---------- Unconditional safe-state entry ----------
-   try_transition() returns -1 both when a transition is refused AND when
-   laststates_log() fails - and in the latter case it returns BEFORE assigning
-   current_state (Kilo #23, comment id 3740885211). So on a Flash-sick,
-   parity-faulted boot the OBSW used to stay in whatever state it had just
-   entered, running nominal ops on memory whose integrity is explicitly not
-   established, accompanied by a very well documented flag saying we intended
-   otherwise. The LastStates record is best effort; the containment is not, so
-   force the state through the SEU pair when the recorded transition does not
-   take.
+   The RESULT is reported to the caller (Kilo #26, roast 8): the only
+   consumer - the acknowledgement of the reset-stable SRAM2 boot-fault flag -
+   may clear that flag ONLY when the containment is on record. "CRIT entered
+   and the transition is in the LastStates trail" and "CRIT in force but
+   nothing was persisted" must therefore stay distinguishable; clearing the
+   flag in the second case is the fail-OPEN direction on the one flag whose
+   whole job is to survive a reset.
 
-   The RESULT is reported to the caller (Kilo #26, roast 8). While this
-   returned void, "CRIT entered and the transition is in the LastStates trail"
-   and "CRIT forced by hand because laststates_log() failed" were the same
-   answer, and the only consumer - the acknowledgement of the reset-stable
-   SRAM2 boot-fault flag - therefore cleared the finding in both cases. That
-   is the fail-OPEN direction on the one flag whose whole job is to survive a
-   reset: the record never landed, the flag was gone, so the next boot came up
-   nominal with no trace on the ground of either the finding or the safe state
-   it was supposed to force. */
+   try_transition() commits CRIT from every state, recorded or not, so the
+   forced path below is a belt-and-braces backstop for a refusal that no
+   current gate can produce. */
 #define SAFE_STATE_RECORDED   (0)   /* in CRIT, and the record landed        */
 #define SAFE_STATE_FORCED    (-1)   /* in CRIT, but nothing was persisted    */
+#define SAFE_STATE_ALREADY    (1)   /* was already in CRIT: nothing recorded */
 
 static int enter_safe_state(uint8_t trigger)
 {
-    if (try_transition(STATE_CRIT, trigger) == 0) {
+    const int rc = try_transition(STATE_CRIT, trigger);
+
+    if (rc == TR_RECORDED) {
         return SAFE_STATE_RECORDED;
     }
-
-    seu_mitigation_lock();
-    obsw_state.current_state = STATE_CRIT;
-    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
-    seu_mitigation_unlock();
-    /* Containment must survive a reboot, and the SRAM2 shadow provably does
-     * not (sram2_parity_init() erases it at every boot): the caller persists
-     * the forced CRIT through to the FRAM golden copy AFTER releasing
-     * state_mutex, so seu_mitigation_init() restores CRIT - not the
-     * pre-fault state - after a parity-NMI reset. Best effort: a FRAM
-     * failure is counted, never rolled back; the containment in RAM stands
-     * either way. (No sync here: blocking I2C must not run under
-     * state_mutex - see try_transition().) */
-
-    /* Containment is in force either way - only the evidence is missing. */
+    if (rc == TR_ALREADY) {
+        return SAFE_STATE_ALREADY;
+    }
+    if (rc != TR_UNRECORDED) {
+        seu_mitigation_lock();
+        obsw_state.current_state = STATE_CRIT;
+        (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+        seu_mitigation_unlock();
+    }
+    /* Containment is in force either way - only the evidence is missing.
+       (No FRAM sync here: blocking I2C must not run under state_mutex - the
+       caller syncs after releasing it, see try_transition().) */
     return SAFE_STATE_FORCED;
 }
 
@@ -440,13 +481,14 @@ static int check_battery_autonomous(void)
     bms_soc_band_t   band = bms_soc_band(&bms, &default_thresholds);
 
     if (bms_soc_is_low(band)) {
-        return (try_transition(STATE_CRIT, TRIGGER_BATTERY_LOW) == 0);
+        /* Already in CRIT is TR_ALREADY: no record, no FRAM sync. */
+        return tr_committed(try_transition(STATE_CRIT, TRIGGER_BATTERY_LOW));
     } else if (obsw_state.current_state == STATE_CRIT &&
                bms_soc_allows_payload(&bms, &default_thresholds)) {
         /* No parity check here any more: it lives in try_transition(), which
            covers this caller and every other one (Kilo #23, id 3740885216).
            A refused recovery simply leaves the OBSW in CRIT. */
-        return (try_transition(STATE_READY, TRIGGER_BATTERY_OK) == 0);
+        return tr_committed(try_transition(STATE_READY, TRIGGER_BATTERY_OK));
     }
     return 0;
 }
@@ -471,11 +513,39 @@ static void state_machine_task(void *arg)
 
     (void)arg;
 
+    /* Every boot starts from s0 with an UNKNOWN battery, whatever the FRAM
+       golden copy says. seu_mitigation_init() (main(), after
+       state_machine_init()) restores the last synced obsw_state from FRAM
+       over the boot defaults; left as-is that meant:
+         - current_state came back as READY/ACTIVE/CRIT, so the INIT
+           transition (legal only from OFF) was refused and the boot sequence
+           was skipped - an ACTIVE satellite rebooted straight into ACTIVE;
+         - a restored CRIT could never be left again while the SoC is
+           unknown (s2->s3 needs a valid SoC >= B_OPOK), not even across a
+           ground-commanded reset;
+         - bms.valid = true came back with a stale reading, re-opening the
+           SoC gates on a battery nobody had measured this boot (the fail-open
+           closed by fix/bms-soc-gating).
+       The safety latches that MUST survive a reset do not live here: the
+       SRAM2 parity finding is in the reset-stable sram2 store, the image
+       trust is re-derived by boot_crc, and the battery bands are re-derived
+       from fresh EPS telemetry. What IS kept from FRAM is the ground-commanded
+       beacon override. This runs before the first osDelay(), i.e. before any
+       lower-priority task (beacon, RX) can read or request a state. */
+    osMutexAcquire(state_mutex, osWaitForever);
+    seu_mitigation_lock();
+    obsw_state.magic         = OBSW_STATE_MAGIC;
+    obsw_state.current_state = STATE_OFF;
+    obsw_state.bms           = bms_boot_default;
+    (void)seu_mitigation_commit(SEU_REGION_OBSW_STATE);
+    seu_mitigation_unlock();
+    osMutexRelease(state_mutex);
+
     /* Boot sequence: s0 → s1 → s3 */
     osDelay(pdMS_TO_TICKS(100));   /* let peripherals settle */
 
     osMutexAcquire(state_mutex, osWaitForever);
-    init_committed = (try_transition(STATE_INIT, TRIGGER_BOOT) == 0);
+    init_committed = tr_committed(try_transition(STATE_INIT, TRIGGER_BOOT));
     osMutexRelease(state_mutex);
     if (init_committed) {
         state_fram_sync();
@@ -508,7 +578,7 @@ static void state_machine_task(void *arg)
         parity_safe_entered = 1;
         boot_dirty = 1;
     } else {
-        boot_dirty = (try_transition(STATE_READY, TRIGGER_ANTENNA_DONE) == 0);
+        boot_dirty = tr_committed(try_transition(STATE_READY, TRIGGER_ANTENNA_DONE));
     }
 
     if (parity_safe_latched != 0U) {
@@ -555,14 +625,18 @@ static void state_machine_task(void *arg)
         int batt_dirty;
         watchdog_alive_self();
 
-        /* Battery refresh at 1 Hz (every 10th 100 ms tick): blocking SPI to
-           the EPS, and the battery moves on a timescale of minutes. Runs
-           OUTSIDE state_mutex - it touches only the SRAM2 snapshot, while
-           check_battery_autonomous() below takes the lock to read it. */
-        if (bms_tick++ >= 10U) {
-            bms_tick = 0U;
+        /* Battery refresh at 1 Hz: on the first iteration (the boot starts
+           from an UNKNOWN battery, so read it as soon as possible) and then
+           on every 10th 100 ms tick - blocking SPI to the EPS, and the
+           battery moves on a timescale of minutes. (The previous
+           `bms_tick++ >= 10U` polled every 11th tick, 1.1 s, and only after
+           the first 1.1 s.) Runs OUTSIDE state_mutex - it touches only the
+           SRAM2 snapshot, while check_battery_autonomous() below takes the
+           lock to read it. */
+        if (bms_tick == 0U) {
             bms_refresh_snapshot();
         }
+        bms_tick = (bms_tick + 1U) % 10U;
 
         osMutexAcquire(state_mutex, osWaitForever);
         batt_dirty = check_battery_autonomous();
@@ -631,13 +705,18 @@ int state_machine_request_transition(obw_state_t target, uint8_t trigger)
     osMutexAcquire(state_mutex, osWaitForever);
     rc = try_transition(target, trigger);
     osMutexRelease(state_mutex);
-    if (rc == 0) {
+    if (tr_committed(rc)) {
         /* FRAM write-through for the committed transition, outside
            state_mutex: the sync runs a blocking I2C transaction (up to 1 s
            timeout) that must not stall the transition critical section. */
         state_fram_sync();
     }
-    return rc;
+    /* Committed (recorded or not) and "already in CRIT" both leave the OBSW
+       in the requested state: success for the caller. Only a gate refusal
+       is -1. A missing record is reported through
+       state_machine_unrecorded_transitions(), not as a refusal - the
+       transition DID happen. */
+    return (rc == TR_REFUSED) ? -1 : 0;
 }
 
 uint32_t state_machine_get_beacon_interval(void)

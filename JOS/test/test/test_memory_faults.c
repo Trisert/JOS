@@ -278,10 +278,10 @@ void test_fram_rejects_an_address_length_combination_that_wraps(void)
  * Cyclic buffer wrap-around
  * ===================================================================== */
 
-/* The 512 KB FRAM bank is a ring: a record that does not fit in the tail is
+/* The cyclic buffer [0, FRAM_CYCLIC_BYTES) is a ring: a record that does not fit in the tail is
  * split, the remainder goes to offset 0 and the head follows it. Losing the
  * split (or wrapping the head without writing the remainder) silently drops
- * the oldest half of every record written at the end of the bank. */
+ * the oldest half of every record written at the end of the ring. */
 void test_cyclic_buffer_write_wraps_and_splits_the_record(void)
 {
     static uint8_t chunk[4096];
@@ -298,12 +298,13 @@ void test_cyclic_buffer_write_wraps_and_splits_the_record(void)
     fram_init();
     cyclic_buffer_init();
 
-    /* Fill the bank up to 8 bytes short of the end. */
-    for (i = 0u; i < 127u; i++) {
+    /* Fill the ring up to 8 bytes short of its end (the golden area above
+     * FRAM_CYCLIC_BYTES is not part of it). */
+    for (i = 0u; i < (FRAM_CYCLIC_BYTES / sizeof(chunk)) - 1u; i++) {
         TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(chunk, sizeof(chunk)));
     }
     TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(chunk, sizeof(chunk) - 8u));
-    TEST_ASSERT_EQUAL_UINT32(FRAM_TOTAL_SIZE - 8u, cyclic_buffer_head());
+    TEST_ASSERT_EQUAL_UINT32(FRAM_CYCLIC_BYTES - 8u, cyclic_buffer_head());
 
     /* 16 B into an 8 B tail: 8 bytes at the end, 8 bytes back at offset 0. */
     TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(record, sizeof(record)));
@@ -311,7 +312,7 @@ void test_cyclic_buffer_write_wraps_and_splits_the_record(void)
 
     memset(tail, 0, sizeof(tail));
     memset(head, 0, sizeof(head));
-    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_read(FRAM_TOTAL_SIZE - 8u, tail, sizeof(tail)));
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_read(FRAM_CYCLIC_BYTES - 8u, tail, sizeof(tail)));
     TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_read(0u, head, sizeof(head)));
 
     TEST_ASSERT_EQUAL_UINT8_ARRAY(record, tail, sizeof(tail));

@@ -121,6 +121,21 @@
     # test binary uses the flight default (1) from comms_validate.h.
     :test_comms_legacy:
       - COMMS_AUTH_ENFORCE=0
+      - COMMS_AUTH_ALLOW_PUBLIC_KEY=1
+    # The comms suites build their sealed frames with the published default
+    # key, so they opt into it explicitly (the Makefile bench profile does the
+    # same). test_comms_auth_key.c builds WITHOUT the opt-in and pins the
+    # flight default: no provisioned key -> every authenticated frame is
+    # refused. test_comms_auth_provisioned.c provisions a key.
+    # Regex on the file path, not a bare name: bare names match as substrings,
+    # "test_comms" would also hit test_comms_auth_key.
+    /test_comms\.c$/:
+      - COMMS_AUTH_ALLOW_PUBLIC_KEY=1
+    :test_comms_auth_provisioned:
+      - COMMS_AUTH_KEY0=0x5AU
+      - COMMS_AUTH_KEY1=0x17U
+      - COMMS_AUTH_KEY2=0xC0U
+      - COMMS_AUTH_KEY3=0x3EU
     # test_boot_unstamped_bench.c links the same boot_crc.c with the bench
     # opt-out of the unstamped-image policy, which is the only way to reach
     # the #if BOOT_CRC_TRUST_UNSTAMPED branch of boot_crc_image_trusted().

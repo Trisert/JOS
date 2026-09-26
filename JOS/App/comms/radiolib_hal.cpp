@@ -7,16 +7,18 @@
  * SPI uses REAL DMA: HAL_SPI_TransmitReceive_DMA on SPI1 (DMA1 Channel2 RX /
  * Channel3 TX, CSELR mapping per RM0351 Table 46 — STM32L496 has no DMAMUX),
  * with IRQ-driven completion (DMA1_Channel2/3_IRQHandler in stm32l4xx_it.c).
- * spiTransfer() still blocks because RadioLib's HAL abstraction is
- * synchronous, but the wait sleeps with __WFI on a DMA-complete flag (woken
- * by the DMA IRQ or the TIM6 timebase tick) instead of busy-spinning, and
- * every chunk carries a baud-derived timeout. delayMicroseconds() is
+ * spiTransfer() still blocks the CALLING task because RadioLib's HAL
+ * abstraction is synchronous, but once the scheduler runs it blocks on a
+ * thread flag set by the DMA completion IRQ (other tasks keep running);
+ * before the scheduler it sleeps with __WFI. Every chunk carries a
+ * baud-derived timeout. delayMicroseconds() is
  * BLOCKING: only call from init / non-RTOS-hot paths (SPF: radio.begin()
  * performs reset settling).
  */
 
 #include "radiolib_hal.h"
 #include "spi_dma_sched.h"
+#include "cmsis_os.h"   /* thread-flag wait for the DMA completion, osDelay */
 
 /* DMA completion state, written by the ISR callbacks below, read by the
  * waiting spiTransfer(). Plain volatile bytes: single-writer (ISR) /
@@ -26,6 +28,24 @@
 namespace {
 volatile uint8_t s_dma_state = 0U;   /* 0 idle, 1 busy, 2 done, 3 error */
 volatile uint32_t s_spi_last_error = 0U;
+/* Task blocked in spiTransfer() (NULL before the scheduler runs, when the
+   wait falls back to __WFI). Distinct from the TX/RX_DONE bits (0x01/0x02)
+   that radiolib_driver.cpp uses on the same threads. */
+volatile osThreadId_t s_dma_waiter = NULL;
+constexpr uint32_t SPI_DMA_DONE_FLAG = 0x04U;
+
+bool scheduler_running_in_thread_mode()
+{
+    return (osKernelGetState() == osKernelRunning) && (__get_IPSR() == 0U);
+}
+
+void dma_wake_waiter()
+{
+    const osThreadId_t w = s_dma_waiter;
+    if (w != NULL) {
+        (void)osThreadFlagsSet(w, SPI_DMA_DONE_FLAG);
+    }
+}
 }
 
 /* HAL callbacks: C linkage, SPI1 only. TX/RX complete share one flag because
@@ -37,6 +57,7 @@ extern "C" void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 {
     if ((hspi != nullptr) && (hspi->Instance == SPI1)) {
         s_dma_state = 2U;
+        dma_wake_waiter();
     }
 }
 
@@ -45,6 +66,7 @@ extern "C" void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
     if ((hspi != nullptr) && (hspi->Instance == SPI1)) {
         s_dma_state = 3U;
+        dma_wake_waiter();
     }
 }
 
@@ -183,23 +205,41 @@ void STM32Hal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
                          ? (uint32_t)SPI_DMA_MAX_CHUNK : (uint32_t)left;
         uint32_t timeout = spi_dma_chunk_timeout_ms(chunk, pclk, div, 25U);
         uint32_t t0      = HAL_GetTick();
+        const bool block = scheduler_running_in_thread_mode();
 
+        if (block) {
+            (void)osThreadFlagsClear(SPI_DMA_DONE_FLAG);
+            s_dma_waiter = osThreadGetId();
+        }
         s_dma_state = 1U;
         if (HAL_SPI_TransmitReceive_DMA(_spi, &out[done], &in[done],
                                         (uint16_t)chunk) != HAL_OK) {
             s_spi_last_error = (uint32_t)SPI_XFER_DMA_START;
+            s_dma_waiter = NULL;   /* nobody waits: a later IRQ must not flag us */
             failed = true;
             break;
         }
-        /* Sleep until the DMA IRQ (or the TIM6 tick) wakes us; the tick
-         * guarantees progress even if an IRQ is ever lost. Wrap-safe:
-         * unsigned subtraction survives the 49-day HAL_GetTick() rollover. */
+        /* Wait for the DMA IRQ. Once the scheduler runs, BLOCK on a thread
+         * flag set by the completion callbacks: the previous __WFI() spin
+         * never yielded, so every lower-priority task starved for the whole
+         * transfer (AGENTS.md: no blocking polling in tasks). Before the
+         * scheduler (lora_init()) there is nothing to yield to and __WFI()
+         * stays. The loop re-checks s_dma_state, so a stale or early flag
+         * cannot end the wait. Wrap-safe: unsigned subtraction survives the
+         * 49-day HAL_GetTick() rollover. */
         while (s_dma_state == 1U) {
-            if ((HAL_GetTick() - t0) >= timeout) {
+            const uint32_t elapsed = HAL_GetTick() - t0;
+            if (elapsed >= timeout) {
                 break;
             }
-            __WFI();
+            if (block) {
+                (void)osThreadFlagsWait(SPI_DMA_DONE_FLAG, osFlagsWaitAny,
+                                        timeout - elapsed);
+            } else {
+                __WFI();
+            }
         }
+        s_dma_waiter = NULL;
         if (s_dma_state != 2U) {
             /* Timeout or DMA error (TE flag -> ErrorCallback -> state 3):
              * stop the peripheral so the next transfer starts clean, then
@@ -227,8 +267,18 @@ void STM32Hal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
 
 void STM32Hal::delay(RadioLibTime_t ms)
 {
-    /* Blocking. Only safe off the hot RTOS path (use osDelay in tasks). */
-    HAL_Delay((uint32_t)ms);
+    /* RadioLib waits through here (reset settling, mode switches) from task
+       context too: yield to the scheduler instead of HAL_Delay()'s busy loop,
+       which starved every lower-priority task. HAL_Delay() only before the
+       scheduler runs. configTICK_RATE_HZ = 1000, so ticks == ms. */
+    if (ms == 0U) {
+        return;
+    }
+    if (scheduler_running_in_thread_mode()) {
+        (void)osDelay((uint32_t)ms);
+    } else {
+        HAL_Delay((uint32_t)ms);
+    }
 }
 
 void STM32Hal::delayMicroseconds(RadioLibTime_t us)
@@ -242,17 +292,38 @@ void STM32Hal::delayMicroseconds(RadioLibTime_t us)
 
 unsigned long STM32Hal::millis()  { return (unsigned long)(HAL_GetTick()); }
 
-/* Microseconds since boot, derived from the 1 kHz SysTick: the whole-ms part
-   from HAL_GetTick() and the sub-ms remainder from the current down-counter
-   value. This is the REAL elapsed time, not HAL_GetTick()*1000 (which would
-   be milliseconds mislabelled as microseconds). RadioLib relies on micros()
-   for reset-settling and preamble timing, so the unit must be correct. */
+/* Microseconds since boot, from the HAL timebase: HAL_GetTick() counts TIM6
+   updates (1 kHz) and TIM6->CNT counts microseconds inside the current
+   millisecond (TIM6 runs at 1 MHz, ARR = 999: stm32l4xx_hal_timebase_tim.c).
+   This used to take the sub-ms part from SysTick, which after T35 is the
+   FreeRTOS tick and not in phase with TIM6 (and not even running before the
+   scheduler), so micros() could step backwards by up to 1 ms. RadioLib uses
+   micros() for timing, so it must be monotonic.
+   The tick is re-read around the counter so an update between the two reads
+   is caught; a wrap whose interrupt is still pending (UIF set, e.g. with
+   interrupts masked) is accounted for by hand. */
+extern TIM_HandleTypeDef htim6;   /* Core/Src/stm32l4xx_hal_timebase_tim.c */
+
 unsigned long STM32Hal::micros()
 {
-    uint32_t ticks_per_us = SystemCoreClock / 1000000UL;
-    // cppcheck-suppress cstyleCast  // SysTick is a CMSIS macro cast; unavoidable
-    uint32_t elapsed_sub_ms = ((uint32_t)SysTick->LOAD - (uint32_t)SysTick->VAL) / ticks_per_us;
-    return (unsigned long)(HAL_GetTick()) * 1000UL + (unsigned long)elapsed_sub_ms;
+    const TIM_TypeDef *const tim = htim6.Instance;
+    uint32_t ms;
+    uint32_t cnt;
+    uint32_t again;
+
+    if (tim == nullptr) {
+        return (unsigned long)HAL_GetTick() * 1000UL;   /* timebase not up */
+    }
+    do {
+        ms    = HAL_GetTick();
+        cnt   = tim->CNT;
+        again = HAL_GetTick();
+    } while (ms != again);
+
+    if (((tim->SR & TIM_SR_UIF) != 0U) && (cnt < 500U)) {
+        ms++;   /* counter wrapped, HAL_IncTick() not run yet */
+    }
+    return (unsigned long)ms * 1000UL + (unsigned long)cnt;
 }
 
 long STM32Hal::pulseIn(uint32_t pin, uint32_t state, RadioLibTime_t timeout)

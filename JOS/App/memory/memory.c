@@ -18,6 +18,7 @@
  * target; test/fakes/seu_mitigation.h (same signatures, no RTOS) on the host,
  * so the lock/commit calls below stay flight code in both builds. */
 #include "seu_mitigation.h"
+#include "hw_watchdog.h"   /* hw_watchdog_boot_kick(): long pre-scheduler I2C */
 #include <string.h>
 #include <stdint.h>
 
@@ -77,6 +78,12 @@
  * failed attempt cannot corrupt a partially written select. */
 #define FRAM_I2C_TRIES      3U
 #define FRAM_I2C_TIMEOUT_MS 1000
+/* Presence probe timeout per trial. An F-RAM acknowledges its slave address
+ * immediately (no write-cycle busy period: FM24V10 datasheet, "NoDelay"
+ * writes), so the address phase completes in well under 1 ms even at
+ * 100 kHz; 10 ms is ample. The full 1 s transfer timeout here made a sick
+ * bus cost up to 8 x 3 x 1 s = 24 s at boot, far past the STWD100 tWD. */
+#define FRAM_PROBE_TIMEOUT_MS 10U
 /* One A16 page: the most a single device select (and a single 16-bit
  * memory-address field) spans. A transfer may stream across the page
  * boundary inside a chip - the part latches the full 17-bit address and
@@ -87,17 +94,14 @@
 #define FM24VN_NUM_CHIPS      4
 #define FRAM_SIZE             (FM24VN_NUM_CHIPS * FM24VN_CHIP_SIZE)
 
-/* FRAM layout (512 KB total):
- *   [0 .. cyclic_buffer_head)   : cyclic science-data buffer (wraps the device)
- *   [SEU_FRAM_BASE .. FRAM_SIZE)  : SEU golden records (W2-5), one fixed
- *                                 CRC-32-protected slot per region id,
- *                                 reserved at the TOP and grown downward; see
- *                                 Core/Inc/seu_mitigation.h SEU_FRAM_*.
- *
- * The cyclic buffer still wraps the whole device, so a wrapped head can land
- * on a golden slot; golden records reject anything they do not own
- * (magic / length / CRC), and the next commit write-through refreshes a
- * clobbered slot. Same trade-off as the retired App/obsw/scrub.c pool.
+/* FRAM layout (512 KB total, see the partition in memory.h):
+ *   [0 .. FRAM_CYCLIC_BYTES)          : cyclic science-data buffer, wraps
+ *                                       inside this range only;
+ *   [FRAM_GOLDEN_BASE .. FRAM_SIZE)   : SEU golden records (W2-5), one fixed
+ *                                       CRC-32-protected slot per region id;
+ *                                       see Core/Inc/seu_mitigation.h.
+ * The two ranges are disjoint by construction (static asserts below and in
+ * seu_mitigation.h).
  *
  * Compile-time guards: a zero (or non-power-of-two) chip size would make the
  * shift/mask decode below wrong and is the divide-by-zero class M1 guards
@@ -114,6 +118,10 @@ _Static_assert(FM24VN_CHIP_SIZE == 2U * FM24VN_PAGE_BYTES,
                "one chip is two A16 pages");
 _Static_assert(FRAM_SIZE == (512UL * 1024UL),
                "FRAM_SIZE must be 512 KB (4 x 128 KB) per RED_DES_ElectronicArchitecture_V1");
+_Static_assert(FRAM_SIZE == FRAM_TOTAL_BYTES,
+               "memory.h FRAM partition must describe the same bank");
+_Static_assert((FRAM_CYCLIC_BYTES + FRAM_GOLDEN_BYTES) == FRAM_SIZE,
+               "cyclic buffer + golden area must tile the bank exactly");
 
 extern I2C_HandleTypeDef hi2c1;
 
@@ -148,8 +156,9 @@ void fram_init(void)
     uint8_t missing = 0U;
     for (uint8_t sel = 0U; sel < 8U; sel++) {
         uint16_t dev = (uint16_t)((FM24VN_I2C_ADDR_BASE + sel) << 1);
+        hw_watchdog_boot_kick();
         if (HAL_I2C_IsDeviceReady(&hi2c1, dev, FRAM_I2C_TRIES,
-                                  FRAM_I2C_TIMEOUT_MS) != HAL_OK) {
+                                  FRAM_PROBE_TIMEOUT_MS) != HAL_OK) {
             missing |= (uint8_t)(1U << sel);
         }
     }
@@ -186,6 +195,10 @@ static int fram_xfer(int is_write, uint16_t dev_addr, uint16_t offset,
                      uint8_t *buf, uint16_t size)
 {
     for (uint8_t t = 0U; t < FRAM_I2C_TRIES; t++) {
+        /* Each try may take up to FRAM_I2C_TIMEOUT_MS (1 s) on a sick bus,
+           i.e. about the STWD100 tWD: refresh before each one while the
+           scheduler is not running yet (boot-time SEU golden restore). */
+        hw_watchdog_boot_kick();
         HAL_StatusTypeDef st = is_write
             ? HAL_I2C_Mem_Write(&hi2c1, dev_addr, offset,
                                 I2C_MEMADD_SIZE_16BIT, buf, size,
@@ -269,7 +282,7 @@ int fram_write(uint32_t addr, const uint8_t *buf, size_t len)
 }
 
 /* ========== Cyclic buffer ========== */
-/* 4x FM24VN10-G = 512 KB FRAM used as circular buffer */
+/* [0, FRAM_CYCLIC_BYTES) of the 4x FM24VN10-G bank, used as circular buffer */
 
 static uint32_t cb_head = 0;   /* next write position */
 
@@ -294,16 +307,19 @@ int cyclic_buffer_write(const uint8_t *data, size_t len)
     if (len == 0U) {
         return 0;
     }
-    if ((data == NULL) || (len > (size_t)FRAM_SIZE)) {
+    if ((data == NULL) || (len > (size_t)FRAM_CYCLIC_BYTES)) {
         return -1;
+    }
+    if (cb_head >= FRAM_CYCLIC_BYTES) {
+        cb_head = 0U;   /* never trust a corrupted head into the golden area */
     }
 
     /* Split once at the ring boundary, then fram_write() splits further at
      * every 64 KB device-select boundary. Advance cb_head only after
      * all transfers succeed: a failed I2C write must remain visible to the
      * caller rather than silently creating a hole in the telemetry stream. */
-    first = (len < (size_t)(FRAM_SIZE - cb_head)) ? len :
-            (size_t)(FRAM_SIZE - cb_head);
+    first = (len < (size_t)(FRAM_CYCLIC_BYTES - cb_head)) ? len :
+            (size_t)(FRAM_CYCLIC_BYTES - cb_head);
     if (cyclic_buffer_write_range(cb_head, data, first) != 0) {
         return -1;
     }
@@ -312,7 +328,7 @@ int cyclic_buffer_write(const uint8_t *data, size_t len)
         return -1;
     }
 
-    cb_head = (uint32_t)((cb_head + len) % FRAM_SIZE);
+    cb_head = (uint32_t)((cb_head + len) % FRAM_CYCLIC_BYTES);
     return 0;
 }
 
@@ -321,7 +337,7 @@ int cyclic_buffer_read(uint32_t offset, uint8_t *buf, size_t len)
     /* Same wrap-safe bound check as fram_range_valid(): offset + len in
      * 32-bit arithmetic can wrap past zero. fram_read() re-checks and splits
      * at select boundaries, so a multi-select read is served, not rejected. */
-    if (((uint64_t)offset + (uint64_t)len) > (uint64_t)FRAM_SIZE) return -1;
+    if (((uint64_t)offset + (uint64_t)len) > (uint64_t)FRAM_CYCLIC_BYTES) return -1;
     return fram_read(offset, buf, len);
 }
 
@@ -386,9 +402,9 @@ extern uintptr_t flash_base;
 _Static_assert((LASTSTATES_ENTRY_SIZE % 8U) == 0U,
                "LastStates entry must be a whole number of Flash double words");
 
-/* Compile-time guards tying the ring to the dual-bank pool description, so the
-   two writers of this pool (here and Core/Src/dual_bank.c) can never drift
-   apart or straddle the bank boundary (W2-2 review C3). */
+/* Compile-time guards tying the ring to the dual-bank pool description
+   (Core/Inc/dual_bank.h, which also reads the pool back), so the two can never
+   drift apart or straddle the bank boundary (W2-2 review C3). */
 #ifndef HOST_UNIT_TEST
 /* Pool-geometry guards. Skipped on the host, where LASTSTATES_FLASH_BASE is a
  * relocatable variable rather than a constant expression; the geometry they
@@ -792,15 +808,13 @@ static int flash_erase_page_bounded(uintptr_t addr)
  * LastStates pool lock (W2-2 review, CRITICAL: Flash write race).
  *
  * See memory.h for the full rationale and the meaning of the three return
- * values. Short version: laststates_write() and dual_bank.c:ls_append() both
- * run "pick the first erased slot -> unlock -> program -> lock" on the SAME
- * pool, from tasks of different priority, with configUSE_PREEMPTION == 1. One
- * mutex owns that sequence in both writers.
+ * values. Short version: laststates_write() runs "pick the slot -> erase ->
+ * unlock -> program -> lock" from tasks of different priority, with
+ * configUSE_PREEMPTION == 1. One mutex owns that sequence.
  *
  * The mutex is created in laststates_init(), which main() calls before
  * osKernelInitialize(): osMutexNew() only refuses to run from an ISR, so
- * creating it there is legal and removes any lazy-creation race between the
- * two writers.
+ * creating it there is legal and removes any lazy-creation race.
  * ------------------------------------------------------------------------- */
 
 /* Degraded-path telemetry. Compiled in BOTH builds so the host tests can see
@@ -809,16 +823,16 @@ static int flash_erase_page_bounded(uintptr_t addr)
  */
 static volatile uint32_t ls_lock_failures   = 0U;
 static volatile uint32_t ls_dropped_records = 0U;
+static volatile uint32_t ls_erase_ahead_failures = 0U;
 
 uint32_t laststates_lock_failures(void)   { return ls_lock_failures; }
 uint32_t laststates_dropped_records(void) { return ls_dropped_records; }
+uint32_t laststates_erase_ahead_failures(void) { return ls_erase_ahead_failures; }
 
-/* Every writer of this pool - laststates_write() here and
- * Core/Src/dual_bank.c:ls_append(), which drives HAL_FLASH_Program() itself
- * and never routes through laststates_write() - must call this when it
- * refuses a record because serialisation was unavailable. Without it the
- * dual-bank boot-fault / boot-OK markers were dropped silently and the
- * tri-state lock was invisible from the ground (Kilo #26). */
+/* Any writer of this pool that does not route through laststates_write()
+ * must call this when it refuses a record because serialisation was
+ * unavailable, so the loss is visible from the ground (Kilo #26). Every
+ * writer in the tree goes through laststates_write() today. */
 void laststates_note_dropped_record(void)
 {
     ls_dropped_records++;
@@ -987,30 +1001,100 @@ static int flash_write_row(uintptr_t addr, const uint8_t *data, size_t len)
     return rc;
 }
 
-/* Re-derive the write cursor from Flash. The pool is always written in order,
- * so the first erased slot is the next free one.
+/* ---------- Ring cursor derivation ----------
  *
- * This is also what makes the pool safe to SHARE with a second writer: the
- * dual-bank fallback (Core/Src/dual_bank.c) appends boot-fault / boot-OK
- * markers (tagged 'DBNK') outside laststates_write(), both before
- * laststates_init() runs and later from a task. Re-deriving the cursor means
- * those appends are simply picked up here instead of colliding with a stale
- * in-RAM index (W2-2 review C2). Returns the number of occupied slots.
- */
+ * The pool has no per-record sequence number (the 128 B entry is a frozen
+ * ground ICD), so the write cursor has to be re-derived from the erase state
+ * of the slots alone. That is only possible because of the ERASE-AHEAD
+ * invariant maintained by laststates_write():
+ *
+ *   whenever a write fills the last slot of a page, the NEXT page (the oldest
+ *   one in ring order) is erased immediately, so the ring always holds exactly
+ *   one contiguous run of erased slots, and the write cursor is its first slot.
+ *
+ * The previous implementation used "first erased slot counting from index 0"
+ * as the cursor. That is only true before the ring wraps for the first time:
+ * once page 0 had been recycled and refilled, the scan walked past the whole
+ * pool, fell back to slot 0 and erased page 0 AGAIN - so from then on it kept
+ * recycling the page holding the NEWEST records and never touched pages 1..3,
+ * which froze the oldest records forever (100 writes left records 16..63 and
+ * 96..99; 64..95 were destroyed).
+ *
+ * Returns the write cursor (first slot of the erased run) and stores the
+ * index of the OLDEST occupied slot in *oldest (LASTSTATES_MAX_ENTRIES when
+ * the pool is empty). A pool with no erased slot at all can only be a legacy
+ * layout or an erase-ahead that failed; its age order is unknowable, so the
+ * cursor falls back to slot 0 and the next write recycles page 0. */
+_Static_assert((LASTSTATES_MAX_ENTRIES <= 64U) &&
+               ((LASTSTATES_MAX_ENTRIES & (LASTSTATES_MAX_ENTRIES - 1U)) == 0U),
+               "laststates_scan() bitmap and ring mask need a power-of-two pool of <= 64 slots");
+static uint32_t laststates_scan(uint32_t *oldest, int *full)
+{
+    uint64_t erased   = 0U;
+    uint32_t n_erased = 0U;
+    uint32_t cursor   = LASTSTATES_MAX_ENTRIES;
+    uint32_t first    = LASTSTATES_MAX_ENTRIES;
+
+    for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
+        if (slot_is_erased(i)) {
+            erased |= ((uint64_t)1U << i);
+            n_erased++;
+        }
+    }
+
+    if (n_erased == LASTSTATES_MAX_ENTRIES) {
+        cursor = 0U;                           /* empty pool */
+    } else if (n_erased == 0U) {
+        cursor = 0U;                           /* full: age order unknown */
+        first  = 0U;
+    } else {
+        /* Start of the erased run: an erased slot whose ring predecessor is
+         * occupied. With the erase-ahead invariant there is exactly one. */
+        for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
+            const uint32_t prev = (i + LASTSTATES_MAX_ENTRIES - 1U) &
+                                  (LASTSTATES_MAX_ENTRIES - 1U);
+            if (((erased >> i) & 1U) != 0U && ((erased >> prev) & 1U) == 0U) {
+                cursor = i;
+                break;
+            }
+        }
+        /* Oldest record: the first occupied slot after the erased run. */
+        for (uint32_t k = 0U; k < LASTSTATES_MAX_ENTRIES; k++) {
+            const uint32_t i = (cursor + k) & (LASTSTATES_MAX_ENTRIES - 1U);
+            if (((erased >> i) & 1U) == 0U) {
+                first = i;
+                break;
+            }
+        }
+    }
+    if (oldest != NULL) {
+        *oldest = first;
+    }
+    if (full != NULL) {
+        *full = (n_erased == 0U) ? 1 : 0;
+    }
+    return cursor;
+}
+
+/* Cursor validity: false until laststates_init() (or the first write) has
+ * derived it from Flash. Core/Src/dual_bank.c logs through laststates_write()
+ * BEFORE laststates_init() runs, and the compile-time mirror default (idx 0)
+ * must never be trusted there: slot 0 of a used pool is occupied, and taking
+ * it at face value would erase page 0. */
+static uint8_t ls_cursor_known = 0U;
+
 static uint32_t laststates_resync(void)
 {
-    uint32_t idx = 0U;
+    ls_mirror.idx   = laststates_scan(NULL, NULL);
+    ls_cursor_known = 1U;
+    return ls_mirror.idx;
+}
 
-    while (idx < LASTSTATES_MAX_ENTRIES) {
-        if (slot_is_erased(idx)) {
-            break;
-        }
-        idx++;
-    }
-    /* A completely full pool wraps to slot 0; the next write recycles the
-     * oldest page there. */
-    ls_mirror.idx = (idx >= LASTSTATES_MAX_ENTRIES) ? 0U : idx;
-    return idx;
+uint32_t laststates_oldest_slot(void)
+{
+    uint32_t oldest = LASTSTATES_MAX_ENTRIES;
+    (void)laststates_scan(&oldest, NULL);
+    return oldest;
 }
 
 void laststates_init(void)
@@ -1018,24 +1102,16 @@ void laststates_init(void)
     dwt_cyccnt_enable();
 
     /* Create the pool mutex before anything can write: main() calls us before
-     * osKernelInitialize(), and dual_bank.c's writer only starts once the
-     * watchdog task runs, so the mutex always exists by the time two writers
-     * can actually race (W2-2 review, CRITICAL). */
+     * osKernelInitialize(), so the mutex always exists by the time two tasks
+     * can actually race on the pool (W2-2 review, CRITICAL). */
     laststates_pool_lock_create();
 
-    /* Scan the pool for the first free (erased) slot. That slot is where the
-     * next record must be appended so post-mortem readback can recover the
-     * existing trail after the reboot (review C1). If the pool is completely
-     * full we wrap to index 0 and the next write will recycle the oldest page.
-     */
-    uint32_t idx   = 0U;
+    /* Re-derive the ring cursor from Flash (see laststates_scan()), so the
+     * next record lands right after the newest one that survived the reset
+     * (review C1) - not at "the first erased slot", which is wrong as soon
+     * as the ring has wrapped. */
+    uint32_t idx   = laststates_scan(NULL, NULL);
     uint32_t valid = 0U;
-    while (idx < LASTSTATES_MAX_ENTRIES) {
-        if (slot_is_erased(idx)) {
-            break;
-        }
-        idx++;
-    }
     for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
         if (slot_is_complete(i)) {
             valid++;
@@ -1048,20 +1124,32 @@ void laststates_init(void)
        seu_mitigation_init() has registered the region. */
     seu_mitigation_lock();
     ls_mirror.magic = LASTSTATES_MIRROR_MAGIC;
-    ls_mirror.idx   = (idx < LASTSTATES_MAX_ENTRIES) ? idx : 0U;
+    ls_mirror.idx   = idx;
     ls_mirror.count = valid;
+    ls_cursor_known = 1U;
     (void)seu_mitigation_commit(SEU_REGION_LASTSTATES);
     seu_mitigation_unlock();
 }
+
+/* Erase the page that starts at slot `idx` (slot index must be page aligned). */
+static int laststates_erase_slot_page(uint32_t idx)
+{
+    const uintptr_t addr = (uintptr_t)LASTSTATES_FLASH_BASE +
+                           (uintptr_t)idx * LASTSTATES_ENTRY_SIZE;
+    const uintptr_t page = addr & ~(((uintptr_t)1U << LS_PAGE_SHIFT) - 1U);
+    return flash_erase_page_bounded(page);
+}
+
+#define LS_SLOTS_PER_PAGE  ((uint32_t)(FLASH_PAGE_SIZE / LASTSTATES_ENTRY_SIZE))
+_Static_assert((FLASH_PAGE_SIZE % LASTSTATES_ENTRY_SIZE) == 0U,
+               "a Flash page must hold a whole number of LastStates slots");
 
 int laststates_write(const laststates_entry_t *entry)
 {
     if (entry == NULL) return -1;
 
-    /* Take the pool lock for the WHOLE select-slot / erase / program sequence:
-       dual_bank.c:ls_append() runs the same sequence from a higher-priority
-       task, and interleaving the two corrupts the pool (W2-2 review,
-       CRITICAL). Every exit path below must release it. */
+    /* Take the pool lock for the WHOLE select-slot / erase / program sequence
+       (W2-2 review, CRITICAL). Every exit path below must release it. */
     const int lock_held = laststates_pool_lock();
 
     /* Serialisation required but unavailable (mutex creation or acquire
@@ -1075,46 +1163,55 @@ int laststates_write(const laststates_entry_t *entry)
         return -1;
     }
 
-    /* Bounds guard: the cursor is always in range after init, but never trust
-       a cached index against corruption. */
+    /* Bounds guard: never trust a cached index against corruption. */
     if (ls_mirror.idx >= LASTSTATES_MAX_ENTRIES) {
-        ls_mirror.idx = 0U;
+        ls_cursor_known = 0U;
     }
-
-    /* The pool has a second writer: Core/Src/dual_bank.c appends boot-fault
-       and boot-OK markers (tagged 'DBNK') outside laststates_write(), both
-       before laststates_init() runs and later from a task. Programming a slot
-       that is no longer erased fails on STM32L4 and, because the cursor never
-       advanced, every later write would fail too — the forensic log would be
-       silently dead. So whenever the target slot has moved under us, re-derive
-       the cursor from Flash before deciding anything (W2-2 review C2). Only if
-       the pool is genuinely full does the ring wrap and recycle a page. */
-    uint32_t ls_idx = ls_mirror.idx;  /* local cursor = SEU mirror cursor */
-    if (!slot_is_erased(ls_idx)) {
+    if (ls_cursor_known == 0U) {
         (void)laststates_resync();
-        ls_idx = ls_mirror.idx;  /* resync may have moved the cursor */
     }
 
-    uintptr_t addr = (uintptr_t)LASTSTATES_FLASH_BASE + (uintptr_t)ls_idx * LASTSTATES_ENTRY_SIZE;
-    ls_mirror.idx = ls_idx;  /* keep the SEU scrubber mirror in sync (W2-5) */
-
-    /* If the target slot STILL holds a valid (programmed) record after the
-     * resync, the ring really has wrapped: recycle the OLDEST page it belongs
-     * to. Erasing only that page preserves every newer page, so the newest
-     * valid record is never lost (review C1). Note this can drop dual-bank
-     * boot-fault evidence — fail-safe by design: a lost counter can only
-     * inhibit a fallback, never trigger one. */
+    uint32_t ls_idx = ls_mirror.idx;
     if (!slot_is_erased(ls_idx)) {
-        uintptr_t page_addr = addr & ~(((uintptr_t)1U << LS_PAGE_SHIFT) - 1U);
-        if (flash_erase_page_bounded(page_addr) != 0) {
-            laststates_pool_unlock(lock_held);
-            return -1;
+        /* The cursor slot is no longer free: another writer, a torn record or
+           an erase-ahead that did not happen. Re-derive it from Flash. */
+        int full = 0;
+        const uint32_t cached = ls_idx;
+        ls_idx = laststates_scan(NULL, &full);
+        if ((full != 0) && ((cached % LS_SLOTS_PER_PAGE) == 0U)) {
+            /* No erased slot anywhere: the last erase-ahead failed. The
+               cached cursor then still names the page it was meant to
+               recycle - the oldest one - which the Flash scan alone cannot
+               tell apart from any other page. */
+            ls_idx = cached;
+        }
+        if (!slot_is_erased(ls_idx)) {
+            if (laststates_erase_slot_page(ls_idx) != 0) {
+                laststates_pool_unlock(lock_held);
+                return -1;
+            }
         }
     }
 
+    uintptr_t addr = (uintptr_t)LASTSTATES_FLASH_BASE + (uintptr_t)ls_idx * LASTSTATES_ENTRY_SIZE;
     if (flash_write_row(addr, (const uint8_t *)entry, LASTSTATES_ENTRY_SIZE) != 0) {
+        /* The slot may now be torn: force a re-scan on the next write. */
+        ls_cursor_known = 0U;
         laststates_pool_unlock(lock_held);
         return -1;
+    }
+
+    const uint32_t next = (ls_idx + 1U) & (LASTSTATES_MAX_ENTRIES - 1U);
+
+    /* Erase-ahead (see laststates_scan()): the page just filled up, so recycle
+       the next one - the oldest in ring order - now, keeping one erased run
+       in the pool that marks the cursor across a reset. A failure is not a
+       failure of THIS record (it is already programmed); the next write finds
+       the page-aligned cursor occupied and retries the erase. */
+    if (((next % LS_SLOTS_PER_PAGE) == 0U) && !slot_is_erased(next)) {
+        if (laststates_erase_slot_page(next) != 0) {
+            ls_erase_ahead_failures++;
+        }
     }
 
     /* Advance the bookkeeping and re-take its snapshot in one atomic step, so
@@ -1122,7 +1219,7 @@ int laststates_write(const laststates_entry_t *entry)
        legitimate advance for a bit flip (W2-5). The lock is PRIMASK based, so
        this is also safe on the parity-NMI path, which logs through here. */
     seu_mitigation_lock();
-    ls_mirror.idx = (ls_mirror.idx + 1U) & (LASTSTATES_MAX_ENTRIES - 1U);
+    ls_mirror.idx = next;
     if (ls_mirror.count < LASTSTATES_MAX_ENTRIES) { ls_mirror.count++; }
     (void)seu_mitigation_commit(SEU_REGION_LASTSTATES);
     seu_mitigation_unlock();
@@ -1161,8 +1258,8 @@ int laststates_dump_all(uint8_t *out, size_t *len)
     uint32_t needed   = 0U;
     uint32_t valid    = 0U;
 
-    /* Hold the pool lock across BOTH passes. laststates_write() and
-     * dual_bank.c:ls_append() seal a record with a single double-word program
+    /* Hold the pool lock across BOTH passes. laststates_write() seals a
+     * record with a single double-word program
      * (see slot_is_complete()), so without the lock a record can become
      * complete between the counting pass and the copying pass and the memcpy
      * would run one entry past the capacity that was just checked (Kilo #26).
@@ -1182,10 +1279,18 @@ int laststates_dump_all(uint8_t *out, size_t *len)
         return -1;
     }
 
-    /* Scan the whole pool: because page recycling can leave gaps, valid
-     * records are not necessarily a contiguous prefix. Copy every valid slot
-     * in index order so ground can reconstruct the trail by timestamp. */
-    for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
+    /* Copy every complete record in CHRONOLOGICAL order, oldest first,
+     * walking the ring from the oldest occupied slot (see laststates_scan()).
+     * Slot-index order is not time order once the ring has wrapped, and the
+     * entry timestamps restart at every boot, so they cannot restore it on
+     * the ground either. */
+    uint32_t oldest = LASTSTATES_MAX_ENTRIES;
+    (void)laststates_scan(&oldest, NULL);
+    if (oldest >= LASTSTATES_MAX_ENTRIES) {
+        oldest = 0U;
+    }
+    for (uint32_t k = 0U; k < LASTSTATES_MAX_ENTRIES; k++) {
+        const uint32_t i = (oldest + k) & (LASTSTATES_MAX_ENTRIES - 1U);
         if (valid >= needed) {
             break;      /* hard bound: never copy past the checked capacity */
         }

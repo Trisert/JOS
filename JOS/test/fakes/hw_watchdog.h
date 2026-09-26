@@ -13,9 +13,11 @@
 #include <stdint.h>
 
 void hw_watchdog_kick(void);
+void hw_watchdog_boot_kick(void);
 
 /* Host-only observation seam (not part of the flight API). */
 uint32_t host_hw_watchdog_kick_count(void);
 void     host_hw_watchdog_reset(void);
+uint32_t host_hw_watchdog_boot_kick_count(void);
 
 #endif /* JOS_TEST_FAKE_HW_WATCHDOG_H */

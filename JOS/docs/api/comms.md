@@ -22,9 +22,34 @@ Semtech SX1268 on SPI1.
 | `lora_rx_task(void *arg)` | `void` | FreeRTOS task: interrupt-driven RX, CRC, decrypt, dispatch |
 | `lora_beacon_task_create(void)` | `osThreadId_t` | Create beacon task (declared in `comms.h`) |
 | `lora_rx_task_create(void)` | `osThreadId_t` | Create RX task (declared in `comms.h`) |
-| `lora_send_chunked(const uint8_t *data, size_t len)` | `int` | Fragment into ≤64 B packets; each chunk carries a 3-B header (byte 0 = message id, byte 1 = 0-based seq, byte 2 = total count), 128-B beacon ships as 3 chunks; aborts + counts on radio error |
-| `comms_tx_get_stats(comms_tx_stats_t *out)` | `void` | TX counters: sequences ok/failed, chunks sent |
-| `comms_rx_handle_frame(const uint8_t *frame, size_t len)` | `comms_tc_result_t` | Validate + dispatch uplink; every verdict counted (incl. `PHY` for radio-level drops below the validator) |
+| `lora_send_chunked(const uint8_t *data, size_t len)` | `int` | Fragment into ≤64 B packets; each chunk carries a 3-B header (byte 0 = message id, byte 1 = 0-based seq, byte 2 = total count), 128-B beacon ships as 3 chunks; aborts + counts on radio error; **re-arms RX on every exit** (`startTransmit()` leaves the SX1268 in standby) |
+| `comms_tx_get_stats(comms_tx_stats_t *out)` | `void` | TX counters: sequences ok/failed, chunks sent, RX re-arm failures |
+| `comms_rx_handle_frame(const uint8_t *frame, size_t len)` | `comms_tc_result_t` | Validate + dispatch uplink; the verdict is what the dispatcher reports: `OK` only when the command was carried out, `REFUSED` when its subsystem refused it (state gates, beacon bounds), `OPCODE` for validated-but-unimplemented opcodes (`SET_CONFIG`, `SEND_DATA`); every verdict counted (incl. `PHY` for radio-level drops) |
+| `comms_flags_have(flags, want)` | `bool` | Correct test of an `osThreadFlagsWait()` result (mask + error bit), used by the RX task |
+
+Radio concurrency: every `lora_*()` entry point that talks to the SX1268 holds
+a radio mutex (`radiolib_driver.cpp`) for its whole command sequence, because
+the beacon task and the RX task share the chip, SPI1 and the DMA state.
+`lora_start_receive()` refuses while a TX is in flight. The HAL's SPI wait
+blocks on a thread flag set by the DMA IRQ (other tasks keep running), and
+`delay()` uses `osDelay()` once the scheduler runs.
+
+## Uplink authentication key
+
+Authenticated frames carry a truncated HMAC-SHA256 tag (upstream `makeMAC`,
+4-byte key). The key is provisioned at build time:
+`make release COMMS_AUTH_KEY=<8 hex digits>` (-> `COMMS_AUTH_KEY0..3` in the
+generated, mode-0600 `build/gen/comms_auth_key.h`, never on a logged command
+line). Without
+it the image only knows the **published** upstream default `A1 B2 C3 D4`, and
+every authenticated frame is rejected with `MAC` (fail closed). The `bench`
+profile opts back into the public key (`COMMS_AUTH_ALLOW_PUBLIC_KEY=1`).
+Changing the key rebuilds the affected objects automatically (the generated
+header is tracked by the dependency files).
+
+Open (TASKS.md): 4-byte key and 4-byte tag are brute-forceable offline from
+one captured frame, and there is no replay protection — both are properties of
+the upstream frame/MAC design shared with the ground segment.
 
 > `lora_beacon_task_create` / `lora_rx_task_create` prototypes were missing
 > from `comms.h` and caused a build failure on GCC 15 (implicit-function-

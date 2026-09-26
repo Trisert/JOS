@@ -6,11 +6,17 @@
 
 | Function | Purpose |
 |----------|---------|
-| `fram_init()` | Probe all eight I2C1 FRAM device selects at boot |
+| `fram_init()` | Probe all eight I2C1 FRAM device selects at boot (10 ms per trial, watchdog refreshed between selects while the scheduler is not running) |
 | `cyclic_buffer_write(const uint8_t *data, size_t len)` | Append; overwrite oldest on wrap |
 | `cyclic_buffer_read(uint32_t offset, uint8_t *buf, size_t len)` | Retrieve for downlink |
 
 Oldest data overwritten first — graceful degradation, no fault.
+
+**Partition** (`memory.h`): the cyclic buffer owns `[0, FRAM_CYCLIC_BYTES)` and
+wraps inside it; the top `FRAM_GOLDEN_BYTES` (4 KB, from `FRAM_GOLDEN_BASE`)
+hold the SEU golden records (`Core/Inc/seu_mitigation.h` `SEU_FRAM_*`). The
+two never overlap (static asserts on both sides). The buffer head is not yet
+persisted across a reset (`cyclic_buffer_init()` starts at 0).
 
 ## LastStates Pool (Flash)
 
@@ -21,13 +27,19 @@ exposed as `LASTSTATES` region in `STM32L496VGTX_FLASH.ld`.
 
 | Function | Purpose |
 |----------|---------|
-| `laststates_init()` | Scan the pool for the first free (erased) slot; that is the next write index so post-mortem readback recovers the existing trail. |
-| `laststates_write(entry)` | Append one record at the write index. If the slot still holds valid data the ring has wrapped, so the **oldest 2 KB page** it belongs to is erased — never the newest record. |
-| `laststates_dump_all(out, len)` / `laststates_count()` | Read back every valid slot (the pool is scanned whole, because page recycling can leave gaps). |
+| `laststates_init()` | Re-derive the write cursor from the erase state: the first slot of the (single) erased run, i.e. right after the newest record. |
+| `laststates_write(entry)` | Append one record at the cursor. When the write fills the last slot of a 2 KB page, the **next page — the oldest in ring order — is erased immediately** (erase-ahead). If that erase fails, the next write retries it (`laststates_erase_ahead_failures()`). |
+| `laststates_dump_all(out, len)` / `laststates_count()` | Read back every complete record, **oldest first** (ring order from `laststates_oldest_slot()`). |
+| `laststates_oldest_slot()` | Index of the oldest record in ring order; `LASTSTATES_MAX_ENTRIES` when empty. Readers that need time order use it (dual-bank boot-fault count). |
 | `flash_write_row` / `flash_write_dword_bounded` | Double-word program bounded by the **DWT cycle counter** (not `HAL_GetTick()`), so it can never block indefinitely in a fault handler. |
 | `flash_erase_page_bounded` | Erase one 2 KB page with a DWT-bounded wait; correctly selects **bank 2** (the LastStates pool sits at `0x08080000`). |
 
-> The pool is a ring of 64 × 128 B records. STM32L4 Flash is erased per
-> 2 KB page, so a full page (16 slots) is recycled when the cursor wraps.
-> Erasing only that page preserves every newer page, so the newest valid
-> record is never overwritten. Every Flash operation is cycle-count bounded.
+> The pool is a ring of 64 × 128 B slots. STM32L4 Flash is erased per 2 KB
+> page (16 slots). The entry has no sequence number (frozen ICD), so the
+> cursor is recovered from the erase state alone; that is why the ring always
+> keeps one erased run (erase-ahead). Consequence: once the ring has wrapped
+> it holds **48 to 63 records**, not 64. The oldest page is always the one
+> recycled, so the newest records are never lost. (Before the fix the cursor
+> was "first erased slot from index 0", which after the first wrap kept
+> recycling page 0 — the newest records — and froze pages 1–3.) Every Flash
+> operation is cycle-count bounded.

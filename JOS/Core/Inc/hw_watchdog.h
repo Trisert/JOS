@@ -76,6 +76,14 @@ void hw_watchdog_kick(void);
   */
 uint8_t hw_watchdog_is_running(void);
 
+/* Refresh from inside long boot-time work that runs before the scheduler
+   (FRAM probe/retries, SEU golden restore): no-op once the scheduler has
+   started. The external STWD100 (OBC V2.0, WDI <- PC15) needs an edge within
+   tWD >= 1.12 s (STWD100-Y datasheet), and a single FRAM transfer may take up
+   to its 1 s HAL timeout on a sick bus - several of those between the
+   explicit kicks in main() reset the board in the middle of the boot. */
+void hw_watchdog_boot_kick(void);
+
 #ifdef __cplusplus
 }
 #endif
