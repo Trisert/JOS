@@ -40,7 +40,8 @@ Authenticated frames carry a truncated HMAC-SHA256 tag (upstream `makeMAC`,
 4-byte key). The key is provisioned at build time:
 `make release COMMS_AUTH_KEY=<8 hex digits>` (-> `COMMS_AUTH_KEY0..3` in the
 generated, mode-0600 `build/gen/comms_auth_key.h`, never on a logged command
-line). Without
+line; a later `make` without the variable keeps the provisioned header,
+`COMMS_AUTH_KEY=` removes it — see `docs/dev/building.md`). Without
 it the image only knows the **published** upstream default `A1 B2 C3 D4`, and
 every authenticated frame is rejected with `MAC` (fail closed). The `bench`
 profile opts back into the public key (`COMMS_AUTH_ALLOW_PUBLIC_KEY=1`).
@@ -75,6 +76,11 @@ merges chunks across ids. A sequence aborted mid-TX (radio error, counted in
 ## Beacon blocking vs watchdog
 
 One beacon TX holds `loraBeacon` for up to ~6 s (3 chunks × 2 s TX_DONE wait).
+`lora_tx()` routes DIO1 to the sender **before** `startTransmit()`, and
+`lora_tx_wait_done()` accepts a wake-up only when the SX1268 IRQ status
+(`getIrqFlags()`) carries `TX_DONE`, so neither a preemption after
+`startTransmit()` nor an RX_DONE pending from receive mode can be mistaken
+for the other.
 No mid-sequence watchdog kick is needed: the task is monitored against its
 1..16 min cadence and flagged only after 3× the period (≥ 3 min), so the block
 sits two orders of magnitude inside the monitor window.

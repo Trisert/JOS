@@ -89,7 +89,11 @@ spin-forever behaviour on the bench (the fallback is then inert).
 
 A boot is declared good only after `DUAL_BANK_BOOT_OK_UPTIME_MS` (5 s) of
 scheduler uptime, from the watchdog monitor task — not at `osKernelStart()`,
-which would close the window before any task had run.
+which would close the window before any task had run. If that boot's
+`BOOT_OK` marker cannot be written, the `ok_pending` token lets the next boot
+honour the proof once and retry the write; if that retry fails too, the
+marker stays owed and the next `dual_bank_boot_complete()` retries it again
+(re-raising the token on failure) instead of dropping it.
 
 **Open layout conflict:** the LastStates pool occupies `0x08080000`, i.e. the
 exact address the boot ROM fetches the golden vector table from after a `BFB2`

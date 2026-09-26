@@ -532,6 +532,66 @@ void test_laststates_failed_erase_ahead_recycles_the_oldest_page_later(void)
     }
 }
 
+/* A program failure that tears the LAST erased slot of a wrapped ring (64 +
+ * 15 writes: page 0 recycled, slots 0..14 refilled, slot 15 the only erased
+ * one). Before the fix the failure invalidated the cursor; the re-scan then
+ * found no erased slot, fell back to slot 0 and the next write erased page 0,
+ * destroying records 64..78 - the newest ones. The torn slot must instead be
+ * consumed, page 1 (the oldest) recycled, and records 64..78 kept. */
+void test_laststates_torn_last_free_slot_does_not_recycle_the_newest_page(void)
+{
+    static uint8_t dump[LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE];
+    size_t   len = sizeof(dump);
+    uint32_t n;
+    uint32_t i;
+
+    for (i = 0u; i < 79u; i++) {
+        laststates_entry_t e = make_entry(i, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, (uint8_t)i);
+        TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+    }
+    host_flash_fail_program_after(5u);       /* 5 dwords land, then PROGERR */
+    {
+        laststates_entry_t e = make_entry(79u, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, 79u);
+        TEST_ASSERT_EQUAL_INT(-1, laststates_write(&e));
+    }
+    for (i = 80u; i < 83u; i++) {
+        laststates_entry_t e = make_entry(i, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, (uint8_t)i);
+        TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(dump, &len));
+    n = (uint32_t)(len / LASTSTATES_ENTRY_SIZE);
+    TEST_ASSERT_TRUE(n >= 18u);
+    /* Newest first from the end: 82, 81, 80, then 78 down to 64 (79 torn). */
+    TEST_ASSERT_EQUAL_UINT32(82u, dumped_ts(dump, n - 1u));
+    TEST_ASSERT_EQUAL_UINT32(81u, dumped_ts(dump, n - 2u));
+    TEST_ASSERT_EQUAL_UINT32(80u, dumped_ts(dump, n - 3u));
+    for (i = 0u; i < 15u; i++) {
+        TEST_ASSERT_EQUAL_UINT32(78u - i, dumped_ts(dump, n - 4u - i));
+    }
+}
+
+/* A program failure that leaves the slot fully erased (PROGERR on the first
+ * double word) keeps the cursor: the next record lands in that same slot. */
+void test_laststates_failed_program_with_nothing_written_retries_the_slot(void)
+{
+    laststates_entry_t a = make_entry(1u, STATE_READY, STATE_ACTIVE,
+                                      TRIGGER_TASK_COMPLETE, 0x11u);
+    laststates_entry_t b = make_entry(2u, STATE_READY, STATE_ACTIVE,
+                                      TRIGGER_TASK_COMPLETE, 0x22u);
+
+    host_flash_fail_program_after(0u);
+    TEST_ASSERT_EQUAL_INT(-1, laststates_write(&a));
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&b));
+
+    TEST_ASSERT_EQUAL_UINT32(1u, laststates_count());
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&b, host_flash_pool(),
+                                  LASTSTATES_ENTRY_SIZE);
+}
+
 /* =====================================================================
  * FRAM / cyclic buffer (same HAL doubles, I2C side)
  * ===================================================================== */

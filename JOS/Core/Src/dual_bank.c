@@ -82,6 +82,13 @@ static bool               db_golden_valid = false;
 static uint32_t           db_optr         = 0U;
 static bool               db_bfb2_armed   = false;
 
+/* Set when dual_bank_init() honoured an ok_pending token but could not write
+ * the BOOT_OK marker through. The counters were zeroed on that proof, so
+ * dual_bank_boot_complete() would otherwise see "nothing to clear", skip the
+ * write and drop the token for good - leaving the stale BOOT_FAULT records in
+ * Flash to trip the fallback on the next reset of a healthy image. */
+static bool               db_ok_marker_owed = false;
+
 /* ===========================================================================
  * Option bytes
  * ========================================================================= */
@@ -384,7 +391,8 @@ int dual_bank_boot_complete(void)
 
     /* Only touch Flash when there is evidence to clear — a nominal boot must
      * not consume a pool slot on every power cycle. */
-    if ((db_fault_count == 0U) && (db_scratch.fault_count == 0U)) {
+    if ((db_fault_count == 0U) && (db_scratch.fault_count == 0U) &&
+        !db_ok_marker_owed) {
         db_scratch.pending    = 0U;
         db_scratch.ok_pending = 0U;
         return 0;
@@ -408,6 +416,7 @@ int dual_bank_boot_complete(void)
     db_scratch.pending     = 0U;
     db_scratch.ok_pending  = 0U;
     db_fault_count         = 0U;
+    db_ok_marker_owed      = false;
     return 0;
 }
 
@@ -508,6 +517,7 @@ dual_bank_status_t dual_bank_init(void)
      * lifetime to exactly one boot, whatever path is taken below. */
     const uint32_t ok_pending_snapshot = db_scratch.ok_pending;
     db_scratch.ok_pending = 0U;
+    db_ok_marker_owed     = false;
 
     db_optr        = read_user_option_bytes();
     db_active_bank = dual_bank_active_bank();
@@ -525,8 +535,15 @@ dual_bank_status_t dual_bank_init(void)
          * cleared. Honour that proof once, for this boot only, and try to
          * write it through now. Without this escape a single failed marker
          * write turns "fault_count >= threshold" into a permanent
-         * boot_looping verdict on a healthy image (W2-2 review). */
-        (void)ls_append(TRIGGER_BOOT_OK, 0U);
+         * boot_looping verdict on a healthy image (W2-2 review).
+         *
+         * If the write-through fails again, the marker stays OWED: this
+         * boot's dual_bank_boot_complete() must retry it (and re-raise the
+         * token if that fails too) instead of taking its "nothing to clear"
+         * early return on the counters zeroed just below. */
+        if (ls_append(TRIGGER_BOOT_OK, 0U) != 0) {
+            db_ok_marker_owed = true;
+        }
         db_scratch.fault_count = 0U;
         db_scratch.pending     = 0U;
         db_fault_count         = 0U;
