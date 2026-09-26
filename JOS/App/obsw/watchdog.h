@@ -65,14 +65,46 @@ void watchdog_alive(const osThreadId_t handle);
 /* Convenience wrapper: signal liveness for the calling task */
 void watchdog_alive_self(void);
 
-/* Suspend/defer policy for a stalled task (see watchdog.c): returns 1 when
-   `suspect` may be suspended now, 0 when the escalation must be deferred
-   because `suspect` currently holds the LastStates pool mutex (`pool_holder`
-   as read by laststates_pool_holder(), NULL when the mutex is free).
-   Suspending the holder would wedge every later laststates_write() on an
-   acquire its holder can no longer release, so the monitor defers the whole
-   escalation (no suspend, no Flash write) and retries on the next scan. */
+/* Record/defer gate for a stalled task (see watchdog.c): returns 1 when the
+   escalation record may be written for `suspect` now, 0 when it must be
+   deferred because `suspect` currently holds the LastStates pool mutex
+   (`pool_holder` as read by laststates_pool_holder(), NULL when the mutex is
+   free) - writing the record would wedge the monitor on that mutex. The name
+   predates the reset policy (the monitor used to suspend the task). */
 int watchdog_suspend_allowed(osThreadId_t suspect, osThreadId_t pool_holder);
+
+/* ---------- Escalation of a stalled task ----------
+   A task silent for more than 3x its declared period is escalated: the
+   monitor writes a TRIGGER_WATCHDOG LastStates record and resets the OBC
+   (after dual_bank_mark_boot_fault(), so a task that hangs on every boot
+   arms the golden-image fallback). When the stalled task holds the
+   LastStates pool mutex the record cannot be written (it would wedge the
+   monitor): the escalation is deferred and retried on the next scan, at most
+   WDG_MAX_HOLDER_DEFERRALS times in a row, after which the OBC resets
+   without the record. 60 scans x 500 ms = 30 s: two orders of magnitude
+   above the documented nominal pool hold (~80 ms, see state_machine.c
+   try_transition()), yet a bounded wait for a task that hung inside the
+   pool lock. */
+#define WDG_MAX_HOLDER_DEFERRALS   60u
+
+#define WDG_ACTION_NONE               0  /* nothing to escalate (NULL suspect) */
+#define WDG_ACTION_DEFER              1  /* suspect holds the pool mutex: retry */
+#define WDG_ACTION_RECORD_AND_RESET   2  /* record TRIGGER_WATCHDOG, reset OBC  */
+#define WDG_ACTION_RESET_UNRECORDED   3  /* deferral budget spent: reset only   */
+
+/* Pure decision behind the escalation (host-tested): what to do with
+   `suspect` given the current pool-mutex holder and how many times in a row
+   its escalation has already been deferred. */
+int watchdog_escalation_action(osThreadId_t suspect, osThreadId_t pool_holder,
+                               uint32_t consecutive_deferrals);
+
+#ifdef HOST_UNIT_TEST
+/* Host-only observation of the last escalation (the record and the reset are
+   compiled out on the host): the WDG_ACTION_* taken, and how many resets the
+   monitor would have performed. */
+int      watchdog_last_escalation_action(void);
+uint32_t watchdog_escalation_resets(void);
+#endif
 
 /* Escalations deferred by the policy above (suspect held the pool mutex).
    The deferral leaves no Flash record by construction - writing one would

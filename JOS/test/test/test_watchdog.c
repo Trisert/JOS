@@ -24,9 +24,10 @@
  *     on every scan, seeds entries registered before the scheduler started,
  *     and declares the boot good only after DUAL_BANK_BOOT_OK_UPTIME_MS of
  *     scheduler uptime, retrying a bounded number of times.
-+ *   - the suspend/defer policy: a stalled task that holds the LastStates
-+ *     pool mutex is never suspended (that would wedge the pool) - the
-+ *     escalation is deferred, counted, and retried on the next scan.
++ *   - the escalation policy: a stalled task is recorded and the OBC reset;
++ *     when it holds the LastStates pool mutex the record would wedge the
++ *     monitor, so the escalation is deferred, counted and retried - at most
++ *     WDG_MAX_HOLDER_DEFERRALS times in a row, then the OBC resets unrecorded.
 + *   - stack high-water-mark telemetry: every scan samples
 + *     uxTaskGetStackHighWaterMark() per registered task for
 + *     watchdog_task_stack_hwm().
@@ -572,4 +573,86 @@ void test_watchdog_task_stack_hwm_rejects_unknown_handle_and_null(void)
 
     TEST_ASSERT_EQUAL_INT(-1, watchdog_task_stack_hwm(TH(0), NULL));
     TEST_ASSERT_EQUAL_INT(-1, watchdog_task_stack_hwm(TH(1), &hwm));
+}
+
+/* ================= escalation: record + reset ================= */
+
+/* The pure decision: a free (or foreign) pool mutex -> record and reset; the
+   suspect holding it -> defer, but only WDG_MAX_HOLDER_DEFERRALS times in a
+   row, then reset without the record. A NULL suspect escalates nothing. */
+void test_watchdog_escalation_action_policy(void)
+{
+    TEST_ASSERT_EQUAL_INT(WDG_ACTION_NONE,
+                          watchdog_escalation_action(NULL, NULL, 0u));
+    TEST_ASSERT_EQUAL_INT(WDG_ACTION_RECORD_AND_RESET,
+                          watchdog_escalation_action(TH(0), NULL, 0u));
+    TEST_ASSERT_EQUAL_INT(WDG_ACTION_RECORD_AND_RESET,
+                          watchdog_escalation_action(TH(0), TH(1), 1000u));
+    TEST_ASSERT_EQUAL_INT(WDG_ACTION_DEFER,
+                          watchdog_escalation_action(TH(0), TH(0), 0u));
+    TEST_ASSERT_EQUAL_INT(WDG_ACTION_DEFER,
+                          watchdog_escalation_action(TH(0), TH(0),
+                                                     WDG_MAX_HOLDER_DEFERRALS - 1u));
+    TEST_ASSERT_EQUAL_INT(WDG_ACTION_RESET_UNRECORDED,
+                          watchdog_escalation_action(TH(0), TH(0),
+                                                     WDG_MAX_HOLDER_DEFERRALS));
+}
+
+/* A stalled task is no longer merely suspended (which left no recovery path:
+   the IWDG kept being kicked and no telecommand resumes a task): the monitor
+   records the stall and resets the OBC - once per stall. */
+void test_monitor_escalates_a_stalled_task_with_record_and_reset(void)
+{
+    const uint32_t resets_before = watchdog_escalation_resets();
+
+    given_kernel_running();
+    xTaskGetTickCount_ExpectAndReturn(0u);
+    TEST_ASSERT_EQUAL_INT(0, watchdog_register_task(TH(0), 100u));
+    xTaskGetTickCount_ExpectAndReturn(0u);
+    watchdog_alive(TH(0));
+
+    capture_monitor_entry();
+    host_laststates_set_pool_holder((TaskHandle_t)NULL);
+    uxTaskGetStackHighWaterMark_IgnoreAndReturn(64u);
+    xTaskGetTickCount_IgnoreAndReturn(1000u);
+    osDelay_Stub(osDelay_escape_cb);
+
+    run_monitor_scans(3);
+
+    TEST_ASSERT_EQUAL_INT(WDG_ACTION_RECORD_AND_RESET,
+                          watchdog_last_escalation_action());
+    TEST_ASSERT_EQUAL_UINT32(resets_before + 1u, watchdog_escalation_resets());
+    TEST_ASSERT_EQUAL_UINT32(3u, host_hw_watchdog_kick_count());
+}
+
+/* A task that hangs INSIDE the LastStates pool lock can never release it, so
+   deferring its escalation "until the mutex is free" deferred it for ever.
+   After WDG_MAX_HOLDER_DEFERRALS consecutive deferrals the OBC resets without
+   the record. */
+void test_monitor_resets_without_record_after_bounded_deferrals(void)
+{
+    const uint32_t resets_before = watchdog_escalation_resets();
+
+    given_kernel_running();
+    xTaskGetTickCount_ExpectAndReturn(0u);
+    TEST_ASSERT_EQUAL_INT(0, watchdog_register_task(TH(0), 100u));
+    xTaskGetTickCount_ExpectAndReturn(0u);
+    watchdog_alive(TH(0));
+
+    capture_monitor_entry();
+    host_laststates_set_pool_holder((TaskHandle_t)TH(0));
+    uxTaskGetStackHighWaterMark_IgnoreAndReturn(64u);
+    xTaskGetTickCount_IgnoreAndReturn(1000u);
+    osDelay_Stub(osDelay_escape_cb);
+
+    run_monitor_scans((int)WDG_MAX_HOLDER_DEFERRALS);
+    TEST_ASSERT_EQUAL_UINT32(WDG_MAX_HOLDER_DEFERRALS, watchdog_holder_deferrals());
+    TEST_ASSERT_EQUAL_UINT32(resets_before, watchdog_escalation_resets());
+
+    run_monitor_scans(1);
+    TEST_ASSERT_EQUAL_INT(WDG_ACTION_RESET_UNRECORDED,
+                          watchdog_last_escalation_action());
+    TEST_ASSERT_EQUAL_UINT32(resets_before + 1u, watchdog_escalation_resets());
+
+    host_laststates_set_pool_holder((TaskHandle_t)NULL);
 }

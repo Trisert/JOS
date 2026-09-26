@@ -99,6 +99,11 @@ static uint8_t wdg_kernel_is_running(void)
 
 /* ---------- Public functions ---------- */
 
+/* Consecutive deferrals of the SAME suspect (reset when another task stalls
+   or an escalation is carried out). */
+static osThreadId_t wdg_deferred_suspect;
+static uint32_t     wdg_consecutive_deferrals;
+
 void watchdog_monitor_init(void)
 {
     const osMutexAttr_t mtx_attrs = {
@@ -115,6 +120,8 @@ void watchdog_monitor_init(void)
         wdg_tasks[i].stack_hwm_words = (UBaseType_t)0;
     }
     wdg_holder_deferral_count = 0u;
+    wdg_deferred_suspect      = NULL;
+    wdg_consecutive_deferrals = 0u;
 }
 
 int watchdog_register_task(osThreadId_t handle, uint32_t expected_period_ms)
@@ -291,106 +298,139 @@ int watchdog_task_stack_hwm(osThreadId_t handle, UBaseType_t *hwm_words)
     return rc;
 }
 
-/* Reaction to a task that missed its liveness deadline (#36 — closes the
- * "log anomaly, optionally suspend/delete task" TODO).
+/* Reaction to a task that missed its liveness deadline.
  *
- * Policy: SUSPEND, then RECORD — never delete.
+ * Policy: RECORD, then RESET the OBC. (It used to be "suspend, then record",
+ * which left the spacecraft with no recovery path at all: the IWDG/STWD100
+ * keep being kicked by this task unconditionally, and "ground can put it back
+ * with osThreadResume()" was not true - no telecommand does that, and if the
+ * stalled task was loraRX the command could not even be received. A
+ * suspended RX task meant a deaf satellite for the rest of the mission, a
+ * suspended stateMachine meant no autonomous battery protection.)
  *
- *  - Suspend, not osThreadTerminate(): on an OBC, recovery beats kill. A
- *    suspended thread keeps its TCB and stack, so the post-mortem stays
- *    readable, ground (or a future FDIR state) can put it back with
- *    osThreadResume(), and the handle stored in wdg_tasks[] stays valid —
- *    deleting the thread would leave this table pointing at freed memory and
- *    a later re-creation could hand out the same address. Suspending is
- *    still enough for the actual hazard: a livelocked task at or above the
- *    monitor's priority starving the rest of the system.
- *    INCLUDE_vTaskSuspend is enabled in Core/Inc/FreeRTOSConfig.h, so the
- *    call is available in the flight build.
- *
- *  - Record through laststates_write() with TRIGGER_WATCHDOG (the trigger
- *    code obsw_types.h has reserved for this since the pool was defined), so
- *    the anomaly reaches ground over the existing LastStates downlink,
- *    survives a later IWDG reset, and needs no new telemetry path.
+ *  - Record through laststates_write() with TRIGGER_WATCHDOG, so the anomaly
+ *    reaches ground over the existing LastStates downlink after the reset.
  *    state_from/state_to are 0xFF: this is a fault record, not a state
  *    transition — same convention as mpu_fault_log_flush().
  *
- *  - Suspend first, log second: the Flash program inside laststates_write()
- *    costs tens of ms and can block on the pool lock, and the point of the
- *    escalation is to stop the misbehaving task promptly. Logging afterwards
- *    also lets the record carry the result of the suspend, which ground
- *    cannot infer from anywhere else.
+ *  - dual_bank_mark_boot_fault() before the reset, exactly like the fault
+ *    handlers (Core/Src/faults.c): a task that hangs on every boot is then a
+ *    boot loop the golden-image fallback can see (DUAL_BANK_BOOT_FAULT_
+ *    THRESHOLD), while an occasional hang after the boot was declared good
+ *    is cleared by the next boot-OK marker.
  *
- *  - Deliberately NOT done here: forcing a state-machine transition (state
- *    changes belong to state_machine.c; driving them from the monitor would
- *    braid two FDIR paths together) and touching the IWDG (the hardware
- *    backstop stays independent of this policy — see the kick at the top of
- *    the scan loop).
+ *  - The record is only written when the stalled task does NOT hold the
+ *    LastStates pool mutex (watchdog_suspend_allowed()): writing it would
+ *    wedge this task on the held mutex. Such an escalation is deferred and
+ *    retried on the next scan (the holder normally releases in bounded
+ *    time), but only WDG_MAX_HOLDER_DEFERRALS times in a row - a task that
+ *    hangs INSIDE the pool lock would otherwise be deferred for ever. After
+ *    that the OBC resets without the record.
  *
  * Called with wdg_mutex RELEASED. Holding the monitor mutex across a Flash
- * program and a scheduler call would block every watchdog_alive() caller for
- * the duration and could manufacture the very silence this function reports.
+ * program and a reset would block every watchdog_alive() caller.
  *
- * Returns WDG_ESCALATE_HANDLED after the suspend+record ran (or on the host,
- * where both back ends are compiled out and only the policy above is
- * exercised), WDG_ESCALATE_DEFERRED when the suspect currently holds the
- * pool mutex: nothing was suspended and nothing was written, the caller
- * clears the stall latch so the next scan retries, and the deferral is
- * counted in wdg_holder_deferral_count so it stays visible to ground.
+ * Returns the action taken (watchdog_escalation_action()). On the host the
+ * record and the reset are compiled out; the decision is exercised in full.
  */
 #define WDG_ESCALATE_HANDLED   0
 #define WDG_ESCALATE_DEFERRED  1
+
+#ifdef HOST_UNIT_TEST
+static int wdg_last_action = WDG_ACTION_NONE;
+static uint32_t wdg_resets_requested;
+
+int watchdog_last_escalation_action(void) { return wdg_last_action; }
+uint32_t watchdog_escalation_resets(void) { return wdg_resets_requested; }
+#endif
+
+int watchdog_escalation_action(osThreadId_t suspect, osThreadId_t pool_holder,
+                               uint32_t consecutive_deferrals)
+{
+    if (suspect == NULL) {
+        return WDG_ACTION_NONE;
+    }
+    if (watchdog_suspend_allowed(suspect, pool_holder) != 0) {
+        return WDG_ACTION_RECORD_AND_RESET;
+    }
+    if (consecutive_deferrals < WDG_MAX_HOLDER_DEFERRALS) {
+        return WDG_ACTION_DEFER;
+    }
+    return WDG_ACTION_RESET_UNRECORDED;
+}
 
 static int watchdog_escalate_stalled(osThreadId_t handle,
                                      uint32_t     elapsed_ms,
                                      uint32_t     limit_ms,
                                      uint32_t     period_ms)
 {
-    /* Holder check FIRST, in both builds: laststates_pool_holder() is a
+    if (handle != wdg_deferred_suspect) {
+        wdg_deferred_suspect      = handle;
+        wdg_consecutive_deferrals = 0u;
+    }
+
+    /* Holder query FIRST, in both builds: laststates_pool_holder() is a
        non-blocking xQueueGetMutexHolder() read (flight) or the host double
-       (test). When the suspect holds the pool mutex, suspending it would
-       wedge every later laststates_write() on an osWaitForever acquire -
-       and writing the record first would wedge this very call on the same
-       mutex. Defer instead: no suspend, no Flash, retry next scan. */
-    if (!watchdog_suspend_allowed(handle,
-                                  (osThreadId_t)laststates_pool_holder())) {
+       (test). */
+    const int action = watchdog_escalation_action(
+        handle, (osThreadId_t)laststates_pool_holder(),
+        wdg_consecutive_deferrals);
+
+#ifdef HOST_UNIT_TEST
+    wdg_last_action = action;
+#endif
+
+    if (action == WDG_ACTION_NONE) {
+        return WDG_ESCALATE_HANDLED;
+    }
+    if (action == WDG_ACTION_DEFER) {
         wdg_holder_deferral_count++;
+        wdg_consecutive_deferrals++;
         return WDG_ESCALATE_DEFERRED;
     }
 
+    wdg_deferred_suspect      = NULL;
+    wdg_consecutive_deferrals = 0u;
+
 #ifdef WDG_NO_ESCALATION_BACKEND
-    (void)handle;
     (void)elapsed_ms;
     (void)limit_ms;
     (void)period_ms;
-    return WDG_ESCALATE_HANDLED;
-#else
-    laststates_entry_t entry;
-    uint32_t           ctx[6];
-    osStatus_t         st = osThreadSuspend(handle);
-
-    (void)memset(&entry, 0, sizeof(entry));
-    entry.timestamp  = (uint32_t)osKernelGetTickCount();
-    entry.state_from = 0xFFU;   /* not a transition: fault record */
-    entry.state_to   = 0xFFU;
-    entry.trigger    = (uint8_t)TRIGGER_WATCHDOG;
-
-    /* Marker so ground can find a watchdog record inside a context blob, the
-       way dual_bank tags its entries 'DBNK'. */
-    ctx[0] = 0x474F4457UL;                  /* 'WDOG' (little-endian)      */
-    ctx[1] = (uint32_t)(uintptr_t)handle;   /* which task went silent      */
-    ctx[2] = elapsed_ms;                    /* how long it was silent      */
-    ctx[3] = limit_ms;                      /* the deadline it blew        */
-    ctx[4] = period_ms;                     /* the period it declared      */
-    ctx[5] = (uint32_t)(int32_t)st;         /* osStatus_t of the suspend   */
-    (void)memcpy(entry.context, ctx, sizeof(ctx));
-
-    /* One record per stall (the entry is latched by wdg_tasks[i].stalled), so
-       a failed write is not retried here: a hung task must not be allowed to
-       burn the LastStates pool. laststates_write() counts its own drops
-       (laststates_dropped_records()). */
-    (void)laststates_write(&entry);
+#ifdef HOST_UNIT_TEST
+    wdg_resets_requested++;
 #endif
     return WDG_ESCALATE_HANDLED;
+#else
+    if (action == WDG_ACTION_RECORD_AND_RESET) {
+        laststates_entry_t entry;
+        uint32_t           ctx[6];
+
+        (void)memset(&entry, 0, sizeof(entry));
+        entry.timestamp  = (uint32_t)osKernelGetTickCount();
+        entry.state_from = 0xFFU;   /* not a transition: fault record */
+        entry.state_to   = 0xFFU;
+        entry.trigger    = (uint8_t)TRIGGER_WATCHDOG;
+
+        /* Marker so ground can find a watchdog record inside a context blob,
+           the way dual_bank tags its entries 'DBNK'. */
+        ctx[0] = 0x474F4457UL;                  /* 'WDOG' (little-endian)  */
+        ctx[1] = (uint32_t)(uintptr_t)handle;   /* which task went silent  */
+        ctx[2] = elapsed_ms;                    /* how long it was silent  */
+        ctx[3] = limit_ms;                      /* the deadline it blew    */
+        ctx[4] = period_ms;                     /* the period it declared  */
+        ctx[5] = (uint32_t)action;              /* WDG_ACTION_* taken      */
+        (void)memcpy(entry.context, ctx, sizeof(ctx));
+
+        /* Best effort: the reset below is the containment, the record the
+           evidence. laststates_write() counts its own drops. */
+        (void)laststates_write(&entry);
+    }
+
+    dual_bank_mark_boot_fault();
+    __DSB();
+    NVIC_SystemReset();
+    return WDG_ESCALATE_HANDLED;   /* not reached */
+#endif
 }
 
 static void watchdog_monitor_task(void *arg)
@@ -483,11 +523,11 @@ static void watchdog_monitor_task(void *arg)
                                           stalled_limit, stalled_period)
                 == WDG_ESCALATE_DEFERRED) {
                 /* The suspect holds the LastStates pool mutex: nothing was
-                   suspended and nothing was written. Clear the latch so the
-                   next scan retries (a transient Flash-write holder releases
-                   the mutex in bounded time) instead of swallowing a still-
-                   stalled task forever. The deferral itself is counted inside
-                   watchdog_escalate_stalled(). */
+                   written and no reset was taken. Clear the latch so the next
+                   scan retries (a transient Flash-write holder releases the
+                   mutex in bounded time); after WDG_MAX_HOLDER_DEFERRALS
+                   retries the OBC resets without the record. The deferral
+                   itself is counted inside watchdog_escalate_stalled(). */
                 osMutexAcquire(wdg_mutex, osWaitForever);
                 wdg_tasks[stalled_idx].stalled = 0u;
                 osMutexRelease(wdg_mutex);
