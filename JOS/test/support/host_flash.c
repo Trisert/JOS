@@ -387,10 +387,15 @@ void host_i2c_set_silent(uint16_t dev_addr_shifted)
     }
 }
 
+static uint32_t last_probe_timeout;
+
+uint32_t host_i2c_last_probe_timeout(void) { return last_probe_timeout; }
+
 HAL_StatusTypeDef HAL_I2C_IsDeviceReady(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
                                         uint32_t Trials, uint32_t Timeout)
 {
-    (void)Trials; (void)Timeout;
+    (void)Trials;
+    last_probe_timeout = Timeout;
     if (hi2c == NULL) {
         return HAL_ERROR;
     }

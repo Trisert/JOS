@@ -18,6 +18,7 @@
  * target; test/fakes/seu_mitigation.h (same signatures, no RTOS) on the host,
  * so the lock/commit calls below stay flight code in both builds. */
 #include "seu_mitigation.h"
+#include "hw_watchdog.h"   /* hw_watchdog_boot_kick(): long pre-scheduler I2C */
 #include <string.h>
 #include <stdint.h>
 
@@ -77,6 +78,12 @@
  * failed attempt cannot corrupt a partially written select. */
 #define FRAM_I2C_TRIES      3U
 #define FRAM_I2C_TIMEOUT_MS 1000
+/* Presence probe timeout per trial. An F-RAM acknowledges its slave address
+ * immediately (no write-cycle busy period: FM24V10 datasheet, "NoDelay"
+ * writes), so the address phase completes in well under 1 ms even at
+ * 100 kHz; 10 ms is ample. The full 1 s transfer timeout here made a sick
+ * bus cost up to 8 x 3 x 1 s = 24 s at boot, far past the STWD100 tWD. */
+#define FRAM_PROBE_TIMEOUT_MS 10U
 /* One A16 page: the most a single device select (and a single 16-bit
  * memory-address field) spans. A transfer may stream across the page
  * boundary inside a chip - the part latches the full 17-bit address and
@@ -87,17 +94,14 @@
 #define FM24VN_NUM_CHIPS      4
 #define FRAM_SIZE             (FM24VN_NUM_CHIPS * FM24VN_CHIP_SIZE)
 
-/* FRAM layout (512 KB total):
- *   [0 .. cyclic_buffer_head)   : cyclic science-data buffer (wraps the device)
- *   [SEU_FRAM_BASE .. FRAM_SIZE)  : SEU golden records (W2-5), one fixed
- *                                 CRC-32-protected slot per region id,
- *                                 reserved at the TOP and grown downward; see
- *                                 Core/Inc/seu_mitigation.h SEU_FRAM_*.
- *
- * The cyclic buffer still wraps the whole device, so a wrapped head can land
- * on a golden slot; golden records reject anything they do not own
- * (magic / length / CRC), and the next commit write-through refreshes a
- * clobbered slot. Same trade-off as the retired App/obsw/scrub.c pool.
+/* FRAM layout (512 KB total, see the partition in memory.h):
+ *   [0 .. FRAM_CYCLIC_BYTES)          : cyclic science-data buffer, wraps
+ *                                       inside this range only;
+ *   [FRAM_GOLDEN_BASE .. FRAM_SIZE)   : SEU golden records (W2-5), one fixed
+ *                                       CRC-32-protected slot per region id;
+ *                                       see Core/Inc/seu_mitigation.h.
+ * The two ranges are disjoint by construction (static asserts below and in
+ * seu_mitigation.h).
  *
  * Compile-time guards: a zero (or non-power-of-two) chip size would make the
  * shift/mask decode below wrong and is the divide-by-zero class M1 guards
@@ -114,6 +118,10 @@ _Static_assert(FM24VN_CHIP_SIZE == 2U * FM24VN_PAGE_BYTES,
                "one chip is two A16 pages");
 _Static_assert(FRAM_SIZE == (512UL * 1024UL),
                "FRAM_SIZE must be 512 KB (4 x 128 KB) per RED_DES_ElectronicArchitecture_V1");
+_Static_assert(FRAM_SIZE == FRAM_TOTAL_BYTES,
+               "memory.h FRAM partition must describe the same bank");
+_Static_assert((FRAM_CYCLIC_BYTES + FRAM_GOLDEN_BYTES) == FRAM_SIZE,
+               "cyclic buffer + golden area must tile the bank exactly");
 
 extern I2C_HandleTypeDef hi2c1;
 
@@ -148,8 +156,9 @@ void fram_init(void)
     uint8_t missing = 0U;
     for (uint8_t sel = 0U; sel < 8U; sel++) {
         uint16_t dev = (uint16_t)((FM24VN_I2C_ADDR_BASE + sel) << 1);
+        hw_watchdog_boot_kick();
         if (HAL_I2C_IsDeviceReady(&hi2c1, dev, FRAM_I2C_TRIES,
-                                  FRAM_I2C_TIMEOUT_MS) != HAL_OK) {
+                                  FRAM_PROBE_TIMEOUT_MS) != HAL_OK) {
             missing |= (uint8_t)(1U << sel);
         }
     }
@@ -186,6 +195,10 @@ static int fram_xfer(int is_write, uint16_t dev_addr, uint16_t offset,
                      uint8_t *buf, uint16_t size)
 {
     for (uint8_t t = 0U; t < FRAM_I2C_TRIES; t++) {
+        /* Each try may take up to FRAM_I2C_TIMEOUT_MS (1 s) on a sick bus,
+           i.e. about the STWD100 tWD: refresh before each one while the
+           scheduler is not running yet (boot-time SEU golden restore). */
+        hw_watchdog_boot_kick();
         HAL_StatusTypeDef st = is_write
             ? HAL_I2C_Mem_Write(&hi2c1, dev_addr, offset,
                                 I2C_MEMADD_SIZE_16BIT, buf, size,
@@ -269,7 +282,7 @@ int fram_write(uint32_t addr, const uint8_t *buf, size_t len)
 }
 
 /* ========== Cyclic buffer ========== */
-/* 4x FM24VN10-G = 512 KB FRAM used as circular buffer */
+/* [0, FRAM_CYCLIC_BYTES) of the 4x FM24VN10-G bank, used as circular buffer */
 
 static uint32_t cb_head = 0;   /* next write position */
 
@@ -294,16 +307,19 @@ int cyclic_buffer_write(const uint8_t *data, size_t len)
     if (len == 0U) {
         return 0;
     }
-    if ((data == NULL) || (len > (size_t)FRAM_SIZE)) {
+    if ((data == NULL) || (len > (size_t)FRAM_CYCLIC_BYTES)) {
         return -1;
+    }
+    if (cb_head >= FRAM_CYCLIC_BYTES) {
+        cb_head = 0U;   /* never trust a corrupted head into the golden area */
     }
 
     /* Split once at the ring boundary, then fram_write() splits further at
      * every 64 KB device-select boundary. Advance cb_head only after
      * all transfers succeed: a failed I2C write must remain visible to the
      * caller rather than silently creating a hole in the telemetry stream. */
-    first = (len < (size_t)(FRAM_SIZE - cb_head)) ? len :
-            (size_t)(FRAM_SIZE - cb_head);
+    first = (len < (size_t)(FRAM_CYCLIC_BYTES - cb_head)) ? len :
+            (size_t)(FRAM_CYCLIC_BYTES - cb_head);
     if (cyclic_buffer_write_range(cb_head, data, first) != 0) {
         return -1;
     }
@@ -312,7 +328,7 @@ int cyclic_buffer_write(const uint8_t *data, size_t len)
         return -1;
     }
 
-    cb_head = (uint32_t)((cb_head + len) % FRAM_SIZE);
+    cb_head = (uint32_t)((cb_head + len) % FRAM_CYCLIC_BYTES);
     return 0;
 }
 
@@ -321,7 +337,7 @@ int cyclic_buffer_read(uint32_t offset, uint8_t *buf, size_t len)
     /* Same wrap-safe bound check as fram_range_valid(): offset + len in
      * 32-bit arithmetic can wrap past zero. fram_read() re-checks and splits
      * at select boundaries, so a multi-select read is served, not rejected. */
-    if (((uint64_t)offset + (uint64_t)len) > (uint64_t)FRAM_SIZE) return -1;
+    if (((uint64_t)offset + (uint64_t)len) > (uint64_t)FRAM_CYCLIC_BYTES) return -1;
     return fram_read(offset, buf, len);
 }
 

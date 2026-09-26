@@ -152,6 +152,9 @@ void host_flash_fail_next_erases(uint32_t count);
  * A16 pages). */
 uint16_t host_flash_last_i2c_addr(void);
 
+/* Timeout (ms) of the last HAL_I2C_IsDeviceReady() call. */
+uint32_t host_i2c_last_probe_timeout(void);
+
 /* ==========================================================================
  * Radio doubles (support/radiolib_stubs.c) — SX1268 failure injection
  * ========================================================================== */

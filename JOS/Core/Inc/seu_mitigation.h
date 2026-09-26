@@ -103,6 +103,7 @@
 #include <stddef.h>
 
 #include "cmsis_os2.h"   /* osThreadId_t */
+#include "memory.h"      /* FRAM_GOLDEN_BASE / FRAM_GOLDEN_BYTES */
 
 #ifdef __cplusplus
 extern "C" {
@@ -173,19 +174,23 @@ extern "C" {
 #endif
 
 /* ---------- FRAM golden pool (reboot persistence) ----------
- * Top of the 64 KB FRAM (see App/memory/memory.c FRAM layout): one fixed
- * slot per region id, reserved top-down so the cyclic telemetry buffer
- * (which owns the bottom and wraps) needs no allocator handshake. The wire
- * format is identical to the retired App/obsw/scrub.c golden record, so
- * FRAM dumps - and any golden written before the T1.6 unify - stay
- * readable. All slots sit in the last 16 KB chip, so one record is one
- * single-chip I2C transaction. */
+ * The reserved golden area at the TOP of the 512 KB FRAM bank
+ * (App/memory/memory.h FRAM_GOLDEN_BASE / FRAM_GOLDEN_BYTES): one fixed slot
+ * per region id. The cyclic telemetry buffer owns [0, FRAM_CYCLIC_BYTES) and
+ * never enters this area. (The base used to be computed from a 64 KB FRAM,
+ * 0x10000 - slots, which put the golden slots inside the cyclic buffer.) The
+ * wire format is identical to the retired App/obsw/scrub.c golden record, so
+ * FRAM dumps stay readable. All slots sit in the last device select, so one
+ * record is one single-select I2C transaction. */
 #define SEU_FRAM_MAGIC            0x53435552U   /* "SCUR", as the retired pool */
 #define SEU_FRAM_PAYLOAD_BYTES    256U          /* max golden payload per slot */
 #define SEU_FRAM_RECORD_HEADER    16U           /* magic+id+reserved+crc+len   */
 #define SEU_FRAM_RECORD_SIZE      (SEU_FRAM_RECORD_HEADER + SEU_FRAM_PAYLOAD_BYTES)
-#define SEU_FRAM_SLOTS            8U            /* slots reserved at the top   */
-#define SEU_FRAM_BASE             (0x10000U - ((uint32_t)SEU_FRAM_SLOTS * (uint32_t)SEU_FRAM_RECORD_SIZE))
+#define SEU_FRAM_SLOTS            8U            /* slots in the golden area    */
+#define SEU_FRAM_BASE             ((uint32_t)FRAM_GOLDEN_BASE)
+_Static_assert(((uint32_t)SEU_FRAM_SLOTS * (uint32_t)SEU_FRAM_RECORD_SIZE) <=
+               (uint32_t)FRAM_GOLDEN_BYTES,
+               "SEU golden slots must fit the reserved FRAM golden area");
 /* FRAM byte address of a region id's golden record slot. */
 #define SEU_FRAM_SLOT_ADDR(id)    ((uint32_t)(SEU_FRAM_BASE) + (uint32_t)(id) * (uint32_t)(SEU_FRAM_RECORD_SIZE))
 

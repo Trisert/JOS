@@ -17,6 +17,7 @@
 #include "main.h"             /* fakes/main.h: HAL prototypes exercised directly */
 #include "seu_mitigation.h"   /* fakes/: lock/commit contract of W2-5 */
 #include "host_support.h"
+#include "hw_watchdog.h"      /* fakes/: boot-kick counter */
 
 #include <stdint.h>
 #include <string.h>
@@ -911,3 +912,54 @@ void test_laststates_erase_guard_only_accepts_pool_pages(void)
     /* the vector table, i.e. the worst case this guard exists for */
     TEST_ASSERT_FALSE(laststates_erase_addr_allowed((uintptr_t)0x08000000UL));
 }
+
+/* The boot-time FRAM probe runs before the scheduler, where nothing else
+ * refreshes the external STWD100 (tWD >= 1.12 s). It must use a short
+ * per-trial timeout (an F-RAM ACKs its address immediately) and refresh the
+ * watchdog between selects; the full 1 s transfer timeout made a sick bus
+ * cost up to 24 s at boot. Every FRAM transfer try refreshes it too. */
+void test_fram_boot_probe_kicks_watchdog_and_bounds_the_probe_timeout(void)
+{
+    uint8_t buf[4] = { 0 };
+
+    host_hw_watchdog_reset();
+    fram_init();
+    TEST_ASSERT_TRUE(host_hw_watchdog_boot_kick_count() >= 8u);
+    TEST_ASSERT_TRUE(host_i2c_last_probe_timeout() <= 25u);
+
+    host_hw_watchdog_reset();
+    TEST_ASSERT_EQUAL_INT(0, fram_read(0u, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_UINT32(1u, host_hw_watchdog_boot_kick_count());
+}
+
+/* The cyclic buffer wraps inside [0, FRAM_CYCLIC_BYTES) and never enters the
+ * golden area at the top of the bank. The SEU golden slots used to be
+ * computed from a 64 KB FRAM and sat inside the first 64 KB of the buffer;
+ * the buffer itself wrapped at 512 KB, i.e. through the golden area. */
+void test_cyclic_buffer_never_writes_into_the_golden_area(void)
+{
+    static uint8_t big[FRAM_CYCLIC_BYTES];
+    uint8_t golden[64];
+    uint8_t check[64];
+
+    memset(golden, 0x5A, sizeof(golden));
+    TEST_ASSERT_EQUAL_INT(0, fram_write(FRAM_GOLDEN_BASE, golden, sizeof(golden)));
+    TEST_ASSERT_EQUAL_INT(0, fram_write(FRAM_TOTAL_BYTES - sizeof(golden),
+                                        golden, sizeof(golden)));
+
+    cyclic_buffer_init();
+    memset(big, 0xC3, sizeof(big));
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(big, FRAM_CYCLIC_BYTES - 100u));
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(big, 200u));   /* wraps */
+    TEST_ASSERT_EQUAL_UINT32(100u, cyclic_buffer_head());
+
+    TEST_ASSERT_EQUAL_INT(0, fram_read(FRAM_GOLDEN_BASE, check, sizeof(check)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(golden, check, sizeof(check));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(FRAM_TOTAL_BYTES - sizeof(check),
+                                       check, sizeof(check)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(golden, check, sizeof(check));
+
+    /* Reads of the buffer stop at its end, too. */
+    TEST_ASSERT_EQUAL_INT(-1, cyclic_buffer_read(FRAM_GOLDEN_BASE, check, 1u));
+}
+

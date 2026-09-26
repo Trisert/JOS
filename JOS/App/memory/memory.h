@@ -18,7 +18,21 @@ uint8_t fram_missing_selects(void);
  * record could not be written. Never resets: a holey bank still flies. */
 int fram_report_boot(void);
 
-/* ---------- Cyclic buffer ---------- */
+/* ---------- FRAM partition ----------
+ * The bank is 512 KB: 4 x FM24VN10-G (1 Mbit each) on I2C1, OBC V2.0 netlist.
+ * The TOP FRAM_GOLDEN_BYTES are reserved for the SEU golden records
+ * (Core/Inc/seu_mitigation.h SEU_FRAM_*); the cyclic buffer owns
+ * [0, FRAM_CYCLIC_BYTES) and wraps inside it, so the two can never overwrite
+ * each other. (The golden slots used to be computed from a 64 KB FRAM, i.e.
+ * they sat INSIDE the first 64 KB of the cyclic buffer, which reached them
+ * after ~62 KB of science data on every boot.) */
+#define FRAM_TOTAL_BYTES   (512UL * 1024UL)
+#define FRAM_GOLDEN_BYTES  (4UL * 1024UL)
+#define FRAM_GOLDEN_BASE   (FRAM_TOTAL_BYTES - FRAM_GOLDEN_BYTES)
+#define FRAM_CYCLIC_BYTES  FRAM_GOLDEN_BASE
+
+/* ---------- Cyclic buffer ----------
+ * Ring over [0, FRAM_CYCLIC_BYTES); offsets are FRAM byte addresses. */
 void cyclic_buffer_init(void);
 int  cyclic_buffer_write(const uint8_t *data, size_t len);
 int  cyclic_buffer_read(uint32_t offset, uint8_t *buf, size_t len);
