@@ -29,7 +29,7 @@ Every recommendation below cites the standard that motivates it:
 | 1.4 | No dynamic allocation after init; ban `malloc/free` inside tasks | [NASA-PoT] #5, [JPL-182] | High | Low (policy) |
 
 > Note: the gcc 15 container already turned an implicit-function-declaration
-> into a hard error that the CI (gcc 10) missed — see PR #5. Keeping
+> into a hard error that the CI of the time (gcc 10; CI now pins 14.3.Rel1) missed — see PR #5. Keeping
 > `-Werror=implicit-function-declaration` closes that gap permanently.
 
 ## 2. Runtime protection (Cortex-M4 / FreeRTOS)
