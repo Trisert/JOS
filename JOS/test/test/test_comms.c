@@ -1495,17 +1495,88 @@ void test_lora_send_chunked_reports_failure_on_later_chunk(void)
                           lora_send_chunked(payload, chunk_max + 7U));
 }
 
-/* SET_CONFIG and SEND_DATA are accepted by the gate (validation only). Handlers are TODO (no-op), so no mock expectations are queued. Frames are sealed: ENFORCE=1 rejects legacy CRC-only frames with ERR_MAC. */
-void test_rx_gate_dispatches_set_config_and_send_data(void)
+/* SET_CONFIG and SEND_DATA pass validation, but have no implementation yet:
+   the dispatcher refuses them as unsupported instead of acknowledging (and
+   counting as accepted) a command that did nothing. */
+void test_rx_gate_refuses_unimplemented_set_config_and_send_data(void)
 {
     uint8_t payload[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    comms_rx_stats_t before, after;
     size_t  n;
 
+    comms_rx_get_stats(&before);
+
     n = build_auth_frame(COMMS_TC_SET_CONFIG, payload, 4U);
-    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_frame(frame_buf, n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_OPCODE, comms_rx_handle_frame(frame_buf, n));
 
     n = build_auth_frame(COMMS_TC_SEND_DATA, payload, 8U);
-    TEST_ASSERT_EQUAL_INT(COMMS_TC_OK, comms_rx_handle_frame(frame_buf, n));
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_OPCODE, comms_rx_handle_frame(frame_buf, n));
+
+    comms_rx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.accepted, after.accepted);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_opcode + 2U, after.rejected_opcode);
+}
+
+/* A valid command the state machine REFUSES is not an accepted command. */
+void test_rx_gate_reports_refused_state_transitions(void)
+{
+    comms_rx_stats_t before, after;
+    size_t n;
+
+    comms_rx_get_stats(&before);
+
+    state_machine_request_transition_ExpectAndReturn(STATE_READY, TRIGGER_GROUND_CMD, -1);
+    n = build_auth_frame(COMMS_TC_EXIT_STATE, NULL, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_REFUSED, comms_rx_handle_frame(frame_buf, n));
+
+    state_machine_request_transition_ExpectAndReturn(STATE_ACTIVE, TRIGGER_GROUND_CMD, -1);
+    n = build_auth_frame(COMMS_TC_ACTIVATE_PAYLOAD, NULL, 0U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_REFUSED, comms_rx_handle_frame(frame_buf, n));
+
+    comms_rx_get_stats(&after);
+    TEST_ASSERT_EQUAL_UINT32(before.accepted, after.accepted);
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_refused + 2U, after.rejected_refused);
+    TEST_ASSERT_EQUAL_STRING("REFUSED", comms_tc_result_str(COMMS_TC_ERR_REFUSED));
+}
+
+void test_rx_gate_reports_refused_beacon_interval(void)
+{
+    uint8_t p[4];
+    put_be32(p, 60000UL);
+    state_machine_set_beacon_interval_ExpectAndReturn(60000UL, -1);
+    size_t n = build_auth_frame(COMMS_TC_SET_BEACON_INTERVAL, p, 4U);
+    TEST_ASSERT_EQUAL_INT(COMMS_TC_ERR_REFUSED, comms_rx_handle_frame(frame_buf, n));
+}
+
+/* The receiver must be back on after every transmission, successful or not:
+   startTransmit() leaves the SX1268 in standby, and nothing else re-armed it,
+   so after the first beacon the satellite was deaf. */
+void test_lora_send_chunked_rearms_rx_after_success_and_failure(void)
+{
+    uint8_t msg[100];
+    memset(msg, 0x33, sizeof(msg));
+
+    TEST_ASSERT_EQUAL_INT(0, lora_send_chunked(msg, sizeof(msg)));
+    TEST_ASSERT_EQUAL_INT(1, host_lora_start_receive_count());
+
+    host_lora_fail_tx_on_call(2);
+    TEST_ASSERT_EQUAL_INT(-1, lora_send_chunked(msg, sizeof(msg)));
+    TEST_ASSERT_EQUAL_INT(2, host_lora_start_receive_count());
+
+    host_lora_fail_wait_on_call(1);
+    TEST_ASSERT_EQUAL_INT(-1, lora_send_chunked(msg, sizeof(msg)));
+    TEST_ASSERT_EQUAL_INT(3, host_lora_start_receive_count());
+}
+
+/* osThreadFlagsWait() returns every flag that was set, or an error code. */
+void test_comms_flags_have_masks_other_bits_and_rejects_errors(void)
+{
+    TEST_ASSERT_TRUE(comms_flags_have(LORA_RX_FLAG, LORA_RX_FLAG));
+    TEST_ASSERT_TRUE(comms_flags_have(LORA_RX_FLAG | 0x01U, LORA_RX_FLAG));
+    TEST_ASSERT_FALSE(comms_flags_have(0x01U, LORA_RX_FLAG));
+    TEST_ASSERT_FALSE(comms_flags_have(0U, LORA_RX_FLAG));
+    TEST_ASSERT_FALSE(comms_flags_have(0xFFFFFFFEU, LORA_RX_FLAG));  /* timeout  */
+    TEST_ASSERT_FALSE(comms_flags_have(0xFFFFFFFFU, LORA_RX_FLAG));  /* osError  */
 }
 
 /* ================= task loops ================= */
@@ -1624,6 +1695,27 @@ void test_lora_rx_task_loops_forever_kicking_watchdog_each_iteration(void)
     watchdog_alive_self_Stub(alive_escape_cb);
 
     run_task_until_escape(lora_rx_task, &alive_calls);
+}
+
+/* RX_DONE arriving together with another thread-flag bit is still a frame:
+   the loop must read it (and re-arm), not drop it on a `==` comparison. The
+   host lora_rx() stub delivers an empty frame, which the gate rejects as
+   malformed - one per iteration. */
+void test_lora_rx_task_handles_rx_flag_set_with_other_bits(void)
+{
+    comms_rx_stats_t before, after;
+    comms_rx_get_stats(&before);
+
+    osThreadGetId_ExpectAndReturn(RX_TH);
+    osThreadFlagsWait_IgnoreAndReturn(LORA_RX_FLAG | 0x01U);
+    watchdog_alive_self_Stub(alive_escape_cb);
+
+    run_task_until_escape(lora_rx_task, &alive_calls);
+
+    comms_rx_get_stats(&after);
+    /* The escape fires inside the last iteration's kick, before its frame. */
+    TEST_ASSERT_EQUAL_UINT32(before.rejected_malformed + (TASK_LOOP_ITERS - 1),
+                             after.rejected_malformed);
 }
 
 /* First iteration: the task narrows its monitored period from the bootstrap

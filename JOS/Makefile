@@ -79,6 +79,25 @@ BOOT_CRC_FATAL           := 1
 BOOT_CRC_TRUST_UNSTAMPED := 0
 
 # ---------------------------------------------------------------------------
+# Uplink authentication key (see App/comms/comms_validate.h).
+#
+#   COMMS_AUTH_KEY=<8 hex digits>   per-mission HMAC key, e.g.
+#                                   make release COMMS_AUTH_KEY=0123ABCD
+#
+# Without it the image carries only the PUBLISHED upstream default key
+# (A1 B2 C3 D4, readable in this repository), and every authenticated
+# telecommand is REJECTED (fail closed): a key anybody can read authenticates
+# nobody. The bench profile opts back into the public key explicitly
+# (COMMS_AUTH_ALLOW_PUBLIC_KEY=1) for ground-station bring-up.
+#
+# `:=` for the same reason as the boot-CRC switches: only an explicit command
+# line may set it, never a stale environment variable. The key is a secret:
+# pass it on the command line of the flight build, never commit it.
+# ---------------------------------------------------------------------------
+COMMS_AUTH_KEY              :=
+COMMS_AUTH_ALLOW_PUBLIC_KEY := 0
+
+# ---------------------------------------------------------------------------
 # Build profile: debug (default), release, bench, release-strip.
 # Changes only optimization/symbol flags. The boot-CRC policy stays on
 # BOOT_CRC_FATAL / BOOT_CRC_TRUST_UNSTAMPED (:=, override via CLI only); the
@@ -96,7 +115,8 @@ else ifeq ($(BUILD_PROFILE),bench)
   OPT := -O0 -g3
   BOOT_CRC_FATAL           := 0
   BOOT_CRC_TRUST_UNSTAMPED := 1
-  $(warning *** BENCH BUILD ONLY: boot CRC recovery reset compiled OUT and unstamped images treated as trusted. NEVER flash this image to flight hardware.)
+  COMMS_AUTH_ALLOW_PUBLIC_KEY := 1
+  $(warning *** BENCH BUILD ONLY: boot CRC recovery reset compiled OUT, unstamped images treated as trusted and the PUBLIC uplink key accepted. NEVER flash this image to flight hardware.)
 else
   $(error BUILD_PROFILE must be debug|release|bench|release-strip, got '$(BUILD_PROFILE)')
 endif
@@ -118,11 +138,28 @@ ifeq ($(BOOT_CRC_TRUST_UNSTAMPED),1)
   $(warning *** BENCH BUILD ONLY - `make crc-stamp` is what a flight image needs.)
 endif
 
+ifneq ($(filter-out 0 1,$(COMMS_AUTH_ALLOW_PUBLIC_KEY)),)
+  $(error COMMS_AUTH_ALLOW_PUBLIC_KEY must be 0 or 1, got '$(COMMS_AUTH_ALLOW_PUBLIC_KEY)')
+endif
+COMMS_AUTH_DEFS := -DCOMMS_AUTH_ALLOW_PUBLIC_KEY=$(COMMS_AUTH_ALLOW_PUBLIC_KEY)
+ifneq ($(strip $(COMMS_AUTH_KEY)),)
+  ifneq ($(shell echo '$(COMMS_AUTH_KEY)' | grep -Eqx '[0-9A-Fa-f]{8}' && echo ok),ok)
+    $(error COMMS_AUTH_KEY must be exactly 8 hex digits)
+  endif
+  COMMS_AUTH_DEFS += -DCOMMS_AUTH_KEY0=0x$(shell echo '$(COMMS_AUTH_KEY)' | cut -c1-2)U \
+                     -DCOMMS_AUTH_KEY1=0x$(shell echo '$(COMMS_AUTH_KEY)' | cut -c3-4)U \
+                     -DCOMMS_AUTH_KEY2=0x$(shell echo '$(COMMS_AUTH_KEY)' | cut -c5-6)U \
+                     -DCOMMS_AUTH_KEY3=0x$(shell echo '$(COMMS_AUTH_KEY)' | cut -c7-8)U
+else ifeq ($(COMMS_AUTH_ALLOW_PUBLIC_KEY),0)
+  $(warning *** COMMS_AUTH_KEY not set: authenticated uplink is DISABLED in this image (fail closed). Flight builds need make ... COMMS_AUTH_KEY=<8 hex digits>.)
+endif
+
 BOOT_CRC_DEFS := -DBOOT_CRC_FATAL=$(BOOT_CRC_FATAL) \
                  -DBOOT_CRC_TRUST_UNSTAMPED=$(BOOT_CRC_TRUST_UNSTAMPED)
 
 C_DEFS  := -DDEBUG -DUSE_HAL_DRIVER -DSTM32L496xx
 C_DEFS  += $(BOOT_CRC_DEFS)
+C_DEFS  += $(COMMS_AUTH_DEFS)
 CXX_DEFS := -DDEBUG -DUSE_HAL_DRIVER -DSTM32L496xx -DRADIOLIB_STATIC_ONLY=1
 ASM_DEFS := -DDEBUG
 

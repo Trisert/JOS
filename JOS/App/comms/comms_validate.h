@@ -99,22 +99,47 @@
 #define COMMS_TC_MAX_AUTH_PAYLOAD (COMMS_TC_MAX_FRAME - COMMS_TC_AUTH_OVERHEAD)
 
 /**
- * Uplink HMAC key (4 bytes, upstream RedPill SECRET_KEY = A1 B2 C3 D4).
- * Per-mission override with -DCOMMS_AUTH_KEY0=.. -DCOMMS_AUTH_KEY3=.. ; the
+ * Uplink HMAC key (4 bytes, upstream RedPill makeMAC design).
+ *
+ * The key is PROVISIONED per mission at build time with
+ * `make ... COMMS_AUTH_KEY=<8 hex digits>` (-> -DCOMMS_AUTH_KEY0..3); the
  * ground station must use the same key or every uplink is rejected.
+ *
+ * Without provisioning, the upstream default SECRET_KEY = A1 B2 C3 D4 is
+ * compiled in - and that key is published in this repository, so a tag made
+ * with it authenticates nobody. COMMS_AUTH_KEY_PROVISIONED is then 0 and
+ * comms_validate_tc_auth() rejects EVERY authenticated frame with
+ * COMMS_TC_ERR_MAC (fail closed) unless COMMS_AUTH_ALLOW_PUBLIC_KEY=1, the
+ * explicit bench/ground-bring-up opt-in (Makefile bench profile).
+ *
+ * NOT addressed here (open, see TASKS.md): a 4-byte key and a 4-byte tag are
+ * brute-forceable offline from one captured frame, and there is no replay
+ * protection. Both are properties of the upstream frame/MAC design shared
+ * with the ground segment and cannot be changed on the OBC side alone.
  */
-#ifndef COMMS_AUTH_KEY0
+#if defined(COMMS_AUTH_KEY0) && defined(COMMS_AUTH_KEY1) && \
+    defined(COMMS_AUTH_KEY2) && defined(COMMS_AUTH_KEY3)
+#define COMMS_AUTH_KEY_PROVISIONED 1
+#else
+#define COMMS_AUTH_KEY_PROVISIONED 0
+#undef  COMMS_AUTH_KEY0
+#undef  COMMS_AUTH_KEY1
+#undef  COMMS_AUTH_KEY2
+#undef  COMMS_AUTH_KEY3
 #define COMMS_AUTH_KEY0 0xA1U
-#endif
-#ifndef COMMS_AUTH_KEY1
 #define COMMS_AUTH_KEY1 0xB2U
-#endif
-#ifndef COMMS_AUTH_KEY2
 #define COMMS_AUTH_KEY2 0xC3U
-#endif
-#ifndef COMMS_AUTH_KEY3
 #define COMMS_AUTH_KEY3 0xD4U
 #endif
+
+#ifndef COMMS_AUTH_ALLOW_PUBLIC_KEY
+#define COMMS_AUTH_ALLOW_PUBLIC_KEY 0
+#endif
+
+/** True when authenticated uplink is usable in this image: a provisioned
+ *  key, or the explicit public-key opt-in (bench only). */
+#define COMMS_AUTH_KEY_USABLE \
+    ((COMMS_AUTH_KEY_PROVISIONED != 0) || (COMMS_AUTH_ALLOW_PUBLIC_KEY != 0))
 
 /**
  * Authentication enforcement (SPF v3 §3.6.6.3 / §3.7: uplink authentication
@@ -164,7 +189,15 @@ typedef enum {
                                      returned by comms_validate_tc() — only
                                      accounted by the RX task via
                                      comms_rx_account() so PHY drops are not a
-                                     stat blind spot. */
+                                     stat blind spot. */,
+    COMMS_TC_ERR_REFUSED        /**< valid, authenticated command that the
+                                     owning subsystem refused to carry out (e.g.
+                                     a state transition the state machine's
+                                     gates rejected). Never returned by the
+                                     validators - only by the dispatcher, so a
+                                     refused command is never counted as
+                                     accepted. Appended last: the values above
+                                     are stable. */
 } comms_tc_result_t;
 
 /** RX acceptance/rejection counters (telemetry + ground diagnostics). */
@@ -177,6 +210,7 @@ typedef struct {
     uint32_t rejected_range;      /**< payload length or parameter range      */
     uint32_t rejected_mac;        /**< missing or invalid HMAC tag            */
     uint32_t rejected_phy;        /**< radio dropped it below the validator   */
+    uint32_t rejected_refused;    /**< valid, but refused by its subsystem    */
 } comms_rx_stats_t;
 
 /**

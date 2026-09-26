@@ -162,6 +162,9 @@ uint16_t host_flash_last_i2c_addr(void);
  * n <= 0 disarms. Default is success; host_lora_reset() restores it
  * (call from setUp()). */
 void host_lora_fail_tx_on_call(int n);
+
+/* lora_start_receive() calls since the last host_lora_reset(). */
+int  host_lora_start_receive_count(void);
 void host_lora_fail_wait_on_call(int n);
 void host_lora_reset(void);
 

@@ -65,6 +65,8 @@ _Static_assert(COMMS_TC_MAC_LEN == 4U,
                "tag is the first 4 bytes of HMAC-SHA256 (upstream makeMAC)");
 _Static_assert((COMMS_AUTH_ENFORCE == 0) || (COMMS_AUTH_ENFORCE == 1),
                "COMMS_AUTH_ENFORCE must be 0 or 1");
+_Static_assert((COMMS_AUTH_ALLOW_PUBLIC_KEY == 0) || (COMMS_AUTH_ALLOW_PUBLIC_KEY == 1),
+               "COMMS_AUTH_ALLOW_PUBLIC_KEY must be 0 or 1");
 
 /* ---------- Private helpers ---------- */
 
@@ -259,6 +261,13 @@ comms_tc_result_t comms_validate_tc_auth(const uint8_t   *frame,
     if (!tag_matches(rx_tag, good_tag)) {
         return COMMS_TC_ERR_MAC;
     }
+    /* A tag that verifies against the PUBLISHED default key proves nothing
+     * about the sender: without a provisioned key (or the explicit bench
+     * opt-in) every authenticated frame is refused - fail closed. Checked
+     * after the tag so the verdict and the accounting stay "MAC" either way. */
+    if (!COMMS_AUTH_KEY_USABLE) {
+        return COMMS_TC_ERR_MAC;
+    }
 
     return tc_check_opcode_and_params(opcode, frame, payload_len,
                                       out_opcode, out_payload, out_len);
@@ -372,6 +381,7 @@ const char *comms_tc_result_str(comms_tc_result_t result)
     case COMMS_TC_ERR_PARAM_RANGE:  return "PARAM_RANGE";
     case COMMS_TC_ERR_MAC:          return "MAC";
     case COMMS_TC_ERR_PHY:          return "PHY";
+    case COMMS_TC_ERR_REFUSED:      return "REFUSED";
     default:                        return "UNKNOWN";
     }
 }
@@ -412,6 +422,9 @@ void comms_rx_account(comms_tc_result_t result)
     case COMMS_TC_ERR_PHY:
         rx_stats.rejected_phy++;
         break;
+    case COMMS_TC_ERR_REFUSED:
+        rx_stats.rejected_refused++;
+        break;
     default:
         rx_stats.rejected_malformed++;
         break;
@@ -430,5 +443,6 @@ void comms_rx_get_stats(comms_rx_stats_t *out)
         out->rejected_range     = rx_stats.rejected_range;
         out->rejected_mac       = rx_stats.rejected_mac;
         out->rejected_phy       = rx_stats.rejected_phy;
+        out->rejected_refused   = rx_stats.rejected_refused;
     }
 }
