@@ -184,4 +184,7 @@ void host_bms_disarm(void);
  * cannot be trusted. */
 void host_bms_arm(uint8_t soc, bool valid);
 
+/* Number of bms_poll() calls since the last host_bms_disarm(). */
+uint32_t host_bms_poll_count(void);
+
 #endif /* HOST_SUPPORT_H */

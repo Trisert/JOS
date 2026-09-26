@@ -155,6 +155,7 @@ void setUp(void)
 {
     host_flash_reset();
     seu_stub_reset();
+    host_bms_disarm();
     fake_tick      = 0u;
     sim_boot_fault = 0;
     boot_fault_acks = 0;
@@ -466,16 +467,40 @@ void test_untrusted_image_confines_to_crit_and_init(void)
     TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
 }
 
-/* A Flash failure under the LastStates write refuses the transition WITHOUT
- * moving state: the record is the evidence, not a side effect. */
-void test_transition_fails_when_laststates_persistence_fails(void)
+/* A Flash failure under the LastStates write no longer vetoes a legal
+ * transition: the OBSW moves, and the missing record is counted. Before the
+ * fix the transition was refused, so a sick Flash page froze the OBSW in its
+ * current state (and a low battery could not drive CRIT any more). */
+void test_transition_commits_and_counts_when_laststates_persistence_fails(void)
 {
+    const uint32_t before = state_machine_unrecorded_transitions();
+    const uint32_t records = laststates_count();
+
     boot_to_ready();
 
     host_flash_fail_program_after(0u);
-    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_ACTIVE,
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_ACTIVE,
                                                        TRIGGER_GROUND_CMD));
-    TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
+    TEST_ASSERT_EQUAL_INT(STATE_ACTIVE, (int)state_machine_get_state());
+    TEST_ASSERT_EQUAL_UINT32(before + 1u, state_machine_unrecorded_transitions());
+    TEST_ASSERT_EQUAL_UINT32(records + 2u, laststates_count());   /* INIT + READY only */
+}
+
+/* Already in CRIT: a further CRIT request is a no-op - accepted, nothing
+ * recorded. It used to write a LastStates record every time. */
+void test_crit_to_crit_is_a_noop_without_record(void)
+{
+    uint32_t records;
+
+    boot_to_crit();
+    records = laststates_count();
+
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_CRIT,
+                                                      TRIGGER_BATTERY_LOW));
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_CRIT,
+                                                      TRIGGER_CRIT_EVENT));
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
+    TEST_ASSERT_EQUAL_UINT32(records, laststates_count());
 }
 
 /* ---------- Beacon cadence ---------- */
@@ -554,7 +579,7 @@ void test_task_boot_reaches_ready_and_idles(void)
  * SoC <= b_scrit and drives s3->s2 by itself. */
 void test_task_loop_drives_crit_on_battery_low(void)
 {
-    bms_set_soc_stub(10u);
+    host_bms_arm(10u, true);
     run_task_until_delay(3);
 
     TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
@@ -569,7 +594,7 @@ void test_task_loop_drives_crit_on_battery_low(void)
  * band (b_crit < soc <= b_commok) and asserts the loop now contains. */
 void test_task_loop_drives_crit_on_b_commok_band(void)
 {
-    bms_set_soc_stub(50u);   /* 40 < 50 <= 60: previously unenforced band */
+    host_bms_arm(50u, true);   /* 40 < 50 <= 60: previously unenforced band */
     run_task_until_delay(3);
 
     TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
@@ -581,7 +606,7 @@ void test_task_loop_drives_crit_on_b_commok_band(void)
  * unenforced. */
 void test_task_loop_drives_crit_on_b_crit_band(void)
 {
-    bms_set_soc_stub(30u);   /* 25 < 30 <= 40 */
+    host_bms_arm(30u, true);   /* 25 < 30 <= 40 */
     run_task_until_delay(3);
 
     TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
@@ -599,13 +624,81 @@ void test_task_loop_drives_crit_on_b_crit_band(void)
  * inventing a fault. Fails if the valid flag is dropped from the band. */
 void test_task_loop_does_not_fabricate_battery_fault_when_soc_unknown(void)
 {
-    bms_set_soc_stub(10u);   /* stale byte, BELOW b_scrit */
-    bms_clear_soc_stub();    /* ... but not backed by telemetry */
+    host_bms_arm(10u, false);  /* byte BELOW b_scrit, reply not trusted */
     run_task_until_delay(3);
 
     TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
 
     bms_set_soc_stub(100u);
+}
+
+/* A low battery must be recorded ONCE, not on every 100 ms iteration: the
+ * autonomous check re-evaluates the band each tick, and CRIT -> CRIT used to
+ * be logged every time (a Flash page erase every ~1.6 s). Boot (2 delays) +
+ * 5 loop iterations: INIT, READY and CRIT are the only records. */
+void test_task_loop_records_low_battery_crit_only_once(void)
+{
+    host_bms_arm(10u, true);
+    run_task_until_delay(7);
+
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
+    TEST_ASSERT_EQUAL_UINT32(3u, laststates_count());
+}
+
+/* The EPS is polled on the first loop iteration and then exactly every 10th
+ * 100 ms tick (1 Hz). `bms_tick++ >= 10U` polled every 11th tick and only
+ * after 1.1 s. 20 iterations -> polls on iterations 1 and 11. */
+void test_task_loop_polls_the_eps_at_1hz_starting_immediately(void)
+{
+    run_task_until_delay(2 + 20);
+
+    TEST_ASSERT_EQUAL_UINT32(2u, host_bms_poll_count());
+}
+
+/* The FRAM golden copy restores obsw_state over the boot defaults. A boot must
+ * still start from s0 and run the boot sequence: a state restored as CRIT
+ * with the SoC unknown used to stay CRIT forever (s2->s3 needs a valid SoC),
+ * even across a ground-commanded reset. */
+void test_task_boot_ignores_a_restored_crit_state(void)
+{
+    boot_to_crit();            /* stands in for the FRAM-restored state */
+    bms_clear_soc_stub();      /* SoC unknown, as after any reset */
+
+    run_task_until_delay(3);
+
+    TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
+}
+
+/* ... and a restored battery snapshot must not re-open the SoC gates: the
+ * reading was taken before the reset, nobody has measured the battery this
+ * boot. */
+void test_task_boot_discards_a_restored_battery_snapshot(void)
+{
+    boot_to_ready();
+    bms_set_soc_stub(90u);     /* valid, stale: what the FRAM golden holds */
+
+    run_task_until_delay(3);   /* EPS poll fails (disarmed) */
+    TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
+
+    TEST_ASSERT_EQUAL_INT(0, state_machine_request_transition(STATE_CRIT,
+                                                      TRIGGER_CRIT_EVENT));
+    TEST_ASSERT_EQUAL_INT(-1, state_machine_request_transition(STATE_READY,
+                                                        TRIGGER_BATTERY_OK));
+    TEST_ASSERT_EQUAL_INT(STATE_CRIT, (int)state_machine_get_state());
+}
+
+/* A LastStates pool that refuses every write must not freeze the boot in
+ * s0: READY is not reachable from OFF, so a refused INIT used to strand the
+ * OBSW in STATE_OFF for the whole run. */
+void test_task_boot_reaches_ready_when_laststates_refuses_writes(void)
+{
+    const uint32_t before = state_machine_unrecorded_transitions();
+
+    laststates_pool_lock_set_result_for_test(LASTSTATES_LOCK_FAILED);
+    run_task_until_delay(3);
+
+    TEST_ASSERT_EQUAL_INT(STATE_READY, (int)state_machine_get_state());
+    TEST_ASSERT_EQUAL_UINT32(before + 2u, state_machine_unrecorded_transitions());
 }
 
 /* An untrusted image survives into the task boot: INIT bookkeeping still
