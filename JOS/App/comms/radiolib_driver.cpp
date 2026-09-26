@@ -18,6 +18,7 @@
 
 #include "radiolib_hal.h"
 #include "cmsis_os.h"   /* osThreadFlagsX for TX_DONE signalling */
+#include "lora_tx_wait.h"
 
 /* RadioLib objects.
  * JOS-vendored RadioLib: SX1268 takes a Module* (not (hal,cs,dio1,rst,busy)).
@@ -26,9 +27,10 @@ STM32Hal radioHal(&hspi1);
 Module   radioModule(&radioHal, RLIB_NSS, RLIB_DIO1, RLIB_RESET, RLIB_BUSY);
 SX1268   radio(&radioModule);
 
-/* Thread flag used to wake the TX path on DIO1 TX_DONE. */
-#define LORA_FLAG_TX_DONE 0x01U
-#define LORA_FLAG_RX_DONE 0x02U
+/* LORA_FLAG_TX_DONE / LORA_FLAG_RX_DONE and the TX_DONE confirmation loop
+   live in lora_tx_wait.h/.c (plain C, host-tested). */
+static_assert(LORA_IRQ_TX_DONE == RADIOLIB_SX126X_IRQ_TX_DONE,
+              "lora_tx_wait.h TX_DONE bit must match the SX126x IRQ status layout");
 
 static osThreadId_t g_tx_wait_handle = NULL;
 
@@ -56,16 +58,6 @@ static void radio_unlock(void)
     }
 }
 
-/* osThreadFlagsWait() result carries `want` and is not an error code. Same
-   rule as comms_flags_have() in comms.c: `==` misses a wanted flag that
-   arrived together with another one. */
-static bool radio_flags_have(uint32_t flags, uint32_t want)
-{
-    if ((flags & osFlagsError) != 0U) {
-        return false;
-    }
-    return (flags & want) == want;
-}
 /* RX task handle, registered by lora_rx_task_create() so the DIO1 ISR can wake
    the correct task on RX_DONE. NULL until the RX task has started. */
 static osThreadId_t g_rx_handle = NULL;
@@ -151,36 +143,21 @@ extern "C" int lora_tx(const uint8_t* data, size_t len)
     return (s == RADIOLIB_ERR_NONE) ? 0 : -1;
 }
 
-/* Block the calling task until the SX1268 reports TX_DONE (or timeout).
-   A DIO1 wake-up is accepted only when the chip's IRQ status really carries
-   TX_DONE; anything else keeps waiting for the rest of the budget. */
+/* Current SX126x IRQ status word (lora_tx_wait.h). getIrqFlags() leaves the
+   buffer at 0 when the SPI read fails, so a dead bus reads as "no TX_DONE". */
+extern "C" uint32_t lora_irq_status(void)
+{
+    radio_lock();
+    const uint32_t irq = radio.getIrqFlags();
+    radio_unlock();
+    return irq;
+}
+
+/* Block the calling task until the SX1268 reports TX_DONE (or timeout); see
+   lora_tx_wait_confirm(). Ends the TX sequence's ownership of DIO1. */
 extern "C" int lora_tx_wait_done(uint32_t timeout_ms)
 {
-    const uint32_t start = osKernelGetTickCount();
-    uint32_t remaining   = timeout_ms;
-    int      rc          = -1;
-
-    for (;;) {
-        const uint32_t flags = osThreadFlagsWait(LORA_FLAG_TX_DONE, osFlagsWaitAny,
-                                                 remaining);
-        if (!radio_flags_have(flags, LORA_FLAG_TX_DONE)) {
-            break;                                   /* timeout or error */
-        }
-        radio_lock();
-        const uint32_t irq = radio.getIrqFlags();
-        radio_unlock();
-        if ((irq & RADIOLIB_SX126X_IRQ_TX_DONE) != 0U) {
-            rc = 0;
-            break;
-        }
-        if (timeout_ms != osWaitForever) {
-            const uint32_t spent = osKernelGetTickCount() - start;
-            if (spent >= timeout_ms) {
-                break;
-            }
-            remaining = timeout_ms - spent;
-        }
-    }
+    const int rc = lora_tx_wait_confirm(timeout_ms);
     g_tx_wait_handle = NULL;
     return rc;
 }

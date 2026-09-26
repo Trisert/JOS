@@ -81,6 +81,18 @@ One beacon TX holds `loraBeacon` for up to ~6 s (3 chunks × 2 s TX_DONE wait).
 (`getIrqFlags()`) carries `TX_DONE`, so neither a preemption after
 `startTransmit()` nor an RX_DONE pending from receive mode can be mistaken
 for the other.
+
+The confirmation loop is plain C in `lora_tx_wait.c` (host-tested by
+`test/test/test_lora_tx_wait.c`):
+
+| Function | Contract |
+|---|---|
+| `lora_tx_wait_confirm(timeout_ms)` | Waits for `LORA_FLAG_TX_DONE`; accepts a wake-up only if `lora_irq_status()` has `LORA_IRQ_TX_DONE` (SX126x IRQ bit 0), otherwise keeps waiting for the remaining budget. `osWaitForever` is unbounded. 0 on confirmed TX_DONE, -1 on timeout or RTOS error. |
+| `lora_irq_status()` | Flight implementation in `radiolib_driver.cpp`: `getIrqFlags()` under the radio mutex; a failed SPI read returns 0 (never TX_DONE). |
+
+`lora_tx_wait_done()` in the driver is `lora_tx_wait_confirm()` followed by the
+release of DIO1 routing. The DIO1-before-`startTransmit()` ordering itself is
+C++ driver code and is not host-tested.
 No mid-sequence watchdog kick is needed: the task is monitored against its
 1..16 min cadence and flagged only after 3× the period (≥ 3 min), so the block
 sits two orders of magnitude inside the monitor window.

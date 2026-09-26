@@ -7,13 +7,16 @@ for the STM32L496VGTx target.
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| ARM GCC toolchain | `gcc-arm-none-eabi` ≥ 10 (CI uses 10.3; build container uses 15.2) | `arm-none-eabi-gcc`, `arm-none-eabi-ld`, `arm-none-eabi-size`, `arm-none-eabi-objcopy` |
+| ARM GCC toolchain | `arm-none-eabi-gcc` ≥ 10. CI pins **Arm GNU Toolchain 14.3.Rel1** (the STM32CubeIDE 2.x reference) and is authoritative; `nix develop` ships gcc-arm-embedded-13, the devcontainer the distro `gcc-arm-none-eabi`, the build container 15.2 | `arm-none-eabi-gcc`, `arm-none-eabi-ld`, `arm-none-eabi-size`, `arm-none-eabi-objcopy` |
 | GNU Make | any 4.x | drives the `Makefile` at `JOS/` root |
 | Git | any | for source checkout |
 
-> **Warning — toolchain strictness:** GCC 15 treats implicit-function-declaration
-> as a hard error; GCC 10 only warns. A build that is green on CI (GCC 10) may
-> fail locally on GCC 15. Keep prototypes declared (see `App/comms/comms.h`).
+> **Warning — toolchain strictness:** GCC >= 14 treats implicit-function-declaration
+> as a hard error; older GCC only warns. The Makefile passes
+> `-Werror=implicit-function-declaration`, so every toolchain fails the same way,
+> but other diagnostics still differ between versions: a local build on a
+> different GCC than CI's 14.3 can be more or less strict. CI is authoritative.
+> Keep prototypes declared (see `App/comms/comms.h`).
 
 ## Warning / hardening flags
 
@@ -23,7 +26,7 @@ for the STM32L496VGTx target.
 |------|-----------|-----|
 | `-Wall -Wextra` | C and C++ | Maximum practical diagnostic coverage (NASA Power of Ten rule 10, JPL-182, ECSS-E-ST-40C). |
 | `-Wdouble-promotion` | C and C++ | The Cortex-M4F FPU is single precision; silent `float -> double` promotion falls back to soft-float. |
-| `-Werror=implicit-function-declaration` | C only | Makes every toolchain fail the way GCC >= 14 does, so a missing prototype cannot pass CI on GCC 10. `cc1plus` rejects the option, so it is not passed to C++. |
+| `-Werror=implicit-function-declaration` | C only | Makes every toolchain fail the way GCC >= 14 does, so a missing prototype cannot pass on an older local toolchain either (CI's 14.3 already rejects it). `cc1plus` rejects the option, so it is not passed to C++. |
 
 `-Werror` is deliberately **not** enabled globally: the vendored trees (STM32
 HAL, FreeRTOS, RadioLib) emit warnings we do not own, and hard-failing on them
@@ -271,12 +274,15 @@ make crc-stamp
 ## Build (CI — GitHub Actions)
 
 Pushing to `main` or opening a PR triggers `.github/workflows/build.yml`, which
-runs two independent jobs:
+runs four independent jobs, and `.github/workflows/codeql.yml`:
 
 | Job | Runner | What it does |
 |-----|--------|--------------|
-| `static-analysis` | `ubuntu-24.04` (pinned) | installs the pinned cppcheck, then runs `make -C JOS cppcheck-canary`, `make -C JOS cppcheck-includes` and `make -C JOS cppcheck` in that order |
-| `build` | `ubuntu-latest` | installs `gcc-arm-none-eabi` + `libnewlib-arm-none-eabi` and runs `make all` in `JOS/`; uploads `JOS.elf/.bin/.hex` |
+| `static-analysis` | `ubuntu-24.04` (pinned) | installs the pinned cppcheck, then runs `make -C JOS cppcheck-canary`, `cppcheck-includes`, `cppcheck-includes-proof` and `cppcheck` in that order |
+| `build` (Firmware build) | `ubuntu-latest` | installs **Arm GNU Toolchain 14.3.Rel1**, runs `make release` and `make crc-stamp` in `JOS/`, reports the size and uploads `JOS.elf/.bin/.hex` |
+| `unit-tests` (Host unit tests) | `ubuntu-latest` | installs Ruby, Ceedling 1.0.1 and gcovr, runs `ceedling test:all` and `ceedling gcov:all` (coverage gate) in `JOS/test` |
+| `workflow-lint` | `ubuntu-24.04` | installs the pinned actionlint and runs `actionlint -color` |
+| CodeQL `Analyze (c-cpp)` | `ubuntu-24.04` | installs the same 14.3.Rel1 toolchain and analyses a manual `make -C JOS` build |
 
 Together these are the authoritative gate.
 
