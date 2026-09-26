@@ -215,6 +215,7 @@ void STM32Hal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
         if (HAL_SPI_TransmitReceive_DMA(_spi, &out[done], &in[done],
                                         (uint16_t)chunk) != HAL_OK) {
             s_spi_last_error = (uint32_t)SPI_XFER_DMA_START;
+            s_dma_waiter = NULL;   /* nobody waits: a later IRQ must not flag us */
             failed = true;
             break;
         }

@@ -459,6 +459,10 @@ void fault_log_assert(const char *file, int line)
     static volatile uint32_t s_assert_nesting = 0U;
 
     __disable_irq();
+    /* Dual-bank boot-fault evidence first (RAM only, never blocks), exactly
+       like fault_capture(): an image that asserts on every boot must reach
+       the golden-image fallback threshold. */
+    dual_bank_mark_boot_fault();
     if (s_assert_nesting != 0U) {
         fault_reset_now();
     }

@@ -1025,6 +1025,9 @@ static int flash_write_row(uintptr_t addr, const uint8_t *data, size_t len)
  * the pool is empty). A pool with no erased slot at all can only be a legacy
  * layout or an erase-ahead that failed; its age order is unknowable, so the
  * cursor falls back to slot 0 and the next write recycles page 0. */
+_Static_assert((LASTSTATES_MAX_ENTRIES <= 64U) &&
+               ((LASTSTATES_MAX_ENTRIES & (LASTSTATES_MAX_ENTRIES - 1U)) == 0U),
+               "laststates_scan() bitmap and ring mask need a power-of-two pool of <= 64 slots");
 static uint32_t laststates_scan(uint32_t *oldest, int *full)
 {
     uint64_t erased   = 0U;

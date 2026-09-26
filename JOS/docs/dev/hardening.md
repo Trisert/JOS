@@ -157,10 +157,10 @@ is deliberately not monitored.
 
 > Note: the hardware IWDG is **active** (~31 s, `Core/Src/hw_watchdog.c`, kicked
 > from `main.c` and `watchdog.c`); the software monitor in `App/obsw/watchdog.c`
-> runs alongside it. The monitor's reaction to a flagged task is still a
-> `TODO` (`watchdog.c:217`: "log anomaly, optionally suspend/delete task"), so
-> the dual-bank golden-image fallback is **not** the only recovery path still
-> pending — closing that TODO is the other one.
+> runs alongside it. A flagged task is recorded (`TRIGGER_WATCHDOG`), counted
+> as a boot fault (`dual_bank_mark_boot_fault()`) and the OBC is reset — see
+> row 2.4. The dual-bank golden-image fallback that such boot faults feed is
+> still inhibited on this build (row 3.2).
 
 ### Verification
 

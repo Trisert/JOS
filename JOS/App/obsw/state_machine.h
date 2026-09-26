@@ -38,7 +38,7 @@ void *state_machine_critical_region(size_t *len);
    be written (Flash failure). A failed record no longer vetoes a transition
    - that froze the OBSW in its current state on a sick Flash page - so the
    loss of evidence is counted here for housekeeping telemetry instead.
-   Saturating-free 32-bit counter, zero after reset. */
+   Wrapping 32-bit counter, zero after reset. */
 uint32_t state_machine_unrecorded_transitions(void);
 
 #endif /* STATE_MACHINE_H */

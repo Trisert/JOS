@@ -234,12 +234,17 @@ arm-none-eabi-size build/JOS.elf
 
 `make all` without a profile defaults to `debug`.
 
-**Uplink key.** A flight image needs the mission HMAC key on the command line,
-from a clean tree (object files do not depend on the defines):
+**Uplink key.** A flight image needs the mission HMAC key on the command line:
 
 ```bash
-make clean && make release COMMS_AUTH_KEY=<8 hex digits>
+make release COMMS_AUTH_KEY=<8 hex digits>
 ```
+
+The key bytes never reach a compiler or cppcheck command line (those are
+echoed into build logs): the Makefile writes them into
+`build/gen/comms_auth_key.h` (mode 0600, git-ignored with `build/`), rewritten
+only when its content changes, so setting, changing or removing the key
+rebuilds exactly the objects that include it.
 
 Without it the build prints a warning and the image rejects every
 authenticated telecommand (fail closed): the only key it would know is the

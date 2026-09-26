@@ -102,7 +102,8 @@
  * Uplink HMAC key (4 bytes, upstream RedPill makeMAC design).
  *
  * The key is PROVISIONED per mission at build time with
- * `make ... COMMS_AUTH_KEY=<8 hex digits>` (-> -DCOMMS_AUTH_KEY0..3); the
+ * `make ... COMMS_AUTH_KEY=<8 hex digits>` (-> COMMS_AUTH_KEY0..3 in the
+ * generated build/gen/comms_auth_key.h); the
  * ground station must use the same key or every uplink is rejected.
  *
  * Without provisioning, the upstream default SECRET_KEY = A1 B2 C3 D4 is
@@ -117,6 +118,12 @@
  * protection. Both are properties of the upstream frame/MAC design shared
  * with the ground segment and cannot be changed on the OBC side alone.
  */
+/* The Makefile writes a provisioned key into a generated header (never on
+ * the command line, which build logs echo); host tests pass -D instead. */
+#if defined(COMMS_AUTH_KEY_HEADER)
+#include "comms_auth_key.h"
+#endif
+
 #if defined(COMMS_AUTH_KEY0) && defined(COMMS_AUTH_KEY1) && \
     defined(COMMS_AUTH_KEY2) && defined(COMMS_AUTH_KEY3)
 #define COMMS_AUTH_KEY_PROVISIONED 1

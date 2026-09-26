@@ -38,12 +38,14 @@ blocks on a thread flag set by the DMA IRQ (other tasks keep running), and
 
 Authenticated frames carry a truncated HMAC-SHA256 tag (upstream `makeMAC`,
 4-byte key). The key is provisioned at build time:
-`make release COMMS_AUTH_KEY=<8 hex digits>` (-> `COMMS_AUTH_KEY0..3`). Without
+`make release COMMS_AUTH_KEY=<8 hex digits>` (-> `COMMS_AUTH_KEY0..3` in the
+generated, mode-0600 `build/gen/comms_auth_key.h`, never on a logged command
+line). Without
 it the image only knows the **published** upstream default `A1 B2 C3 D4`, and
 every authenticated frame is rejected with `MAC` (fail closed). The `bench`
 profile opts back into the public key (`COMMS_AUTH_ALLOW_PUBLIC_KEY=1`).
-Changing the key needs a clean build (`make clean`): object files do not
-depend on the command-line defines.
+Changing the key rebuilds the affected objects automatically (the generated
+header is tracked by the dependency files).
 
 Open (TASKS.md): 4-byte key and 4-byte tag are brute-forceable offline from
 one captured frame, and there is no replay protection — both are properties of

@@ -401,6 +401,12 @@ static int watchdog_escalate_stalled(osThreadId_t handle,
 #endif
     return WDG_ESCALATE_HANDLED;
 #else
+    /* RAM-only and non-blocking, so FIRST: the record below can wait on the
+       pool mutex held by another task, and the STWD100 is not kicked while
+       this task waits - an external reset must not lose the boot-fault
+       evidence the golden-image fallback counts. */
+    dual_bank_mark_boot_fault();
+
     if (action == WDG_ACTION_RECORD_AND_RESET) {
         laststates_entry_t entry;
         uint32_t           ctx[6];
@@ -426,7 +432,6 @@ static int watchdog_escalate_stalled(osThreadId_t handle,
         (void)laststates_write(&entry);
     }
 
-    dual_bank_mark_boot_fault();
     __DSB();
     NVIC_SystemReset();
     return WDG_ESCALATE_HANDLED;   /* not reached */

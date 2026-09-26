@@ -191,7 +191,7 @@ static int laststates_log(uint8_t from, uint8_t to, uint8_t trigger,
 #define TR_UNRECORDED        2   /* committed, but the record did not land     */
 
 /* Transitions committed without their LastStates record (Flash failure).
-   Saturating-free 32-bit counter for housekeeping telemetry, zero after
+   Wrapping 32-bit counter for housekeeping telemetry, zero after
    reset: the missing records are visible as a number instead of a silence. */
 static uint32_t unrecorded_transitions = 0U;
 
