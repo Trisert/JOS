@@ -121,7 +121,7 @@ four bytes of `build/JOS.bin`.
 
 | Value        | Meaning                          | Firmware status      | Trusted |
 |--------------|----------------------------------|----------------------|---------|
-| `0x00000000` | placeholder, image never stamped | `BOOT_CRC_UNSTAMPED` | yes     |
+| `0x00000000` | placeholder, image never stamped | `BOOT_CRC_UNSTAMPED` | policy-dependent; flight policy retries then confines |
 | `0xFFFFFFFF` | erased Flash                     | `BOOT_CRC_ERASED`    | **no**  |
 | other        | real stamp, must match           | `BOOT_CRC_OK` / `BOOT_CRC_MISMATCH` | match only |
 
@@ -155,21 +155,21 @@ yet (payload/AOCS bring-up pending), but they register on creation, so those
 tasks are monitored from the moment they are enabled. The monitor task itself
 is deliberately not monitored.
 
-> Note: the hardware IWDG is **active** (~31 s, `Core/Src/hw_watchdog.c`, kicked
-> from `main.c` and `watchdog.c`); the software monitor in `App/obsw/watchdog.c`
-> runs alongside it. A flagged task is recorded (`TRIGGER_WATCHDOG`), counted
-> as a boot fault (`dual_bank_mark_boot_fault()`) and the OBC is reset — see
-> row 2.4. The dual-bank golden-image fallback that such boot faults feed is
-> still inhibited on this build (row 3.2).
+> Note: the hardware IWDG is active (~31 s, `Core/Src/hw_watchdog.c`), and the
+> software monitor runs alongside it. On an anomaly the monitor records the
+> task and suspends it when safe; suspension is deferred if that task owns the
+> LastStates pool mutex (`watchdog_suspend_allowed()`). This is target-side
+> escalation behavior; host tests exercise policy with target backends compiled
+> out, so they do not prove actual task suspension or Flash behavior.
 
 ### Verification
 
 | Item | Evidence |
 |------|----------|
-| Image stamped in every artefact | `make all` depends on `crc-stamp`; CI re-runs `crc-stamp` + `crc-check` before upload |
-| Flight CRC == stamping tool | `make crc-selftest` (KAT `0xCBF43926` + stamped image) |
-| Unstamped / erased / corrupted image rejected | `crc-check` and `crc-selftest` exit 1 on all three (byte-flip, `0x00000000`, `0xFFFFFFFF`) |
-| `.fw_crc` still last | `--crc-addr` cross-check against `nm __fw_crc_start` |
+| CI image stamping | `.github/workflows/build.yml` runs `make release`, then `make crc-stamp`; the build job uploads ELF/HEX/BIN as `jos-firmware` |
+| Local flash path | `make flash` depends on `crc-stamp` and programs the stamped BIN via `st-flash` |
+| CRC location | `crc-stamp` reads `__fw_crc_start` from the ELF; the stamping tool checks the address against the HEX/BIN image |
+| Unstamped / erased / corrupted image behavior | `boot_crc_verify()` distinguishes the `0x00000000` unstamped placeholder, `0xFFFFFFFF` erased word, and a real stamp; verify with the current tests and tool targets rather than assuming a nonexistent `crc-check` target |
 
 ---
 

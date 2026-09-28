@@ -1,158 +1,147 @@
-# System Architecture
+# JOS system architecture
 
-This document describes the RedPill (JOS) on-board software architecture for the
-STM32L496VGTx target.
+This is a source-tree architecture map, not an approved system baseline. The
+SharePoint document set is authoritative as a whole (`AGENTS.md` §1); where it
+is unresolved, this document preserves the uncertainty instead of inferring a
+flight interface. Source snapshot reviewed: commit `7f0aabd` (2026-09-28).
 
-## Hardware Context
+## System context
 
-| Parameter | Value |
-|-----------|-------|
-| MCU | STM32L496VGTx — ARM Cortex-M4 @ 80 MHz |
-| Internal Flash | 1024 KB (firmware reserves 512 KB; LastStates pool 8 KB @ `0x08080000`) |
-| Internal SRAM | 320 KB (256 KB SRAM1 + 64 KB SRAM2) |
-| External memory | 512 KB FRAM (4x FM24VN10-G, I2C1) |
-| IMU | ASM330LHHXTR (gyro + accel) |
-| Radio | Semtech SX1268 (LoRa, SPI1) |
-| Watchdog | Independent IWDG (~32 s) |
+```mermaid
+flowchart LR
+  GS[Ground station] <-->|LoRa / SX1268<br/>SPI1 + DMA| OBC[OBC: STM32L496VGTx<br/>JOS + FreeRTOS]
+  OBC <-->|Subsystem SPI transport documented;<br/>frame / ICD unresolved| EPS[EPS board<br/>telemetry transaction stub]
+  OBC <-->|Subsystem SPI transport documented;<br/>frame / ICD unresolved| AOCS[AOCS board<br/>task/driver not wired]
+  OBC <-->|I2C1 PB8/PB9| FRAM[4 × FM24VN10-G<br/>512 KB nominal]
+  OBC -->|sensor / actuator connections<br/>implementation partial| PAY[Payload hardware<br/>CRYSTALS / CLOUD / CLEAR]
+  OBC -->|I2C2| CAM[Camera bus]
+```
 
-### Multi-processor split
+The drawing distinguishes transport or board context from a functioning
+end-to-end service. EPS/AOCS subsystem SPI frame formats are not specified in
+the delivered documents and are not implemented as operational polling
+protocols. EPS MCU/gas-gauge identity is an open decision (`TASKS.md`); do not
+infer it from this diagram. Payload hardware details and electrical pin
+assignments remain subject to the OBC netlist and applicable ICDs.
 
-| Processor | Location | Workload |
-|-----------|----------|----------|
-| STM32L496 (OBC) | OBC board | Core OBSW: state machine, telemetry, TT&C, payload commanding, AOCS, memory |
-| STM32L1 | EPS board | BMS: SoC, per-cell temperature, charge current/voltage, safe-mode triggers |
-| Camera MCU | Camera PCB | ArduCam image capture + compression (offloaded from OBC) |
+## Boot and task startup
 
-## Software Architecture
+```mermaid
+flowchart TD
+  R[Reset] --> M[MPU + independent IWDG]
+  M --> H[HAL init + SRAM2 parity init]
+  H --> P[Clock and peripheral init]
+  P --> F[Fault handlers + image CRC check]
+  F --> D[Dual-bank policy check]
+  D --> I[Initialize BMS plumbing, FRAM, LastStates]
+  I --> L[Persist staged boot faults / FRAM probe]
+  L --> C[Apply boot CRC policy]
+  C --> T[Temperature mux/sensors; radio init; FSM; watchdog; SEU]
+  T --> Q[Create default, state-machine, watchdog, LoRa beacon/RX, SEU tasks]
+  Q --> S[Start FreeRTOS scheduler]
+  S --> W[Watchdog monitor declares boot good after uptime window]
+```
 
-- **RTOS:** FreeRTOS (CMSIS-V2, `heap_4`), pre-emptive scheduling.
-- **Watchdog task:** monitors all tasks via tick counters; terminates anomalous tasks.
-- **Communication:** interrupt-driven SPI (no polling). SPI1 = LoRa + CLOUD; I2C1 = FRAM (4x FM24VN10-G); I2C2 = CAM bus.
-- **Storage:** cyclic buffers. FRAM (512 KB) = primary payload sink; internal Flash = OBSW binary + LastStates pool (8 KB @ `0x08080000`) + beacon/ACK buffers.
-- **Chunking:** LoRa max packet 64 B; large objects fragmented on-board, reassembled at GS.
+Sequence is based on `JOS/Core/Src/main.c`. The boot CRC policy can reset on
+failure; after its retry budget it continues in an untrusted, constrained mode
+as described by `docs/dev/hardening.md`. The golden-image mechanism exists but
+is compile-time inhibited because the bank-2 golden vector location conflicts
+with the LastStates reservation; it is not an available flight fallback.
+`lora_init()`'s return value is not checked at boot. The AOCS, CLOUD, and CLEAR
+task factories are not created by `main()` in this snapshot.
 
-## Operational State Machine
+## Runtime and fault/data paths
 
-Five-state FSM; all transitions logged to the LastStates pool.
+```mermaid
+flowchart LR
+  ISR[Radio DIO1 ISR] -->|notification| RX[LoRa RX task]
+  RX --> FRAME[Frame layout discriminator]
+  FRAME -->|JOS opcode frame| V[CRC / HMAC / opcode / range validation]
+  FRAME -->|TT&C layout| TV[TT&C parse + MAC verifier seam]
+  V -->|valid| CMD[Command dispatcher]
+  TV -->|verified| TEC[TEC registry / supported handlers]
+  CMD --> FSM[State machine]
+  TEC --> FSM
+  FSM -->|normal transition: log before commit| LS[LastStates: internal Flash]
+  BMS[BMS cached status] -->|successful poll: update snapshot| FSM
+  BMS -. poll transaction not implemented .-> EPS[EPS SPI seam]
+  FSM -->|commit state shadow| SEU[SEU mitigation + SRAM2 shadow]
+  SCRUB[Separate SEU scrub task] -->|vote and repair| SEU
+  INIT[Boot SEU initialization] -->|restore CRC-valid records| SEU
+  SEU -->|best-effort state persistence| FRAM[FRAM]
+  BEACON[Beacon task] -->|128-byte staging buffer, chunked to max 64 B PHY payload| PHY[SX1268]
+  PHY -->|LoRa| GS[Ground station]
+  MON[Watchdog monitor] -->|task liveness scan / IWDG refresh| IWDG[Hardware watchdog]
+```
 
-| State | Name | Key activities |
-|-------|------|----------------|
-| s0 | OFF | Kill switches active; awaiting deployment |
-| s1 | INIT | Antenna deployment retry; self-tests; COMMS disabled |
-| s2 | CRIT | Low/supercritical battery; charging; beacon every 16 min |
-| s3 | READY | Idle; beacon every 4 min; uplink listening |
-| s4 | ACTIVE | Payload + PDT execution; beacon every 1–10 min |
+The two uplink layouts are separate code paths (`App/comms/comms.c`). The JOS
+opcode path validates CRC and, under the flight default, HMAC-authenticates the
+frame before dispatch. The TT&C path parses its distinct layout and rejects
+unless its MAC-verifier seam accepts; no replay/freshness check is provided.
+Neither diagram nor API name should imply encryption. The beacon's 128-byte
+buffer is transmitted as staged, not yet fully populated telemetry, in chunks
+because the PHY limit is 64 bytes.
 
-### Battery thresholds (from EPS STM32L1 / BQ27441)
+## Operational state model
 
-| Threshold | ≈ SoC | Behaviour |
-|-----------|-------|-----------|
-| B_OPOK | 80% | Normal ops; payload + PDT allowed |
-| B_COMMOK | intermediate | PDTs allowed; payload suspended; → s2 until B_OPOK |
-| B_CRIT | low | Current PDT may finish, then → s2 |
-| B_SCRIT | 25% | Ongoing PDT interrupted immediately; → s2 |
+| State | Name | Source-level meaning |
+|---|---|---|
+| s0 | OFF | Initial/off state |
+| s1 | INIT | Boot initialization state |
+| s2 | CRIT | Constrained/critical state |
+| s3 | READY | Ready/idle state |
+| s4 | ACTIVE | Active operation state |
 
-## Memory Budget
+Transitions are mediated by `App/obsw/state_machine.c`; normal transitions log
+to LastStates before state commit. On a log failure `enter_safe_state()` can
+force CRIT without a persisted record, prioritizing containment over evidence.
+The task loop runs at 10 Hz and attempts a BMS refresh at
+1 Hz. A failed BMS poll does not refresh the state-machine snapshot. CRIT
+recovery and CRIT→ACTIVE require valid SoC; CRIT→ACTIVE also requires a ground
+command. INIT→READY currently assumes antenna
+deployment/self-test succeeded, and READY→ACTIVE currently does not enforce a
+valid BMS reading. `TRIGGER_TASK_COMPLETE` exists in the type definitions, but
+this source snapshot contains no completion transition in the state-machine
+implementation. This conflicts with the completed entry in `TASKS.md` for PR #74;
+reconcile the discrepancy before relying on s4→s3 task completion.
 
-| Region | Capacity | Contents |
-|--------|----------|----------|
-| Flash (internal) | 1024 KB | OBSW binary (≤512 KB reserved); LastStates pool (8 KB @ `0x08080000`); beacon/ACK buffers |
-| SRAM (internal) | 320 KB | FreeRTOS kernel; task stacks; heap; runtime vars |
-| FRAM (external) | 512 KB | All payload data + system logging |
+Do not treat ACTIVE as proof that payload workers are running: the payload and
+AOCS task creators are not wired in `main.c`. Payload helper-level actuation
+and state interlocks require separate verification; this overview is not an
+assurance claim.
 
-Linker script: `JOS/STM32L496VGTX_FLASH.ld` (FLASH capped at 512K; `LASTSTATES`
-region 8K at `0x08080000`).
+## Memory and resilience overview
 
-### Dual-bank golden-image fallback (W2-2)
+| Resource | Current documented role | Boundary / caveat |
+|---|---|---|
+| Internal Flash | Firmware image; LastStates pool at `0x08080000` | Linker reserves application region and LastStates; golden bank fallback inhibited due to address conflict |
+| SRAM1 / SRAM2 | RTOS and runtime state; SRAM2 parity-protected critical data | SRAM2 parity init must precede use of protected data |
+| External FRAM | Cyclic payload/logging area and SEU golden records | Review exact address ownership before assuming non-overlap or persistence guarantees |
+| IWDG + software monitor | Reset backstop and task-liveness supervision | Host doubles do not exercise target suspend/Flash backends |
 
-The STM32L496VGTx is permanently dual bank: bank 1 = `0x08000000`..`0x0807FFFF`
-(primary image), bank 2 = `0x08080000`..`0x080FFFFF` (golden image slot). The
-`BFB2` option bit makes the boot ROM swap the two banks in the address map, so
-the golden image is *linked for `0x08000000`* even though it is stored in
-bank 2. `Core/Src/dual_bank.c` falls back to it when the primary image fails
-its boot CRC32 or has taken three consecutive boot-phase faults
-(NASA-STD-8739.8 graceful degradation, ECSS-Q-ST-80C §6.2.6).
+The memory APIs and protection paths have different semantics: LastStates
+logging can veto a state transition; FRAM write-through for committed state is
+best-effort; cyclic science writes are not equivalent to protected golden
+records. See `docs/api/memory.md`, `docs/dev/seu_mitigation.md`, and
+`docs/dev/hardening.md` for contracts and limitations.
 
-Golden image descriptor (written by ground tooling), last 16 bytes of bank 2:
-`magic 'GLDN'` + `length` + `crc32` + `~crc32`.
+## Hardware and unresolved interfaces
 
-**Boot-fault path.** The IWDG (~31 s, `Core/Src/hw_watchdog.c`) and the external
-STWD100 (PC15/WD_IN, WDO -> NRST) bound a spinning fault handler on their own,
-but the handlers reset promptly instead of waiting out the backstop. `NMI`, `HardFault`,
-`MemManage`, `BusFault` and `UsageFault` therefore call
-`dual_bank_handle_boot_fault()`, which records the fault in the warm-reset RAM
-scratch (`.boot_fault`, NOLOAD, SRAM1 — survives a system reset) and issues
-`NVIC_SystemReset()`. The next boot persists the evidence to LastStates in
-`dual_bank_init()`; after `DUAL_BANK_BOOT_FAULT_THRESHOLD` (3) failed boots the
-fallback arms. Build with `-DDUAL_BANK_FAULT_NO_RESET` to keep the old
-spin-forever behaviour on the bench (the fallback is then inert).
+- OBC: STM32L496VGTx, Cortex-M4F at 80 MHz; 1 MB internal Flash and 320 KB SRAM.
+- Radio: SX1268 on SPI1; SPI transfers use DMA. On-air wiring/pin bring-up still
+  has a HIL dependency tracked by `TASKS.md`.
+- FRAM: four FM24VN10-G devices on I2C1 (PB8/PB9), nominal 512 KB total.
+- EPS/AOCS: subsystem SPI transport is described; request/reply formats remain
+  unspecified. EPS processor and battery-monitor identifiers conflict across
+  delivered sources; tracked in `TASKS.md` and must not be silently resolved.
+- Power management: no mission-level Sleep/Stop implementation is present in
+  this snapshot. The radio HAL's WFI is a bounded DMA wait, not low-power mode.
+- Flight readiness: CI and host tests do not close radio GPIO HIL, interface
+  ICD, or licensing gates recorded in `TASKS.md`.
 
-A boot is declared good only after `DUAL_BANK_BOOT_OK_UPTIME_MS` (5 s) of
-scheduler uptime, from the watchdog monitor task — not at `osKernelStart()`,
-which would close the window before any task had run. If that boot's
-`BOOT_OK` marker cannot be written, the `ok_pending` token lets the next boot
-honour the proof once and retry the write; if that retry fails too, the
-marker stays owed and the next `dual_bank_boot_complete()` retries it again
-(re-raising the token on failure) instead of dropping it.
+## Related documentation
 
-**Open layout conflict:** the LastStates pool occupies `0x08080000`, i.e. the
-exact address the boot ROM fetches the golden vector table from after a `BFB2`
-swap. The two cannot share it, so the fallback is *compile-time inhibited*
-(`DUAL_BANK_GOLDEN_SLOT_AVAILABLE == 0`) and will never arm `BFB2` into an
-unbootable configuration.
-
-Gate G1 reserves the **whole of bank 2** for the golden image (image at the
-bottom, descriptor trailer at `0x080FFFF0`), so the pool must leave bank 2
-entirely. `0x080FE000` — floated as a relocation target in an earlier
-revision — is **not** valid: it covers the trailer and the top of the image.
-Valid targets are the top of bank 1 (e.g. `0x0807E000`, with the `FLASH` region
-capped to 504 K) or the external FRAM. `App/memory/memory.c` derives its pool
-base from `DUAL_BANK_LASTSTATES_BASE`, so a relocation is that define plus the
-`LASTSTATES` linker region plus the ground forensics tooling.
-
-## TT&C Layer
-
-- **Modulation:** LoRa (CSS), 436 MHz (TBC), SF10, BW125, CR4/8, 610 b/s
-- **Max packet:** 64 B
-- **Security:** encryption (whitelist + shuffle), CRC on RX, NACK on failure
-- **Workflows:** Beacon TX, Data TX (on `SEND_DATA`), RX (uplink listening)
-
-See `docs/api/comms.md` for the LoRa task API.
-
-## AOCS
-
-The OBC also runs AOCS: B-dot detumbling (IMU @ 50 Hz) → Nadir-Pointing EKF
-(IMU + IIS2MDC magnetometer fusion, 50 Hz). Three magnetorquers driven via TIM2 PWM.
-
-## ECSS Service Alignment
-
-| ST | Service | Status |
-|----|---------|--------|
-| ST[02] | Device Access | Y |
-| ST[03] | Housekeeping | Y |
-| ST[06] | Memory Management | Y |
-| ST[08] | Function Management | Y |
-| ST[09] | Time Management | Y |
-| ST[11] | Time-Based Scheduling | Y |
-| ST[12] | On-Board Monitoring | Y |
-| ST[13] | Large Data Transfer | Y |
-| ST[15] | On-Board Storage | Y |
-| ST[17] | Test | Y |
-| ST[20] | On-Board Parameter Mgmt | Y |
-| ST[23] | File Management | Y |
-| ST[01] | Request Verification | N (FreeRTOS priority list used) |
-| ST[04]/[05]/[14] | Param Stats / Event Report / RT Forwarding | TBD |
-| ST[18] | On-Board Control Procedure | N |
-| ST[22] | Position-Based Scheduling | N |
-
-## Known Limitations
-
-| Item | Status | Notes |
-|------|--------|-------|
-| In-flight RAM update | Not planned | Restricted to 320 KB SRAM |
-| Context save/restore across reset | Not planned | Only LastStates pool preserved |
-| In-flight SW patching | TBD | No formal post-launch commitment |
-| Full command DB consolidation | In progress | Being simplified |
-| CRYSTALS voltage calibration | TBC (3 V nominal) | In-orbit validation |
-
-See `docs/api/` for module-level detail and `docs/dev/` for build/verify.
+- [API contracts](../api/)
+- [Build and CI](../dev/building.md), [verification scope](../dev/ci-and-verification.md)
+- [Hardening](../dev/hardening.md), [power-mode status](../dev/power_modes.md)
+- [Open work and decisions](../../../TASKS.md)

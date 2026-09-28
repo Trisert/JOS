@@ -7,16 +7,13 @@ for the STM32L496VGTx target.
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| ARM GCC toolchain | `arm-none-eabi-gcc` ≥ 10. CI pins **Arm GNU Toolchain 14.3.Rel1** (the STM32CubeIDE 2.x reference) and is authoritative; `nix develop` ships gcc-arm-embedded-13, the devcontainer the distro `gcc-arm-none-eabi`, the build container 15.2 | `arm-none-eabi-gcc`, `arm-none-eabi-ld`, `arm-none-eabi-size`, `arm-none-eabi-objcopy` |
+| ARM GCC toolchain | CI pins Arm GNU Toolchain **14.3.Rel1** | `arm-none-eabi-gcc`, `arm-none-eabi-ld`, `arm-none-eabi-size`, `arm-none-eabi-objcopy` |
 | GNU Make | any 4.x | drives the `Makefile` at `JOS/` root |
 | Git | any | for source checkout |
 
-> **Warning — toolchain strictness:** GCC >= 14 treats implicit-function-declaration
-> as a hard error; older GCC only warns. The Makefile passes
-> `-Werror=implicit-function-declaration`, so every toolchain fails the same way,
-> but other diagnostics still differ between versions: a local build on a
-> different GCC than CI's 14.3 can be more or less strict. CI is authoritative.
-> Keep prototypes declared (see `App/comms/comms.h`).
+> **Toolchain note:** local toolchains may differ from CI. CI uses Arm GNU
+> 14.3.Rel1 for target firmware; host unit tests use the runner's native GCC.
+> Keep prototypes declared and use CI as the authoritative build gate.
 
 ## Warning / hardening flags
 
@@ -183,17 +180,17 @@ reproduce (and therefore catch) the "aborted configuration, exit 0" regression
 class. CI runs it *before* the gate itself, so a green gate is never trusted
 without first proving the gate can go red.
 
-## Build (canonical — NixOS container + CI)
+## Build (reference: CI)
 
-The reference build environment is a dedicated NixOS container (`josbuilder`)
-with the ARM toolchain installed, reachable from the dev machine over Tailscale.
-This isolates the build from the desktop and matches CI exactly.
+The authoritative target build uses Arm GNU Toolchain 14.3.Rel1 in
+`.github/workflows/build.yml`. Local containers and IDEs are convenience
+environments and may differ; compare their output against CI.
 
 ```bash
-# On the dev machine (Pi / laptop), hop into the container:
-ssh -A nicola@nixos "ssh -A root@10.250.0.2"
-cd /srv/josbuilder/JOS/JOS
-make all
+cd JOS
+make release
+make crc-stamp
+arm-none-eabi-size build/JOS.elf
 ```
 
 Artifacts land in `JOS/build/`:
@@ -209,7 +206,7 @@ Verify size budget:
 
 ```bash
 arm-none-eabi-size build/JOS.elf
-# text + data  must be < 1,048,576  (1 MB Flash, 512K reserved for firmware)
+# text + data  must fit the linker-script application region (512 KiB)
 # bss  + data  must be <   327,680  (320 KB SRAM)
 ```
 
@@ -273,18 +270,21 @@ make crc-stamp
 
 ## Build (CI — GitHub Actions)
 
-Pushing to `main` or opening a PR triggers `.github/workflows/build.yml`, which
-runs four independent jobs, and `.github/workflows/codeql.yml`:
+Pushing to `main` or opening a pull request triggers `.github/workflows/build.yml`.
+Its independent jobs run static analysis, target build, host tests/coverage,
+and workflow lint. `.github/workflows/codeql.yml` separately runs on pushes to
+`main` and pull requests:
 
 | Job | Runner | What it does |
 |-----|--------|--------------|
-| `static-analysis` | `ubuntu-24.04` (pinned) | installs the pinned cppcheck, then runs `make -C JOS cppcheck-canary`, `cppcheck-includes`, `cppcheck-includes-proof` and `cppcheck` in that order |
-| `build` (Firmware build) | `ubuntu-latest` | installs **Arm GNU Toolchain 14.3.Rel1**, runs `make release` and `make crc-stamp` in `JOS/`, reports the size and uploads `JOS.elf/.bin/.hex` |
-| `unit-tests` (Host unit tests) | `ubuntu-latest` | installs Ruby, Ceedling 1.0.1 and gcovr, runs `ceedling test:all` and `ceedling gcov:all` (coverage gate) in `JOS/test` |
-| `workflow-lint` | `ubuntu-24.04` | installs the pinned actionlint and runs `actionlint -color` |
-| CodeQL `Analyze (c-cpp)` | `ubuntu-24.04` | installs the same 14.3.Rel1 toolchain and analyses a manual `make -C JOS` build |
+| `static-analysis` | `ubuntu-24.04` (pinned) | installs pinned cppcheck; runs `cppcheck-canary`, `cppcheck-includes`, `cppcheck-includes-proof`, then `cppcheck` via `make -C JOS` |
+| `build` | `ubuntu-latest` | installs Arm GNU 14.3.Rel1, runs `make release`, then `make crc-stamp`; reports size and uploads ELF/HEX/BIN as `jos-firmware` |
+| `unit-tests` | `ubuntu-latest` | Ceedling 1.0.1 `test:all`, then enforced `gcov:all`; uploads test and coverage artifacts |
+| `workflow-lint` | `ubuntu-24.04` | actionlint 1.7.7 plus regression canary |
 
-Together these are the authoritative gate.
+The separate CodeQL workflow also runs on pushes to `main` and pull requests;
+it performs a manual ARM build and analysis of configured first-party scope.
+These checks are software verification evidence, not flight qualification.
 
 ## Build (alternative — STM32CubeIDE)
 
@@ -293,8 +293,8 @@ generated `Makefile`. Open the `.ioc` in CubeIDE, **Generate Code**, then build
 the Debug configuration. The command-line equivalent (if CubeIDE generated a
 `STM32CubeIDE/Debug` tree) is `make -C STM32CubeIDE/Debug all`.
 
-> CubeIDE is **optional** — the canonical path above (container / local `make
-> all` / CI) does not require it. Keep CubeIDE only if you prefer the IDE
+> CubeIDE is **optional** — the reference CI build and local `make release` path
+> do not require it. Keep CubeIDE only if you prefer the IDE
 > workflow or need the RTOS Viewer debugger panel.
 
 > **After Generate Code, discard the USART1 init.** `JOS.ioc` keeps the
@@ -306,9 +306,13 @@ the Debug configuration. The command-line equivalent (if CubeIDE generated a
 ## Flashing
 
 ```bash
-# Via OpenOCD + ST-LINK (requires the toolchain + openocd):
-make -C JOS flash        # if a flash target exists; otherwise use STM32CubeIDE / STM32CubeProgrammer
+cd JOS
+make release
+make crc-stamp
+make flash               # st-flash programs the CRC-stamped BIN at 0x08000000
 ```
 
-The LastStates pool is reserved at `0x08080000` (8 KB) — never overwrite it
-with the application image (see `JOS/STM32L496VGTX_FLASH.ld`).
+`make flash` depends on `crc-stamp`; do not bypass it with an IDE or programmer
+that flashes a freshly linked, unstamped image. The LastStates pool is reserved
+at `0x08080000` (8 KB); see `STM32L496VGTX_FLASH.ld`. Flash success is not HIL
+or flight qualification.
