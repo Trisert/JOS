@@ -49,7 +49,15 @@
    Core/Src/mpu.c. The prototype is declared here rather than including
    "mpu.h" so this config header keeps working from every build unit. */
 #if defined(__ICCARM__) || defined(__CC_ARM) || defined(__GNUC__)
+#ifdef __cplusplus
+extern "C" {
+#endif
   void mpu_task_stack_guard_set(const void *stack_base);
+  /* configASSERT() sink (Core/Src/faults.c): stages a record and resets. */
+  void fault_log_assert(const char *file, int line);
+#ifdef __cplusplus
+}
+#endif
 #endif
 /* USER CODE END Includes */
 
@@ -168,7 +176,13 @@ See http://www.FreeRTOS.org/RTOS-Cortex-M3-M4.html. */
 /* Normal assert() semantics without relying on the provision of an assert.h
 header file. */
 /* USER CODE BEGIN 1 */
-#define configASSERT( x ) if ((x) == 0) {taskDISABLE_INTERRUPTS(); for( ;; );}
+/* A failed kernel assertion used to disable interrupts and spin: no record,
+   and recovery only through the external watchdog (STWD100 ~1.1 s, IWDG
+   ~31 s) with nothing telling ground why. fault_log_assert() stages the
+   file/line in a reset-persistent slot (no Flash, no lock: the assertion can
+   fire inside a critical section or an ISR), resets, and the next boot
+   commits it to LastStates (fault_assert_flush()). */
+#define configASSERT( x ) if ((x) == 0) { fault_log_assert(__FILE__, __LINE__); }
 /* USER CODE END 1 */
 
 /* Definitions that map the FreeRTOS port interrupt handlers to their CMSIS

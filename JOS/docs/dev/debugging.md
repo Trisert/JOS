@@ -10,8 +10,10 @@ priority → subtle crashes under load.
 
 ## Toolchain strictness mismatch
 
-A build green on CI (GCC 10) may fail locally on GCC 15 (implicit-function-
-declaration is an error there). Always declare prototypes (see `comms.h`).
+CI pins Arm GNU Toolchain 14.3.Rel1; a local toolchain of another version
+(the Nix shell ships 13, the build container 15.2) can be more or less strict.
+Implicit function declarations fail everywhere (`-Werror=implicit-function-declaration`);
+always declare prototypes (see `comms.h`). CI is authoritative.
 
 ## Tools
 

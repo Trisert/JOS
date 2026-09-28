@@ -52,15 +52,24 @@ bms_status_t bms_get_status(void)
     return host_bms_status;
 }
 
+static uint32_t host_bms_polls = 0U;
+
 int bms_poll(void)
 {
+    host_bms_polls++;
     return host_bms_poll_rc;
+}
+
+uint32_t host_bms_poll_count(void)
+{
+    return host_bms_polls;
 }
 
 /* ---------- test control ---------- */
 
 void host_bms_disarm(void)
 {
+    host_bms_polls        = 0U;
     host_bms_status.valid = false;
     host_bms_poll_rc      = -1;
 }

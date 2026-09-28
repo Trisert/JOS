@@ -105,6 +105,7 @@ int lora_send_chunked(const uint8_t *data, size_t len)
        On ANY radio failure the sequence aborts here: no further chunks go on
        air (the partial message is detectable via its total field), the
        failure is counted, and the caller retries the whole message later. */
+    int rc = 0;
     for (size_t seq = 0U; seq < total; seq++) {
         const size_t off = seq * payload_max;   /* no overflow: seq < total <= len */
         size_t n = len - off;
@@ -116,17 +117,30 @@ int lora_send_chunked(const uint8_t *data, size_t len)
         tx[COMMS_CHUNK_OFF_TOTAL] = (uint8_t)total;
         memcpy(&tx[COMMS_CHUNK_HDR_LEN], data + off, n);
         if (lora_tx(tx, n + (size_t)COMMS_CHUNK_HDR_LEN) != 0) {
-            tx_stats.sequences_failed++;
-            return -1;
+            rc = -1;
+            break;
         }
         tx_stats.chunks_sent++;
         if (lora_tx_wait_done(2000U) != 0) {
-            tx_stats.sequences_failed++;
-            return -1;
+            rc = -1;
+            break;
         }
     }
-    tx_stats.sequences_ok++;
-    return 0;
+    if (rc == 0) {
+        tx_stats.sequences_ok++;
+    } else {
+        tx_stats.sequences_failed++;
+    }
+
+    /* Put the receiver back on, on EVERY exit path. startTransmit() takes the
+       SX1268 out of RX and it ends the transmission in standby; nothing else
+       re-armed it (lora_rx_task() only re-arms after a frame it RECEIVED), so
+       from the first beacon on the satellite could not hear a single
+       telecommand. A failed re-arm is counted: it is the uplink. */
+    if (lora_start_receive() != 0) {
+        tx_stats.rx_rearm_failures++;
+    }
+    return rc;
 }
 
 /* ---------- TX counters ---------- */
@@ -141,6 +155,7 @@ void comms_tx_get_stats(comms_tx_stats_t *out)
         out->sequences_ok     = tx_stats.sequences_ok;
         out->sequences_failed = tx_stats.sequences_failed;
         out->chunks_sent      = tx_stats.chunks_sent;
+        out->rx_rearm_failures = tx_stats.rx_rearm_failures;
     }
 }
 
@@ -804,35 +819,48 @@ comms_tc_result_t comms_rx_handle_ttc_frame(const uint8_t *frame, size_t len)
 /* ---------- Telecommand dispatcher (private) ---------- */
 
 /**
- * Execute an already-validated telecommand.
+ * Execute an already-validated telecommand and report what happened.
  *
  * Deliberately file-static and suffixed @c _unchecked: it performs NO
  * structural validation of its own, so the only legal caller is
  * comms_rx_handle_frame(), which runs comms_validate_tc() first (length, CRC,
  * opcode whitelist, per-opcode payload size and parameter ranges).
  * Exporting it would make the validation gate bypassable.
+ *
+ * Returns COMMS_TC_OK only when the command was carried out. A command the
+ * owning subsystem refuses (the state machine's gates, the beacon-interval
+ * bounds) is COMMS_TC_ERR_REFUSED; an opcode that validates but has no
+ * implementation yet is COMMS_TC_ERR_OPCODE. Both used to be reported and
+ * counted as accepted - a silent success for a command that did nothing.
  */
-static void comms_dispatch_command_unchecked(uint8_t cmd_id,
-                                             const uint8_t *payload,
-                                             size_t len)
+static comms_tc_result_t comms_dispatch_command_unchecked(uint8_t cmd_id,
+                                                          const uint8_t *payload,
+                                                          size_t len)
 {
+    comms_tc_result_t rc = COMMS_TC_OK;
+
     switch (cmd_id) {
     case COMMS_TC_RESET:
         NVIC_SystemReset();
         break;
     case COMMS_TC_EXIT_STATE:
-        state_machine_request_transition(STATE_READY, TRIGGER_GROUND_CMD);
+        if (state_machine_request_transition(STATE_READY, TRIGGER_GROUND_CMD) != 0) {
+            rc = COMMS_TC_ERR_REFUSED;
+        }
         break;
     case COMMS_TC_SET_CONFIG:
-        /* TODO: apply config from payload */
-        break;
     case COMMS_TC_SEND_DATA:
-        /* TODO: read FRAM and send chunked */
+        /* Not implemented yet (no config sink, no FRAM downlink path):
+           refuse explicitly instead of acknowledging a no-op. */
+        rc = COMMS_TC_ERR_OPCODE;
         break;
     case COMMS_TC_ACTIVATE_PAYLOAD:
-        state_machine_request_transition(STATE_ACTIVE, TRIGGER_GROUND_CMD);
+        if (state_machine_request_transition(STATE_ACTIVE, TRIGGER_GROUND_CMD) != 0) {
+            rc = COMMS_TC_ERR_REFUSED;
+        }
         break;
     case COMMS_TC_SET_BEACON_INTERVAL:
+        rc = COMMS_TC_ERR_PARAM_RANGE;
         if ((payload != NULL) && (len >= 4U)) {
             uint32_t interval_ms = ((uint32_t)payload[0] << 24) |
                                    ((uint32_t)payload[1] << 16) |
@@ -844,15 +872,18 @@ static void comms_dispatch_command_unchecked(uint8_t cmd_id,
             if ((interval_ms == 0UL) ||
                 ((interval_ms >= COMMS_TC_BEACON_MIN_MS) &&
                  (interval_ms <= COMMS_TC_BEACON_MAX_MS))) {
-                state_machine_set_beacon_interval(interval_ms);
+                rc = (state_machine_set_beacon_interval(interval_ms) == 0)
+                     ? COMMS_TC_OK : COMMS_TC_ERR_REFUSED;
             }
         }
         break;
     default:
         /* Unreachable via comms_rx_handle_frame(): unknown opcodes are
-         * rejected by the whitelist. Kept as a defensive no-op. */
+         * rejected by the whitelist. */
+        rc = COMMS_TC_ERR_OPCODE;
         break;
     }
+    return rc;
 }
 
 /* ---------- Uplink validation gate ---------- */
@@ -906,14 +937,36 @@ comms_tc_result_t comms_rx_handle_frame(const uint8_t *frame, size_t len)
 #endif
     }
 
-    comms_rx_account(result);
-
     if (result != COMMS_TC_OK) {
+        comms_rx_account(result);
         return result;   /* rejected — do NOT dispatch */
     }
 
-    comms_dispatch_command_unchecked(opcode, payload, payload_len);
-    return COMMS_TC_OK;
+    if (opcode == COMMS_TC_RESET) {
+        /* The reset does not return: account the acceptance first. */
+        comms_rx_account(COMMS_TC_OK);
+        (void)comms_dispatch_command_unchecked(opcode, payload, payload_len);
+        return COMMS_TC_OK;
+    }
+
+    /* The verdict is what the dispatcher reports, not "it validated". */
+    result = comms_dispatch_command_unchecked(opcode, payload, payload_len);
+    comms_rx_account(result);
+    return result;
+}
+
+/* ---------- Thread-flag test ---------- */
+
+#ifndef osFlagsError
+#define osFlagsError 0x80000000U   /* CMSIS-RTOS2 cmsis_os2.h */
+#endif
+
+bool comms_flags_have(uint32_t flags, uint32_t want)
+{
+    if ((flags & osFlagsError) != 0U) {
+        return false;          /* timeout / error code, not a flag set */
+    }
+    return (flags & want) == want;
 }
 
 /* ---------- Beacon TX task ---------- */
@@ -1021,7 +1074,12 @@ void lora_rx_task(void *arg)
         uint32_t flags = osThreadFlagsWait(LORA_RX_FLAG, osFlagsWaitAny, 100U);
         watchdog_alive_self();
 
-        if (flags == LORA_RX_FLAG) {
+        /* osThreadFlagsWait() returns the flags that were set BEFORE the
+           wait cleared LORA_RX_FLAG (any other bit included), or an error
+           code with bit 31 set. Comparing with `==` dropped a real RX_DONE
+           whenever any other flag bit happened to be set - and skipped the
+           re-arm below with it. */
+        if (comms_flags_have(flags, LORA_RX_FLAG)) {
             size_t rx_len = 0U;
             uint8_t *rx = comms_rx_buffer(&rx_len);
 

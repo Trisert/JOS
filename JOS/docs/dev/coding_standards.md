@@ -10,4 +10,4 @@
   `/* USER CODE BEGIN */` / `/* USER CODE END */`. (CubeIDE is optional — see
   `building.md`.)
 - **Prototypes:** declare all cross-module functions in the relevant `App/*/*.h`.
-  GCC 15 treats implicit declarations as errors; CI uses GCC 10 and only warns.
+  Implicit declarations are a hard error on every toolchain (`-Werror=implicit-function-declaration`; GCC >= 14, including CI's 14.3, rejects them natively).

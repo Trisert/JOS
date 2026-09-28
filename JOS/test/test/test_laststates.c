@@ -17,6 +17,7 @@
 #include "main.h"             /* fakes/main.h: HAL prototypes exercised directly */
 #include "seu_mitigation.h"   /* fakes/: lock/commit contract of W2-5 */
 #include "host_support.h"
+#include "hw_watchdog.h"      /* fakes/: boot-kick counter */
 
 #include <stdint.h>
 #include <string.h>
@@ -143,17 +144,19 @@ void test_laststates_dump_all_refuses_undersized_buffer(void)
 
     memset(&framed, 0x00, sizeof(framed));
 
-    for (i = 0u; i < (uint32_t)LASTSTATES_MAX_ENTRIES; i++) {
+    /* 63 records: the largest the pool holds without an erase-ahead (the
+     * 64th write fills the last page and recycles the oldest one). */
+    for (i = 0u; i < (uint32_t)LASTSTATES_MAX_ENTRIES - 1u; i++) {
         laststates_entry_t e = make_entry(i, STATE_READY, STATE_ACTIVE,
                                           TRIGGER_TASK_COMPLETE, (uint8_t)i);
         TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
     }
 
-    len = sizeof(framed.out);       /* 256 B for an 8 KB pool */
+    len = sizeof(framed.out);       /* 256 B for a ~8 KB pool */
     TEST_ASSERT_EQUAL_INT(-1, laststates_dump_all(framed.out, &len));
 
     /* Required size reported back ... */
-    TEST_ASSERT_EQUAL_size_t((size_t)LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE, len);
+    TEST_ASSERT_EQUAL_size_t(((size_t)LASTSTATES_MAX_ENTRIES - 1u) * LASTSTATES_ENTRY_SIZE, len);
 
     /* ... and not one byte was copied anywhere. */
     for (i = 0u; i < (uint32_t)sizeof(framed.out); i++) {
@@ -364,28 +367,29 @@ void test_laststates_write_leaves_flash_locked(void)
     TEST_ASSERT_EQUAL_UINT32(16u, host_flash_program_count());
 }
 
-/* Filling the pool must not erase anything: all 64 slots are still virgin. */
+/* Filling the pool up to its last slot must not erase anything: 63 records
+ * land in 63 virgin slots. */
 void test_laststates_fills_pool_without_erasing(void)
 {
     uint32_t i;
 
-    for (i = 0u; i < (uint32_t)LASTSTATES_MAX_ENTRIES; i++) {
+    for (i = 0u; i < (uint32_t)LASTSTATES_MAX_ENTRIES - 1u; i++) {
         laststates_entry_t e = make_entry(i, STATE_READY, STATE_ACTIVE,
                                           TRIGGER_TASK_COMPLETE, (uint8_t)i);
         TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
     }
 
-    TEST_ASSERT_EQUAL_UINT32((uint32_t)LASTSTATES_MAX_ENTRIES, laststates_count());
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)LASTSTATES_MAX_ENTRIES - 1u, laststates_count());
     TEST_ASSERT_EQUAL_UINT32(0u, host_flash_erase_count());
 }
 
-/* Wrapping past the last slot must erase before reusing slot 0. Without the
- * erase the program would fail on a non-erased row (PROGERR), silently losing
- * the transition record -- this is the regression this test pins down.
+/* Erase-ahead: the write that fills the last slot of a page recycles the
+ * NEXT page (the oldest in ring order) straight away, so the pool always
+ * keeps one erased run that marks the write cursor across a reset.
  *
- * Only the ONE page the slot belongs to is recycled (16 slots of 128 B in a
- * 2 KB page), never the whole pool: erasing the pool would throw away the 48
- * newer records the post-mortem downlink exists to recover. */
+ * Only that ONE page is recycled (16 slots of 128 B in a 2 KB page), never the
+ * whole pool: erasing the pool would throw away the newer records the
+ * post-mortem downlink exists to recover. */
 void test_laststates_wrap_erases_pool_before_reuse(void)
 {
     const uint32_t slots_per_page = HOST_FLASH_PAGE_SIZE / LASTSTATES_ENTRY_SIZE;
@@ -397,21 +401,195 @@ void test_laststates_wrap_erases_pool_before_reuse(void)
                                           TRIGGER_TASK_COMPLETE, (uint8_t)i);
         TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
     }
-    TEST_ASSERT_EQUAL_UINT32(0u, host_flash_erase_count());
+    /* The 64th write filled page 3 and erased page 0 ahead of the cursor. */
+    TEST_ASSERT_EQUAL_UINT32(1u, host_flash_erase_count());
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)LASTSTATES_MAX_ENTRIES - slots_per_page,
+                             laststates_count());
+    TEST_ASSERT_EQUAL_HEX8(0xFFu, host_flash_pool()[0]);
 
     wrapped = make_entry(0xDEADBEEFu, STATE_ACTIVE, STATE_CRIT,
                          TRIGGER_CRIT_EVENT, 0xEEu);
     TEST_ASSERT_EQUAL_INT(0, laststates_write(&wrapped));
 
+    /* No further erase: slot 0 was already free. */
     TEST_ASSERT_EQUAL_UINT32(1u, host_flash_erase_count());
-    /* One page recycled (16 slots gone) and slot 0 immediately rewritten. */
     TEST_ASSERT_EQUAL_UINT32((uint32_t)LASTSTATES_MAX_ENTRIES - slots_per_page + 1u,
                              laststates_count());
     /* The wrapped entry is back at slot 0 ... */
     TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&wrapped,
                                   host_flash_pool(), LASTSTATES_ENTRY_SIZE);
-    /* ... and slot 1 was erased by the page erase. */
+    /* ... and slot 1 is still erased. */
     TEST_ASSERT_EQUAL_HEX8(0xFFu, host_flash_pool()[LASTSTATES_ENTRY_SIZE]);
+}
+
+/* Timestamp of the k-th record of a dump. */
+static uint32_t dumped_ts(const uint8_t *dump, uint32_t k)
+{
+    laststates_entry_t e;
+    memcpy(&e, dump + (size_t)k * LASTSTATES_ENTRY_SIZE, sizeof(e));
+    return e.timestamp;
+}
+
+/* Many wraps: the ring must always recycle the OLDEST page. Before the fix
+ * the cursor was re-derived as "first erased slot from index 0", which after
+ * the first wrap sent every 17th write back to page 0 and erased the NEWEST
+ * records (100 writes left 16..63 and 96..99; 64..95 were gone). */
+void test_laststates_ring_keeps_the_newest_records_across_many_wraps(void)
+{
+    static uint8_t dump[LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE];
+    const uint32_t total = 5u * (uint32_t)LASTSTATES_MAX_ENTRIES + 7u;
+    size_t   len = sizeof(dump);
+    uint32_t n;
+    uint32_t i;
+
+    for (i = 0u; i < total; i++) {
+        laststates_entry_t e = make_entry(i, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, (uint8_t)i);
+        TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(dump, &len));
+    n = (uint32_t)(len / LASTSTATES_ENTRY_SIZE);
+    TEST_ASSERT_TRUE(n >= 48u);
+    TEST_ASSERT_TRUE(n < (uint32_t)LASTSTATES_MAX_ENTRIES);
+    /* Oldest first, contiguous, and ending with the very last write. */
+    for (i = 0u; i < n; i++) {
+        TEST_ASSERT_EQUAL_UINT32(total - n + i, dumped_ts(dump, i));
+    }
+}
+
+/* A reset right after a page of a wrapped ring filled up (80 writes: page 0
+ * recycled and refilled). laststates_init() re-derives the
+ * cursor from the erase state alone and appends after the newest record. */
+void test_laststates_cursor_is_recovered_after_a_reboot_in_a_wrapped_ring(void)
+{
+    static uint8_t dump[LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE];
+    size_t   len = sizeof(dump);
+    uint32_t n;
+    uint32_t i;
+
+    for (i = 0u; i < 80u; i++) {
+        laststates_entry_t e = make_entry(i, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, (uint8_t)i);
+        TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+    }
+
+    laststates_init();          /* reboot: RAM cursor lost */
+
+    for (i = 80u; i < 100u; i++) {
+        laststates_entry_t e = make_entry(i, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, (uint8_t)i);
+        TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(dump, &len));
+    n = (uint32_t)(len / LASTSTATES_ENTRY_SIZE);
+    for (i = 0u; i < n; i++) {
+        TEST_ASSERT_EQUAL_UINT32(100u - n + i, dumped_ts(dump, i));
+    }
+    TEST_ASSERT_EQUAL_UINT32(1u,
+        (uint32_t)(laststates_oldest_slot() < (uint32_t)LASTSTATES_MAX_ENTRIES));
+}
+
+/* A failed erase-ahead leaves a pool with no erased slot at all. The next
+ * write must recycle the page the cursor was pointing at (the oldest one),
+ * not page 0, and the failure must be visible. */
+void test_laststates_failed_erase_ahead_recycles_the_oldest_page_later(void)
+{
+    static uint8_t dump[LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE];
+    size_t   len = sizeof(dump);
+    uint32_t n;
+    uint32_t i;
+
+    const uint32_t failures_before = laststates_erase_ahead_failures();
+
+    /* 64 + 16 writes: page 0 recycled and refilled; the 80th write fills page
+     * 0 again and must erase page 1 ahead. Make that erase fail. */
+    for (i = 0u; i < 79u; i++) {
+        laststates_entry_t e = make_entry(i, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, (uint8_t)i);
+        TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+    }
+    host_flash_fail_next_erases(1u);
+    {
+        laststates_entry_t e = make_entry(79u, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, 79u);
+        TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));   /* record itself lands */
+    }
+    TEST_ASSERT_EQUAL_UINT32(failures_before + 1u, laststates_erase_ahead_failures());
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)LASTSTATES_MAX_ENTRIES, laststates_count());
+
+    for (i = 80u; i < 85u; i++) {
+        laststates_entry_t e = make_entry(i, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, (uint8_t)i);
+        TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(dump, &len));
+    n = (uint32_t)(len / LASTSTATES_ENTRY_SIZE);
+    for (i = 0u; i < n; i++) {
+        TEST_ASSERT_EQUAL_UINT32(85u - n + i, dumped_ts(dump, i));
+    }
+}
+
+/* A program failure that tears the LAST erased slot of a wrapped ring (64 +
+ * 15 writes: page 0 recycled, slots 0..14 refilled, slot 15 the only erased
+ * one). Before the fix the failure invalidated the cursor; the re-scan then
+ * found no erased slot, fell back to slot 0 and the next write erased page 0,
+ * destroying records 64..78 - the newest ones. The torn slot must instead be
+ * consumed, page 1 (the oldest) recycled, and records 64..78 kept. */
+void test_laststates_torn_last_free_slot_does_not_recycle_the_newest_page(void)
+{
+    static uint8_t dump[LASTSTATES_MAX_ENTRIES * LASTSTATES_ENTRY_SIZE];
+    size_t   len = sizeof(dump);
+    uint32_t n;
+    uint32_t i;
+
+    for (i = 0u; i < 79u; i++) {
+        laststates_entry_t e = make_entry(i, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, (uint8_t)i);
+        TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+    }
+    host_flash_fail_program_after(5u);       /* 5 dwords land, then PROGERR */
+    {
+        laststates_entry_t e = make_entry(79u, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, 79u);
+        TEST_ASSERT_EQUAL_INT(-1, laststates_write(&e));
+    }
+    for (i = 80u; i < 83u; i++) {
+        laststates_entry_t e = make_entry(i, STATE_READY, STATE_ACTIVE,
+                                          TRIGGER_TASK_COMPLETE, (uint8_t)i);
+        TEST_ASSERT_EQUAL_INT(0, laststates_write(&e));
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, laststates_dump_all(dump, &len));
+    n = (uint32_t)(len / LASTSTATES_ENTRY_SIZE);
+    TEST_ASSERT_TRUE(n >= 18u);
+    /* Newest first from the end: 82, 81, 80, then 78 down to 64 (79 torn). */
+    TEST_ASSERT_EQUAL_UINT32(82u, dumped_ts(dump, n - 1u));
+    TEST_ASSERT_EQUAL_UINT32(81u, dumped_ts(dump, n - 2u));
+    TEST_ASSERT_EQUAL_UINT32(80u, dumped_ts(dump, n - 3u));
+    for (i = 0u; i < 15u; i++) {
+        TEST_ASSERT_EQUAL_UINT32(78u - i, dumped_ts(dump, n - 4u - i));
+    }
+}
+
+/* A program failure that leaves the slot fully erased (PROGERR on the first
+ * double word) keeps the cursor: the next record lands in that same slot. */
+void test_laststates_failed_program_with_nothing_written_retries_the_slot(void)
+{
+    laststates_entry_t a = make_entry(1u, STATE_READY, STATE_ACTIVE,
+                                      TRIGGER_TASK_COMPLETE, 0x11u);
+    laststates_entry_t b = make_entry(2u, STATE_READY, STATE_ACTIVE,
+                                      TRIGGER_TASK_COMPLETE, 0x22u);
+
+    host_flash_fail_program_after(0u);
+    TEST_ASSERT_EQUAL_INT(-1, laststates_write(&a));
+    TEST_ASSERT_EQUAL_INT(0, laststates_write(&b));
+
+    TEST_ASSERT_EQUAL_UINT32(1u, laststates_count());
+    TEST_ASSERT_EQUAL_UINT8_ARRAY((const uint8_t *)&b, host_flash_pool(),
+                                  LASTSTATES_ENTRY_SIZE);
 }
 
 /* =====================================================================
@@ -794,3 +972,54 @@ void test_laststates_erase_guard_only_accepts_pool_pages(void)
     /* the vector table, i.e. the worst case this guard exists for */
     TEST_ASSERT_FALSE(laststates_erase_addr_allowed((uintptr_t)0x08000000UL));
 }
+
+/* The boot-time FRAM probe runs before the scheduler, where nothing else
+ * refreshes the external STWD100 (tWD >= 1.12 s). It must use a short
+ * per-trial timeout (an F-RAM ACKs its address immediately) and refresh the
+ * watchdog between selects; the full 1 s transfer timeout made a sick bus
+ * cost up to 24 s at boot. Every FRAM transfer try refreshes it too. */
+void test_fram_boot_probe_kicks_watchdog_and_bounds_the_probe_timeout(void)
+{
+    uint8_t buf[4] = { 0 };
+
+    host_hw_watchdog_reset();
+    fram_init();
+    TEST_ASSERT_TRUE(host_hw_watchdog_boot_kick_count() >= 8u);
+    TEST_ASSERT_TRUE(host_i2c_last_probe_timeout() <= 25u);
+
+    host_hw_watchdog_reset();
+    TEST_ASSERT_EQUAL_INT(0, fram_read(0u, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_UINT32(1u, host_hw_watchdog_boot_kick_count());
+}
+
+/* The cyclic buffer wraps inside [0, FRAM_CYCLIC_BYTES) and never enters the
+ * golden area at the top of the bank. The SEU golden slots used to be
+ * computed from a 64 KB FRAM and sat inside the first 64 KB of the buffer;
+ * the buffer itself wrapped at 512 KB, i.e. through the golden area. */
+void test_cyclic_buffer_never_writes_into_the_golden_area(void)
+{
+    static uint8_t big[FRAM_CYCLIC_BYTES];
+    uint8_t golden[64];
+    uint8_t check[64];
+
+    memset(golden, 0x5A, sizeof(golden));
+    TEST_ASSERT_EQUAL_INT(0, fram_write(FRAM_GOLDEN_BASE, golden, sizeof(golden)));
+    TEST_ASSERT_EQUAL_INT(0, fram_write(FRAM_TOTAL_BYTES - sizeof(golden),
+                                        golden, sizeof(golden)));
+
+    cyclic_buffer_init();
+    memset(big, 0xC3, sizeof(big));
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(big, FRAM_CYCLIC_BYTES - 100u));
+    TEST_ASSERT_EQUAL_INT(0, cyclic_buffer_write(big, 200u));   /* wraps */
+    TEST_ASSERT_EQUAL_UINT32(100u, cyclic_buffer_head());
+
+    TEST_ASSERT_EQUAL_INT(0, fram_read(FRAM_GOLDEN_BASE, check, sizeof(check)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(golden, check, sizeof(check));
+    TEST_ASSERT_EQUAL_INT(0, fram_read(FRAM_TOTAL_BYTES - sizeof(check),
+                                       check, sizeof(check)));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(golden, check, sizeof(check));
+
+    /* Reads of the buffer stop at its end, too. */
+    TEST_ASSERT_EQUAL_INT(-1, cyclic_buffer_read(FRAM_GOLDEN_BASE, check, 1u));
+}
+

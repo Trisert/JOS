@@ -23,7 +23,7 @@ for the STM32L496VGTx target.
 |------|-----------|-----|
 | `-Wall -Wextra` | C and C++ | Maximum practical diagnostic coverage (NASA Power of Ten rule 10, JPL-182, ECSS-E-ST-40C). |
 | `-Wdouble-promotion` | C and C++ | The Cortex-M4F FPU is single precision; silent `float -> double` promotion falls back to soft-float. |
-| `-Werror=implicit-function-declaration` | C only | Makes every toolchain fail the way GCC >= 14 does, so a missing prototype cannot pass CI on GCC 10. `cc1plus` rejects the option, so it is not passed to C++. |
+| `-Werror=implicit-function-declaration` | C only | Makes every toolchain fail the way GCC >= 14 does, so a missing prototype cannot pass on an older local toolchain either (CI's 14.3 already rejects it). `cc1plus` rejects the option, so it is not passed to C++. |
 
 `-Werror` is deliberately **not** enabled globally: the vendored trees (STM32
 HAL, FreeRTOS, RadioLib) emit warnings we do not own, and hard-failing on them
@@ -221,7 +221,7 @@ never touches first-party source.
 | `debug` (default) | `-O0 -g3` | `FATAL=1 TRUST_UNSTAMPED=0` (flight) | local GDB, full symbols |
 | `release` | `-Os -g3` | flight | size-optimized, symbols kept for backtraces |
 | `release-strip` | `-Os` (no `-g`) | flight | minimum Flash footprint check |
-| `bench` | `-O0 -g3` | `FATAL=0 TRUST_UNSTAMPED=1` | **BENCH BUILD ONLY — never flash to flight** |
+| `bench` | `-O0 -g3` | `FATAL=0 TRUST_UNSTAMPED=1`, public uplink key accepted | **BENCH BUILD ONLY — never flash to flight** |
 
 ```bash
 cd JOS
@@ -232,8 +232,33 @@ make bench          # boot-CRC relaxed; prints BENCH BUILD ONLY warning
 arm-none-eabi-size build/JOS.elf
 ```
 
-`make all` without a profile defaults to `debug`. After building, stamp the
-image CRC before flashing a flight image:
+`make all` without a profile defaults to `debug`.
+
+**Uplink key.** A flight image needs the mission HMAC key on the command line:
+
+```bash
+make release COMMS_AUTH_KEY=<8 hex digits>
+```
+
+The key bytes never reach a compiler or cppcheck command line (those are
+echoed into build logs): the Makefile writes them into
+`build/gen/comms_auth_key.h` (mode 0600, git-ignored with `build/`), rewritten
+only when its content changes, so setting, changing or removing the key
+rebuilds exactly the objects that include it.
+
+The header is written **only** when `COMMS_AUTH_KEY` is on the command line
+(or when it does not exist yet). A later `make crc-stamp`, `make flash` or
+plain `make` without the key keeps the provisioned key (the build prints
+`COMMS_AUTH_KEY: reusing the key provisioned in …`) instead of relinking an
+unkeyed image. To remove a provisioned key pass it empty
+(`make … COMMS_AUTH_KEY=`) or run `make clean`. The "not set" warning reflects
+what the header actually carries, not the current command line.
+
+Without it the build prints a warning and the image rejects every
+authenticated telecommand (fail closed): the only key it would know is the
+upstream default published in this repository. Never commit the key.
+
+After building, stamp the image CRC before flashing a flight image:
 
 ```bash
 make crc-stamp

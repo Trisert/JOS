@@ -76,6 +76,7 @@ static uint8_t i2c_silent_bits = 0U;
 /* Injected program failure (see host_flash_fail_program_after). */
 static int      fail_program_armed;
 static uint32_t fail_program_countdown;
+static uint32_t fail_erase_pending = 0u;
 
 /* ---------- fixture control ---------- */
 
@@ -153,6 +154,7 @@ void host_flash_reset(void)
 
     fail_program_armed     = 0;
     fail_program_countdown = 0u;
+    fail_erase_pending     = 0u;
 
     last_i2c_dev_addr = 0xFFFFu;
 }
@@ -165,6 +167,11 @@ uint32_t host_flash_unlock_count(void)    { return unlock_count; }
 uint32_t host_flash_lock_count(void)      { return lock_count; }
 int      host_flash_is_unlocked(void)     { return flash_unlocked; }
 uint16_t host_flash_last_i2c_addr(void)   { return last_i2c_dev_addr; }
+
+void host_flash_fail_next_erases(uint32_t count)
+{
+    fail_erase_pending = count;
+}
 
 void host_flash_fail_program_after(uint32_t successes)
 {
@@ -250,6 +257,13 @@ HAL_StatusTypeDef HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *pEraseInit, uint32_t
         return HAL_ERROR;                     /* CR locked: PER/STRT are ignored */
     }
     if (pEraseInit->TypeErase != FLASH_TYPEERASE_PAGES) {
+        return HAL_ERROR;
+    }
+    /* Injected erase failure (host_flash_fail_next_erases): a worn page or a
+     * bounded-wait timeout. Nothing is erased. */
+    if (fail_erase_pending != 0U) {
+        fail_erase_pending--;
+        *PageError = pEraseInit->Page;
         return HAL_ERROR;
     }
 
@@ -373,10 +387,15 @@ void host_i2c_set_silent(uint16_t dev_addr_shifted)
     }
 }
 
+static uint32_t last_probe_timeout;
+
+uint32_t host_i2c_last_probe_timeout(void) { return last_probe_timeout; }
+
 HAL_StatusTypeDef HAL_I2C_IsDeviceReady(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
                                         uint32_t Trials, uint32_t Timeout)
 {
-    (void)Trials; (void)Timeout;
+    (void)Trials;
+    last_probe_timeout = Timeout;
     if (hi2c == NULL) {
         return HAL_ERROR;
     }

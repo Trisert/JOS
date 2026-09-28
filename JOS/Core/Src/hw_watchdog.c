@@ -19,6 +19,8 @@
 #include "hw_watchdog.h"
 
 #include "main.h"   /* CMSIS device header: IWDG, IWDG_SR_* */
+#include "FreeRTOS.h"
+#include "task.h"   /* xTaskGetSchedulerState() for hw_watchdog_boot_kick() */
 
 /* ---------- IWDG key register commands (RM0351 38.4.1) ---------- */
 #define IWDG_KEY_RELOAD       0x0000AAAAU  /* refresh the counter          */
@@ -65,6 +67,13 @@
    (including after a fault), hence volatile. */
 static volatile uint8_t s_running = 0U;
 
+/* Set as soon as the IWDG has been STARTED (step 1 below is irreversible),
+   whether or not its prescaler/reload settled. The refresh must follow this
+   flag, not s_running: a started IWDG that is never reloaded resets the MCU
+   at its reset-default timeout (~512 ms with /4 and 0xFFF), i.e. a boot loop
+   from the moment the registers failed to settle. */
+static volatile uint8_t s_started = 0U;
+
 void hw_watchdog_init(void)
 {
     uint32_t guard;
@@ -79,6 +88,7 @@ void hw_watchdog_init(void)
           no RCC configuration is required and the watchdog stays independent
           of the system clock tree that SystemClock_Config() sets up. */
     IWDG->KR = IWDG_KEY_ENABLE;
+    s_started = 1U;
 
     /* 2. Unprotect PR/RLR (they are write-protected until this key is sent). */
     IWDG->KR = IWDG_KEY_WRITE_ACCESS;
@@ -97,10 +107,12 @@ void hw_watchdog_init(void)
     if (guard == 0U) {
         /* The registers never settled, so the timeout actually in force is
            unknown. The watchdog is running regardless (step 1 is irreversible)
-           and will still bound a hang - at the reset-default /4 prescaler,
-           roughly 512 ms, which the 500 ms refresher could not reliably meet.
-           Report "not running" so the condition is visible rather than
-           presenting an unreliable guarantee as a sound one. */
+           and will still bound a hang. hw_watchdog_is_running() reports 0 so
+           the degraded configuration is visible, but the refresh keeps
+           following s_started: skipping it used to turn this condition into a
+           reset every ~0.5 s, forever. Reload now so the boot sequence starts
+           from a full count. */
+        IWDG->KR = IWDG_KEY_RELOAD;
         return;
     }
 
@@ -122,7 +134,7 @@ void hw_watchdog_kick(void)
        Kick budget: the monitor task kicks every 500 ms, within the STWD100-Y
        tWD minimum (1.12 s), with ~2x margin on the worst case. */
     GPIOC->ODR ^= GPIO_ODR_OD15;
-    if (s_running != 0U) {
+    if (s_started != 0U) {
         /* A single store to a write-only key register: no read-modify-write,
            no poll, no HAL_GetTick(). Safe from task, ISR and exception context
            alike, and inherently atomic. */
@@ -133,4 +145,15 @@ void hw_watchdog_kick(void)
 uint8_t hw_watchdog_is_running(void)
 {
     return s_running;
+}
+
+/* Kick from long pre-scheduler boot work only (see hw_watchdog.h). Once the
+   scheduler runs, watchdog_monitor_task() is the sole owner of the refresh:
+   a driver-level kick from task context would keep the STWD100 happy even
+   with the monitor dead. */
+void hw_watchdog_boot_kick(void)
+{
+    if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
+        hw_watchdog_kick();
+    }
 }

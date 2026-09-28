@@ -142,11 +142,18 @@ int host_flash_is_unlocked(void);
  * erased). Reset by host_flash_reset(). */
 void host_flash_fail_program_after(uint32_t successes);
 
+/* Make the next `count` page erases fail with HAL_ERROR without touching the
+ * pool (worn page, bounded-wait timeout). Reset by host_flash_reset(). */
+void host_flash_fail_next_erases(uint32_t count);
+
 /* Last I2C device address the code under test handed to HAL_I2C_Mem_Read/Write
  * (0xFFFF after host_flash_reset()). The HAL takes the 8-bit, already shifted
  * address, so a correct FM24VN10-G access is 0xA0/0xA2/…/0xAE (4 chips x 2
  * A16 pages). */
 uint16_t host_flash_last_i2c_addr(void);
+
+/* Timeout (ms) of the last HAL_I2C_IsDeviceReady() call. */
+uint32_t host_i2c_last_probe_timeout(void);
 
 /* ==========================================================================
  * Radio doubles (support/radiolib_stubs.c) — SX1268 failure injection
@@ -158,6 +165,9 @@ uint16_t host_flash_last_i2c_addr(void);
  * n <= 0 disarms. Default is success; host_lora_reset() restores it
  * (call from setUp()). */
 void host_lora_fail_tx_on_call(int n);
+
+/* lora_start_receive() calls since the last host_lora_reset(). */
+int  host_lora_start_receive_count(void);
 void host_lora_fail_wait_on_call(int n);
 void host_lora_reset(void);
 
@@ -179,5 +189,8 @@ void host_bms_disarm(void);
  * reading the OBSW may trust; arm it false to model a reply that arrived but
  * cannot be trusted. */
 void host_bms_arm(uint8_t soc, bool valid);
+
+/* Number of bms_poll() calls since the last host_bms_disarm(). */
+uint32_t host_bms_poll_count(void);
 
 #endif /* HOST_SUPPORT_H */

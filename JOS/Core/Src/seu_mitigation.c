@@ -448,11 +448,18 @@ int seu_mitigation_commit(seu_region_id_t id)
 
 /* ---------- Reboot-persistent golden copy (FRAM) ----------
    The shadow pool is SRAM2 NOINIT: sram2_parity_init() erases it at every
-   boot, so a commit that only refreshed the shadow cannot carry a
-   containment (STATE_CRIT) across the reboot that the parity NMI is about
-   to cause. The FRAM golden is the leg that survives: task-context commits
+   boot, so a commit that only refreshed the shadow is lost at the next
+   reset. The FRAM golden is the leg that survives: task-context commits
    are written through with seu_mitigation_sync(), and the next init
    restores the CRC-valid records over the registration snapshots.
+
+   What a restore may NOT carry across a reset is decided by the owner, not
+   here: state_machine_task() puts the operational state back to s0 and the
+   battery snapshot back to "unknown" at every boot (only the ground-commanded
+   beacon override survives), because a restored state skipped the boot
+   sequence and a restored battery reading re-opened the SoC gates. The
+   containments that must survive a reset are carried elsewhere (SRAM2 parity
+   finding: reset-stable sram2 store; image trust: re-derived by boot_crc).
 
    Split from commit() on purpose: commit() also runs on the parity-NMI /
    fault path (laststates_write), where a blocking I2C transaction with a

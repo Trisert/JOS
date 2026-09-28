@@ -252,8 +252,8 @@ void dual_bank_handle_boot_fault(void);
  *
  * Returns 0 when the boot-OK state is safely recorded (including the nominal
  * case where there was nothing to clear) and -1 when the marker could not be
- * persisted (LastStates pool exhausted). On -1 the evidence is left intact and
- * the call should be retried later — dual_bank_boot_ok_pending() reports the
+ * persisted (LastStates lock refused or Flash failure). On -1 the evidence is
+ * left intact and the call should be retried later — dual_bank_boot_ok_pending() reports the
  * outstanding state. Call from a running task once the system has proved
  * itself (DUAL_BANK_BOOT_OK_UPTIME_MS), not from main() before the scheduler
  * starts. */

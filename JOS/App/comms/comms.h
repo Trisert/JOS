@@ -74,10 +74,17 @@ typedef struct {
     uint32_t sequences_ok;      /**< fully transmitted messages            */
     uint32_t sequences_failed;  /**< aborted mid-sequence (radio error)    */
     uint32_t chunks_sent;       /**< chunks handed to the radio, all time  */
+    uint32_t rx_rearm_failures; /**< RX could not be re-armed after a TX   */
 } comms_tx_stats_t;
 
 /* Snapshot of the TX counters. Safe with @p out == NULL. */
 void comms_tx_get_stats(comms_tx_stats_t *out);
+
+/* True when a CMSIS-RTOS2 osThreadFlagsWait() result carries every bit of
+   `want` and is not an error code (bit 31 set: timeout, resource, ...). The
+   result holds all flags that were set before the wait, so a plain `==`
+   comparison misses a wanted flag that arrived together with another one. */
+bool comms_flags_have(uint32_t flags, uint32_t want);
 
 /* Validate a raw uplink frame and dispatch it only when it is well formed,
  * CRC-clean, HMAC-authenticated, of a whitelisted opcode and with in-range

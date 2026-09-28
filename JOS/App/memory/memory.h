@@ -18,7 +18,21 @@ uint8_t fram_missing_selects(void);
  * record could not be written. Never resets: a holey bank still flies. */
 int fram_report_boot(void);
 
-/* ---------- Cyclic buffer ---------- */
+/* ---------- FRAM partition ----------
+ * The bank is 512 KB: 4 x FM24VN10-G (1 Mbit each) on I2C1, OBC V2.0 netlist.
+ * The TOP FRAM_GOLDEN_BYTES are reserved for the SEU golden records
+ * (Core/Inc/seu_mitigation.h SEU_FRAM_*); the cyclic buffer owns
+ * [0, FRAM_CYCLIC_BYTES) and wraps inside it, so the two can never overwrite
+ * each other. (The golden slots used to be computed from a 64 KB FRAM, i.e.
+ * they sat INSIDE the first 64 KB of the cyclic buffer, which reached them
+ * after ~62 KB of science data on every boot.) */
+#define FRAM_TOTAL_BYTES   (512UL * 1024UL)
+#define FRAM_GOLDEN_BYTES  (4UL * 1024UL)
+#define FRAM_GOLDEN_BASE   (FRAM_TOTAL_BYTES - FRAM_GOLDEN_BYTES)
+#define FRAM_CYCLIC_BYTES  FRAM_GOLDEN_BASE
+
+/* ---------- Cyclic buffer ----------
+ * Ring over [0, FRAM_CYCLIC_BYTES); offsets are FRAM byte addresses. */
 void cyclic_buffer_init(void);
 int  cyclic_buffer_write(const uint8_t *data, size_t len);
 int  cyclic_buffer_read(uint32_t offset, uint8_t *buf, size_t len);
@@ -28,7 +42,7 @@ uint32_t cyclic_buffer_head(void);
 void     laststates_init(void);
 int      laststates_write(const laststates_entry_t *entry);
 
-/* Dump every COMPLETE record in the pool into `out`.
+/* Dump every COMPLETE record in the pool into `out`, OLDEST FIRST.
  *
  * `len` is an in/out parameter and carries the buffer SIZE - the function has
  * no other way to know how much of `out` it may touch:
@@ -46,29 +60,42 @@ int      laststates_write(const laststates_entry_t *entry);
  * Returns 0 on success, -1 on a NULL argument or an undersized buffer. */
 int      laststates_dump_all(uint8_t *out, size_t *len);
 
+/* Index of the OLDEST occupied slot in ring order, LASTSTATES_MAX_ENTRIES when
+ * the pool is empty. Walking (oldest + k) mod LASTSTATES_MAX_ENTRIES for
+ * k = 0 .. LASTSTATES_MAX_ENTRIES-1 visits the records oldest-first; slot-index
+ * order is NOT time order once the ring has wrapped. Readers that care about
+ * order (Core/Src/dual_bank.c boot-fault counting) must use this.
+ *
+ * Ring invariant behind it (erase-ahead): when a write fills the last slot of
+ * a 2 KB page, laststates_write() immediately erases the next page - the
+ * oldest one - so the pool always keeps one contiguous erased run that marks
+ * the write cursor across a reset. Consequence: once the ring has wrapped the
+ * pool holds between 48 and 63 records, not 64. */
+uint32_t laststates_oldest_slot(void);
+
+/* Page erases that the erase-ahead step above could not complete (bounded
+   Flash timeout / controller error). The next write retries the erase before
+   programming, so no record is lost; this counter makes it visible. */
+uint32_t laststates_erase_ahead_failures(void);
+
 /* Number of complete records currently held in the pool (0 .. 64). Rescans
    Flash, so it is also the required capacity of laststates_dump_all() divided
    by LASTSTATES_ENTRY_SIZE. */
 uint32_t laststates_count(void);
 
 /* ---------- LastStates pool lock (W2-2 review, CRITICAL) ----------
-   The pool has TWO independent writers that each run the full
-   "pick the first erased slot -> HAL_FLASH_Unlock() -> program 16
-   double-words -> HAL_FLASH_Lock()" sequence:
+   laststates_write() is called from tasks of different priority
+   (stateMachine, loraRX, the watchdog monitor through the dual-bank boot-OK
+   marker, the SEU scrubber) and from exception context. Each call runs the
+   full "pick the slot -> erase if needed -> HAL_FLASH_Unlock() -> program 16
+   double-words -> HAL_FLASH_Lock()" sequence, and configUSE_PREEMPTION is 1,
+   so without serialisation a higher-priority writer could claim the same slot
+   (-> PROGERR) or slam HAL_FLASH_Lock() shut between two double-words of
+   another write (-> PGSERR and a permanently torn 128-byte entry).
 
-     - laststates_write() above, from stateMachine (osPriorityAboveNormal)
-       and loraRX;
-     - dual_bank.c:ls_append(), from the watchdog monitor task
-       (osPriorityHigh) once it declares the boot successful.
-
-   configUSE_PREEMPTION is 1, so with no serialisation the high-priority
-   writer can preempt the other one and either claim the same "first erased"
-   slot (-> PROGERR) or slam HAL_FLASH_Lock() shut between two of its
-   double-words (-> PGSERR and a permanently torn 128-byte entry).
-
-   One mutex therefore owns the whole select-slot/erase/program sequence in
-   BOTH writers, and each writer re-checks that its target slot is still
-   erased while holding it.
+   One mutex therefore owns the whole select-slot/erase/program sequence.
+   (Core/Src/dual_bank.c used to program the pool itself; it now writes its
+   'DBNK' markers through laststates_write() as well.)
 
    laststates_pool_lock() has THREE outcomes, not two (Kilo #21, comment id
    3740842366: "one return value, two completely different meanings"). A lock
@@ -147,10 +174,10 @@ uint32_t laststates_lock_failures(void);
 uint32_t laststates_dropped_records(void);
 
 /* Bump laststates_dropped_records() from a writer that does NOT go through
-   laststates_write(). Core/Src/dual_bank.c:ls_append() programs the pool
-   itself, so its boot-fault / boot-OK refusals have to be counted here or the
-   tri-state lock stays invisible from the ground. Call it exactly once, on the
-   LASTSTATES_LOCK_FAILED path, before returning without touching Flash. */
+   laststates_write() (none in the tree today: Core/Src/dual_bank.c routes its
+   markers through laststates_write(), which counts its own refusals). Call it
+   exactly once, on the LASTSTATES_LOCK_FAILED path, before returning without
+   touching Flash. */
 void     laststates_note_dropped_record(void);
 
 /* ---------- LastStates bookkeeping mirror (SEU scrubbing, W2-5) ----------

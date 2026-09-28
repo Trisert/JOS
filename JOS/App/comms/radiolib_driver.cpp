@@ -18,6 +18,7 @@
 
 #include "radiolib_hal.h"
 #include "cmsis_os.h"   /* osThreadFlagsX for TX_DONE signalling */
+#include "lora_tx_wait.h"
 
 /* RadioLib objects.
  * JOS-vendored RadioLib: SX1268 takes a Module* (not (hal,cs,dio1,rst,busy)).
@@ -26,11 +27,37 @@ STM32Hal radioHal(&hspi1);
 Module   radioModule(&radioHal, RLIB_NSS, RLIB_DIO1, RLIB_RESET, RLIB_BUSY);
 SX1268   radio(&radioModule);
 
-/* Thread flag used to wake the TX path on DIO1 TX_DONE. */
-#define LORA_FLAG_TX_DONE 0x01U
-#define LORA_FLAG_RX_DONE 0x02U
+/* LORA_FLAG_TX_DONE / LORA_FLAG_RX_DONE and the TX_DONE confirmation loop
+   live in lora_tx_wait.h/.c (plain C, host-tested). */
+static_assert(LORA_IRQ_TX_DONE == RADIOLIB_SX126X_IRQ_TX_DONE,
+              "lora_tx_wait.h TX_DONE bit must match the SX126x IRQ status layout");
 
 static osThreadId_t g_tx_wait_handle = NULL;
+
+/* One radio, two tasks: the beacon task (lora_tx) and the RX task (lora_rx,
+   lora_start_receive) both drive the SAME SX1268, the same SPI1 and the same
+   DMA completion state in radiolib_hal.cpp. With no serialisation the RX task
+   (osPriorityNormal) could preempt the beacon task (BelowNormal) in the middle
+   of a RadioLib SPI command sequence. Every entry point that talks to the chip
+   holds this mutex for its whole command sequence. Created in lora_init(),
+   which main() calls before osKernelInitialize() (legal: osMutexNew() only
+   refuses ISR context); NULL before that, when boot is single-threaded. */
+static osMutexId_t g_radio_mutex = NULL;
+
+static void radio_lock(void)
+{
+    if ((g_radio_mutex != NULL) && (osKernelGetState() == osKernelRunning)) {
+        (void)osMutexAcquire(g_radio_mutex, osWaitForever);
+    }
+}
+
+static void radio_unlock(void)
+{
+    if ((g_radio_mutex != NULL) && (osKernelGetState() == osKernelRunning)) {
+        (void)osMutexRelease(g_radio_mutex);
+    }
+}
+
 /* RX task handle, registered by lora_rx_task_create() so the DIO1 ISR can wake
    the correct task on RX_DONE. NULL until the RX task has started. */
 static osThreadId_t g_rx_handle = NULL;
@@ -52,6 +79,13 @@ extern "C" uint32_t lora_rx_oversize_drops(void)
 
 extern "C" int lora_init(void)
 {
+    if (g_radio_mutex == NULL) {
+        static const osMutexAttr_t attr = {
+            "radio", osMutexPrioInherit, NULL, 0U
+        };
+        g_radio_mutex = osMutexNew(&attr);
+    }
+
     /* Bind virtual pins to real OBC V2.0 GPIO (radiolib_hal.h, main.h):
        CS_TTC = PA4, RESET = PB1 mux, DIO1 = PB0/EXTI0, BUSY = PC4. */
     radioHal.addPin(RLIB_NSS,   CS_TTC_GPIO_Port,     CS_TTC_Pin);
@@ -90,21 +124,42 @@ extern "C" int lora_tx(const uint8_t* data, size_t len)
     if (len > 255U) {
         return -1;
     }
+    radio_lock();
+    /* Route DIO1 to this task BEFORE the chip can raise TX_DONE. Set after
+       startTransmit(), a preemption between the two let TX_DONE reach the RX
+       task as a bogus RX_DONE and this task's wait time out. Any DIO1 edge
+       that reaches the waiter is therefore only a candidate: lora_tx_wait_done()
+       confirms it against the chip's IRQ status (startTransmit() clears that
+       status before keying the transmitter), so an RX_DONE still pending from
+       the receive mode can no longer pass as TX_DONE. Drop any stale TX_DONE
+       bit left over from an earlier timed-out wait. */
+    (void)osThreadFlagsClear(LORA_FLAG_TX_DONE);
     g_tx_wait_handle = osThreadGetId();
     int16_t s = radio.startTransmit(data, (uint8_t)len);  /* async; DIO1 -> TX_DONE */
     if (s != RADIOLIB_ERR_NONE) {
         g_tx_wait_handle = NULL;
-        return -1;
     }
-    return 0;
+    radio_unlock();
+    return (s == RADIOLIB_ERR_NONE) ? 0 : -1;
 }
 
-/* Block the calling task until DIO1 signals TX_DONE (or timeout). */
+/* Current SX126x IRQ status word (lora_tx_wait.h). getIrqFlags() leaves the
+   buffer at 0 when the SPI read fails, so a dead bus reads as "no TX_DONE". */
+extern "C" uint32_t lora_irq_status(void)
+{
+    radio_lock();
+    const uint32_t irq = radio.getIrqFlags();
+    radio_unlock();
+    return irq;
+}
+
+/* Block the calling task until the SX1268 reports TX_DONE (or timeout); see
+   lora_tx_wait_confirm(). Ends the TX sequence's ownership of DIO1. */
 extern "C" int lora_tx_wait_done(uint32_t timeout_ms)
 {
-    uint32_t flags = osThreadFlagsWait(LORA_FLAG_TX_DONE, osFlagsWaitAny, timeout_ms);
+    const int rc = lora_tx_wait_confirm(timeout_ms);
     g_tx_wait_handle = NULL;
-    return (flags == LORA_FLAG_TX_DONE) ? 0 : -1;
+    return rc;
 }
 
 extern "C" int lora_rx(uint8_t* buf, size_t* len)
@@ -115,6 +170,7 @@ extern "C" int lora_rx(uint8_t* buf, size_t* len)
     /* In this RadioLib version readData() takes the length by value (no
        writeback), so query the received packet length first and report it
        back to the caller. getPacketLength() must be called BEFORE readData(). */
+    radio_lock();
     size_t received = radio.getPacketLength();
     if (received > *len) {
         /* Oversized PHY payload: REJECT, never deliver a truncated frame. A
@@ -128,9 +184,11 @@ extern "C" int lora_rx(uint8_t* buf, size_t* len)
            COMMS_MAX_PACKET bytes, matching the COMMS_TC_MAX_FRAME validation
            budget. */
         g_rx_oversize_drops++;
+        radio_unlock();
         return -1;
     }
     int16_t s = radio.readData(buf, received);
+    radio_unlock();
     if (s != RADIOLIB_ERR_NONE) {
         return -1;
     }
@@ -140,7 +198,16 @@ extern "C" int lora_rx(uint8_t* buf, size_t* len)
 
 extern "C" int lora_start_receive(void)
 {
+    radio_lock();
+    if (g_tx_wait_handle != NULL) {
+        /* A transmission is on the air: switching to RX now would abort it.
+           The sender re-arms RX itself once its sequence ends
+           (lora_send_chunked()). */
+        radio_unlock();
+        return -1;
+    }
     int16_t s = radio.startReceive();
+    radio_unlock();
     return (s == RADIOLIB_ERR_NONE) ? 0 : -1;
 }
 
@@ -151,8 +218,10 @@ extern "C" int lora_start_receive(void)
  */
 extern "C" void lora_on_dio1_irq(void)
 {
-    /* Heuristic: if a TX is pending, it's TX_DONE; else assume RX_DONE.
-       A tighter check would read the SX1268 IRQ status register. */
+    /* A TX sequence owns DIO1 from before startTransmit() until its wait
+       ends; the TX waiter confirms TX_DONE against the IRQ status register
+       (lora_tx_wait_done()). Outside a TX sequence DIO1 means RX_DONE. The
+       ISR itself never touches SPI. */
     if (g_tx_wait_handle != NULL) {
         osThreadFlagsSet(g_tx_wait_handle, LORA_FLAG_TX_DONE);
     } else if (g_rx_handle != NULL) {

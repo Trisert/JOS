@@ -82,6 +82,13 @@ static bool               db_golden_valid = false;
 static uint32_t           db_optr         = 0U;
 static bool               db_bfb2_armed   = false;
 
+/* Set when dual_bank_init() honoured an ok_pending token but could not write
+ * the BOOT_OK marker through. The counters were zeroed on that proof, so
+ * dual_bank_boot_complete() would otherwise see "nothing to clear", skip the
+ * write and drop the token for good - leaving the stale BOOT_FAULT records in
+ * Flash to trip the fallback on the next reset of a healthy image. */
+static bool               db_ok_marker_owed = false;
+
 /* ===========================================================================
  * Option bytes
  * ========================================================================= */
@@ -224,15 +231,20 @@ bool dual_bank_verify_golden(void)
  * TRIGGER_BOOT_FAULT / TRIGGER_BOOT_OK), so existing ground forensics tooling
  * sees them in the normal 64 x 128 B ring.
  *
- * Coexistence contract with App/memory/memory.c (the other writer):
- *   - both writers append to the first still-erased slot; memory.c re-scans
- *     before every write (laststates_write()), so an entry appended here
- *     between two of its writes shifts its cursor instead of colliding with
- *     it — programming a non-erased slot would fail and, before that fix,
- *     wedged the forensic log permanently;
- *   - this module NEVER erases the pool. memory.c owns the erase (only when
- *     the ring wraps), which also clears our evidence. That is fail-safe: a
- *     lost counter can only inhibit a fallback, never trigger one.
+ * Coexistence contract with App/memory/memory.c:
+ *   - the markers are written THROUGH laststates_write(), so there is one
+ *     writer of the pool, one ring cursor and one erase policy. A private
+ *     "first erased slot" appender used to live here; it assumed the pool is
+ *     written in slot-index order, which stops being true the moment the ring
+ *     wraps, and it refused to write at all once the pool was full - which,
+ *     with a lazily-erased ring, is the steady state;
+ *   - the ring recycles its OLDEST page (erase-ahead, see memory.h). That can
+ *     drop old evidence, never fabricate it: every surviving record is newer
+ *     than every erased one, so a surviving BOOT_OK still clears every
+ *     surviving BOOT_FAULT older than it. A lost counter can only inhibit a
+ *     fallback, never trigger one;
+ *   - the evidence is read back in CHRONOLOGICAL ring order
+ *     (laststates_oldest_slot()), never in slot-index order.
  * ========================================================================= */
 
 #define DB_LS_TAG  0x4B4E4244U   /* 'D','B','N','K' (LE) — marks our entries */
@@ -261,28 +273,23 @@ static bool ls_slot_is_ours(const laststates_entry_t *e)
     return tag == DB_LS_TAG;
 }
 
-/* Index of the first erased slot, or LASTSTATES_MAX_ENTRIES if the pool is
- * full (no room left for new evidence, in either direction). */
-static uint32_t ls_first_free_slot(void)
-{
-    for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
-        if (ls_slot_is_erased(ls_slot(i))) {
-            return i;
-        }
-    }
-    return LASTSTATES_MAX_ENTRIES;
-}
-
-/* Boot faults recorded after the most recent successful boot. */
+/* Boot faults recorded after the most recent successful boot, walking the
+ * ring oldest-first. Slot-index order is not time order once the ring has
+ * wrapped, so the walk starts at laststates_oldest_slot(). */
 static uint32_t ls_count_boot_faults(void)
 {
-    uint32_t count = 0U;
+    uint32_t       count  = 0U;
+    const uint32_t oldest = laststates_oldest_slot();
 
-    for (uint32_t i = 0U; i < LASTSTATES_MAX_ENTRIES; i++) {
+    if (oldest >= LASTSTATES_MAX_ENTRIES) {
+        return 0U;                    /* empty pool */
+    }
+    for (uint32_t k = 0U; k < LASTSTATES_MAX_ENTRIES; k++) {
+        const uint32_t            i = (oldest + k) & (LASTSTATES_MAX_ENTRIES - 1U);
         const laststates_entry_t *e = ls_slot(i);
 
         if (ls_slot_is_erased(e)) {
-            break;                    /* pool is written in order */
+            continue;                 /* the erased run: nothing recorded here */
         }
         if (!ls_slot_is_ours(e)) {
             continue;                 /* a normal state transition */
@@ -296,56 +303,18 @@ static uint32_t ls_count_boot_faults(void)
     return count;
 }
 
-/* Append one entry to the first still-erased slot. Returns 0 on success,
- * -1 if the pool is full (we deliberately do not erase: forensic history is
- * worth more than the counter, and the RAM scratch still carries it).
- *
- * The pool is SHARED with App/memory/memory.c:laststates_write(), which runs
- * the same select-slot/unlock/program/lock sequence from stateMachine and
- * loraRX while we run from the watchdog monitor task at osPriorityHigh. The
- * whole sequence therefore runs under the pool mutex, and the chosen slot is
- * re-checked for "still erased" while holding it (W2-2 review, CRITICAL).
+/* Append one 'DBNK' marker through laststates_write(). Returns 0 on success,
+ * -1 when the record could not be written (lock refused - counted by
+ * laststates_write() in laststates_dropped_records() - or a Flash failure).
  *
  * `entry` is file-scope static on purpose: it is 128 bytes and the watchdog
- * task only has a 1 KB stack, with the HAL_FLASH_Program() frames and any
- * exception frame stacked on top of it. The pool lock serialises every caller,
- * and no caller is an ISR, so a shared buffer is safe here. */
+ * task only has a 1 KB stack, with the Flash-programming frames and any
+ * exception frame stacked on top of it. Callers are thread-mode only (boot and
+ * the watchdog monitor task), never an ISR, and never two at once. */
 static laststates_entry_t db_ls_entry;
 
 static int ls_append(uint8_t trigger, uint32_t value)
 {
-    const int lock_held = laststates_pool_lock();
-
-    /* Serialisation required but unavailable: refuse rather than program an
-     * unsynchronised pool (Kilo #21). The caller treats this exactly like a
-     * Flash failure. Count the loss here: this writer drives
-     * HAL_FLASH_Program() itself and never calls laststates_write(), so
-     * without this call a refused boot-fault / boot-OK marker would be
-     * invisible in laststates_dropped_records() and ground would have to infer
-     * it from a gap - the exact hole the tri-state lock exists to close
-     * (Kilo #26). */
-    if (lock_held == LASTSTATES_LOCK_FAILED) {
-        laststates_note_dropped_record();
-        return -1;
-    }
-
-    const uint32_t slot = ls_first_free_slot();
-
-    if (slot >= LASTSTATES_MAX_ENTRIES) {
-        laststates_pool_unlock(lock_held);
-        return -1;
-    }
-    /* Defensive re-validation, not the mutual-exclusion guarantee: that comes
-     * from holding the pool mutex across BOTH the scan above and the whole
-     * programming loop below, so when the lock is real there is no window left
-     * between them. This check only earns its keep on the paths where the lock
-     * is a no-op by design (boot before the scheduler, exception context) and
-     * against a scan result corrupted after the fact. */
-    if (!ls_slot_is_erased(ls_slot(slot))) {
-        laststates_pool_unlock(lock_held);
-        return -1;
-    }
-
     laststates_entry_t *const entry = &db_ls_entry;
 
     memset(entry, 0, sizeof(*entry));
@@ -363,26 +332,7 @@ static int ls_append(uint8_t trigger, uint32_t value)
         memcpy(entry->context + 8, &bank, sizeof(bank));
     }
 
-    const uint32_t addr = DUAL_BANK_LASTSTATES_BASE + (slot * LASTSTATES_ENTRY_SIZE);
-    HAL_StatusTypeDef rc = HAL_OK;
-
-    if (HAL_FLASH_Unlock() != HAL_OK) {
-        laststates_pool_unlock(lock_held);
-        return -1;
-    }
-    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
-    for (uint32_t off = 0U; off < LASTSTATES_ENTRY_SIZE; off += 8U) {
-        uint64_t dword;
-        memcpy(&dword, ((const uint8_t *)entry) + off, sizeof(dword));
-        rc = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr + off, dword);
-        if (rc != HAL_OK) {
-            break;
-        }
-    }
-    (void)HAL_FLASH_Lock();
-    laststates_pool_unlock(lock_held);
-
-    return (rc == HAL_OK) ? 0 : -1;
+    return laststates_write(entry);
 }
 
 void dual_bank_mark_boot_fault(void)
@@ -441,20 +391,20 @@ int dual_bank_boot_complete(void)
 
     /* Only touch Flash when there is evidence to clear — a nominal boot must
      * not consume a pool slot on every power cycle. */
-    if ((db_fault_count == 0U) && (db_scratch.fault_count == 0U)) {
+    if ((db_fault_count == 0U) && (db_scratch.fault_count == 0U) &&
+        !db_ok_marker_owed) {
         db_scratch.pending    = 0U;
         db_scratch.ok_pending = 0U;
         return 0;
     }
 
     if (ls_append(TRIGGER_BOOT_OK, db_fault_count) != 0) {
-        /* Pool exhausted: the boot-OK marker is NOT recorded, so the persisted
+        /* Marker not written (lock refused or Flash failure): the persisted
          * fault evidence still reads "this image keeps failing". Keep the
          * counters as they are, flag the outstanding write and report the
-         * failure so the caller can retry. dual_bank_init() knows that an
-         * exhausted pool cannot be cleared and stops trusting the Flash
-         * evidence in that case (see below), so an unwritable marker can never
-         * provoke a spurious bank switch. */
+         * failure so the caller can retry. The next dual_bank_init() honours
+         * the ok_pending token once and retries the marker write, so an
+         * unwritable marker can never provoke a spurious bank switch. */
         db_scratch.ok_pending = 1U;
         if (db_status == DUAL_BANK_PRIMARY_OK) {
             db_status = DUAL_BANK_DEGRADED;
@@ -466,6 +416,7 @@ int dual_bank_boot_complete(void)
     db_scratch.pending     = 0U;
     db_scratch.ok_pending  = 0U;
     db_fault_count         = 0U;
+    db_ok_marker_owed      = false;
     return 0;
 }
 
@@ -566,6 +517,7 @@ dual_bank_status_t dual_bank_init(void)
      * lifetime to exactly one boot, whatever path is taken below. */
     const uint32_t ok_pending_snapshot = db_scratch.ok_pending;
     db_scratch.ok_pending = 0U;
+    db_ok_marker_owed     = false;
 
     db_optr        = read_user_option_bytes();
     db_active_bank = dual_bank_active_bank();
@@ -575,33 +527,26 @@ dual_bank_status_t dual_bank_init(void)
      * fault handlers recorded in RAM since the last successful boot. */
     const uint32_t persisted = ls_count_boot_faults();
     const uint32_t in_ram    = db_scratch.fault_count;
-    const bool     pool_full = (ls_first_free_slot() >= LASTSTATES_MAX_ENTRIES);
 
-    if (pool_full) {
-        /* Nothing can be appended any more — neither a fault nor the boot-OK
-         * marker that clears it. The Flash evidence is therefore frozen and
-         * possibly stale, so it may not drive the switch decision.
+    if (ok_pending_snapshot != 0U) {
+        /* The PREVIOUS boot proved itself (it stayed up for
+         * DUAL_BANK_BOOT_OK_UPTIME_MS) but its BOOT_OK marker did not reach
+         * Flash, so the Flash evidence is stale and the RAM scratch was never
+         * cleared. Honour that proof once, for this boot only, and try to
+         * write it through now. Without this escape a single failed marker
+         * write turns "fault_count >= threshold" into a permanent
+         * boot_looping verdict on a healthy image (W2-2 review).
          *
-         * The RAM scratch is not automatically fresher: dual_bank_boot_complete()
-         * cannot clear db_scratch.fault_count when its ls_append() fails, it
-         * only raises ok_pending. Consuming the one-shot token here is the
-         * ESCAPE from the otherwise permanent "pool full + fault_count >=
-         * threshold => boot_looping on every warm boot, forever, on a healthy
-         * image" trap (W2-2 review): the PREVIOUS boot did prove itself, it
-         * just could not say so in Flash. Honour that proof once, and only
-         * for the boot that directly follows it. */
-        if (ok_pending_snapshot != 0U) {
-            db_scratch.fault_count = 0U;
-            db_fault_count         = 0U;
-        } else {
-            /* Fail-safe: the worst case is that a genuinely failing image is
-             * not detected across a power cycle, never that a healthy one is
-             * thrown away. */
-            db_fault_count = in_ram;
+         * If the write-through fails again, the marker stays OWED: this
+         * boot's dual_bank_boot_complete() must retry it (and re-raise the
+         * token if that fails too) instead of taking its "nothing to clear"
+         * early return on the counters zeroed just below. */
+        if (ls_append(TRIGGER_BOOT_OK, 0U) != 0) {
+            db_ok_marker_owed = true;
         }
-        /* `pending` can never be serviced while the pool is full; leaving it
-         * set would make every later boot re-read stale evidence. */
-        db_scratch.pending = 0U;
+        db_scratch.fault_count = 0U;
+        db_scratch.pending     = 0U;
+        db_fault_count         = 0U;
     } else if (db_scratch.pending != 0U) {
         /* Write the RAM evidence through to Flash now that we are in thread
          * mode with the HAL available. One entry per faulting boot. */

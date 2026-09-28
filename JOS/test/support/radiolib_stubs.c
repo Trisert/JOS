@@ -58,6 +58,7 @@ static uint8_t stub_tx_data[RADIOLIB_STUB_TX_LOG_MAX][RADIOLIB_STUB_TX_CAP];
 static size_t  stub_tx_len[RADIOLIB_STUB_TX_LOG_MAX];
 static size_t  stub_tx_n = 0U;
 static int     tx_calls;
+static int     start_receive_calls;
 static int     tx_fail_at   = -1;   /* 1-based lora_tx() call number to fail */
 static int     wait_calls;
 static int     wait_fail_at = -1;   /* 1-based lora_tx_wait_done() call to fail */
@@ -83,6 +84,7 @@ void host_lora_reset(void)
     tx_calls = 0;   tx_fail_at   = -1;
     wait_calls = 0; wait_fail_at = -1;
     stub_tx_n = 0U; stub_tx_fail_at = (size_t)-1; stub_wait_fail = 0;
+    start_receive_calls = 0;
 }
 
 int lora_tx(const uint8_t *data, size_t len)
@@ -111,7 +113,8 @@ int lora_tx(const uint8_t *data, size_t len)
     return 0;
 }
 int  lora_rx(uint8_t *buf, size_t *len)       { (void)buf; if (len) *len = 0U; return 0; }
-int  lora_start_receive(void)                  { return 0; }
+int  lora_start_receive(void)                  { start_receive_calls++; return 0; }
+int  host_lora_start_receive_count(void)       { return start_receive_calls; }
 void lora_rx_task_register(void *handle)       { (void)handle; }
 void lora_on_dio1_irq(void)                    { }
 int  lora_tx_wait_done(uint32_t timeout_ms)

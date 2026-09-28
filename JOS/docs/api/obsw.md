@@ -6,17 +6,43 @@ Five-state FSM (see `docs/arch/README.md` §Operational State Machine).
 
 | Function | Purpose |
 |----------|---------|
-| `try_transition(state_t next)` | Attempt a transition; returns `int` (0 = ok). Propagates LastStates write errors. |
-| `state_machine_task()` | FreeRTOS task @ 10 Hz; runs transitions, kicks watchdog. |
+| `state_machine_request_transition(target, trigger)` | Request a transition through the gates (boot-CRC / SRAM2-parity confinement, SoC gates). Returns 0 when the OBSW is in `target` afterwards (committed, or already in CRIT), -1 when a gate refused it. |
+| `state_machine_unrecorded_transitions()` | Transitions committed although their LastStates record could not be written (Flash failure). |
+| `state_machine_task()` | FreeRTOS task @ 10 Hz: boot sequence, 1 Hz EPS poll, autonomous battery check, watchdog kick. |
 
-Transitions are logged to the LastStates pool via `memory_laststates_write()`.
+Rules (file-static `try_transition()` / `enter_safe_state()`):
+
+- Every committed transition is logged to LastStates **before** the commit.
+  A failed record does **not** veto the transition (it used to, which froze the
+  OBSW on a sick Flash page — boot stuck in OFF, no CRIT on low battery); the
+  loss is counted instead.
+- CRIT → CRIT is a no-op with no record (the 10 Hz battery check used to log
+  it every 100 ms).
+- Every boot starts from s0 with an **unknown** battery: the task resets
+  `current_state` and the BMS snapshot restored from the FRAM golden copy
+  before the boot sequence. Only the ground-commanded beacon override survives
+  a reset.
+- The EPS is polled on the first loop iteration, then every 10th (1 Hz).
 
 ## Watchdog (`App/obsw/watchdog.c`)
 
 Dedicated task monitoring all other tasks via FreeRTOS tick counters.
-Any task deviating from its nominal tick profile is flagged anomalous.
+A task silent for more than 3x its declared period is escalated:
 
-- Hardware IWDG (~32 s) kicked in the main OBSW task loop.
+- a `TRIGGER_WATCHDOG` LastStates record, `dual_bank_mark_boot_fault()` (a
+  task hanging on every boot arms the golden-image fallback) and a **reset**
+  of the OBC. (It used to be suspended, with the IWDG still kicked: no
+  recovery path at all — a suspended loraRX meant a deaf satellite.)
+- if the stalled task holds the LastStates pool mutex, the record would wedge
+  the monitor: the escalation is deferred and retried, at most
+  `WDG_MAX_HOLDER_DEFERRALS` (60 scans, 30 s) in a row, then the OBC resets
+  without the record. The count covers one stall episode: a scan with no
+  stalled task restarts it, so a task that recovers does not carry old
+  deferrals into its next, unrelated stall.
+- The IWDG (~31 s) and the STWD100 are refreshed by the monitor task every
+  500 ms, unconditionally. The IWDG is reloaded whenever it has been started,
+  even if its prescaler/reload did not settle. Long pre-scheduler work calls
+  `hw_watchdog_boot_kick()`.
 - Every task must register with the watchdog on init.
 
 ### External watchdog (OBC V2.0 STWD100YNYWY3F)
@@ -38,14 +64,14 @@ Flash-backed ring buffer of state transitions — primary forensic tool.
 |----------|-------|
 | Location | Internal Flash, `0x08080000` |
 | Entry size | 128 B |
-| Max entries | 64 (circular) |
+| Max entries | 64 slots (circular); 48–63 records once wrapped (erase-ahead, see `docs/api/memory.md`) |
 | Total | 8 KB |
 | Linker region | `LASTSTATES` in `STM32L496VGTX_FLASH.ld` |
 
 | Function | Purpose |
 |----------|---------|
-| `laststates_write(state_entry_t *entry)` | Write one entry; erases/reclaims pool pages on wrap (STM32L4 **pages**, not sectors). Returns `int`. |
-| `laststates_log(...)` | Hook called on every transition; returns `int` so errors propagate to `try_transition`. |
-| `laststates_dump_all(uint8_t *out, size_t *len)` | Serialise pool for downlink (`SEND_DATA` with LastStates alias). |
+| `laststates_write(const laststates_entry_t *entry)` | Write one entry; recycles the oldest 2 KB page ahead of the cursor (STM32L4 **pages**, not sectors). Returns `int`. |
+| `laststates_log(...)` | File-static hook in `state_machine.c`, called on every transition. |
+| `laststates_dump_all(uint8_t *out, size_t *len)` | Serialise the pool oldest-first for downlink (no downlink path is wired yet: `SEND_DATA` is refused as unimplemented). |
 
 > Implemented (PR #1). Previously a stub.
