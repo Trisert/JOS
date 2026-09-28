@@ -19,7 +19,7 @@ Semtech SX1268 on SPI1.
 |----------|--------|---------|
 | `lora_init(void)` | `int` | Configure SX1268 |
 | `lora_beacon_task(void *arg)` | `void` | FreeRTOS task: 128-B beacon at state-dependent interval |
-| `lora_rx_task(void *arg)` | `void` | FreeRTOS task: interrupt-driven RX, CRC, decrypt, dispatch |
+| `lora_rx_task(void *arg)` | `void` | FreeRTOS task: interrupt-driven RX, frame validation/authentication, dispatch |
 | `lora_beacon_task_create(void)` | `osThreadId_t` | Create beacon task (declared in `comms.h`) |
 | `lora_rx_task_create(void)` | `osThreadId_t` | Create RX task (declared in `comms.h`) |
 | `lora_send_chunked(const uint8_t *data, size_t len)` | `int` | Fragment into ≤64 B packets; each chunk carries a 3-B header (byte 0 = message id, byte 1 = 0-based seq, byte 2 = total count), 128-B beacon ships as 3 chunks; aborts + counts on radio error |
@@ -33,9 +33,26 @@ Semtech SX1268 on SPI1.
 
 ## Telecommand Set
 
-`RESET`, `EXIT_STATE`, `SET_CONFIG`, `SET_DOWNLINK`, `SEND_CONFIG`,
-`SEND_DATA`, `SEND_TELEMETRY`, `ACTIVATE_PAYLOAD`. Each packet may carry a
-set-delay field for out-of-view scheduling.
+The JOS opcode dispatcher currently handles `RESET`, `EXIT_STATE`,
+`SET_CONFIG`, `SEND_DATA`, `ACTIVATE_PAYLOAD`, and beacon-interval updates.
+`SET_CONFIG` and `SEND_DATA` are currently TODO/no-op handlers; accepting a structurally valid frame does
+not mean every requested operation is implemented. See the dispatcher in
+`App/comms/comms.c` for current behavior. The separate TT&C layout uses the TEC
+registry; only handlers bound in the current adapter are operational.
+
+## Uplink validation paths
+
+`comms_rx_handle_frame()` selects the TT&C layout or the JOS opcode layout.
+The JOS path checks structure, CRC, opcode and parameter bounds, and under the
+flight default requires the truncated HMAC-SHA256 authentication tag. CRC is
+unkeyed integrity, not authentication. The TT&C path parses its own layout and
+calls a MAC-verifier seam. No production binding for that verifier is present
+in this snapshot; the NULL verifier rejects TT&C frames before dispatch. Neither path
+provides a replay/freshness check. Neither path encrypts payloads. The JOS
+validator currently uses a four-byte HMAC key default and a four-byte tag; the
+default is public source material, not a mission secret. Mission key provisioning
+and accepted authentication strength must be confirmed before flight use; do not
+copy test/default key bytes into operational documentation.
 
 ## Downlink framing
 

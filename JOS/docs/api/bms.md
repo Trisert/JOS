@@ -1,22 +1,27 @@
 # BMS API — Battery Management (`App/bms/`)
 
-The BMS runs on the **EPS STM32L1** (separate board). The OBC talks to it over
-SPI (OBC = master, EPS = slave).
+The BMS module is OBC-side plumbing for battery telemetry from the separate
+EPS board. The OBC configures SPI2 as master, but the EPS transaction and wire
+format are not implemented. EPS MCU / battery-monitor identity is unresolved
+across delivered documents; see `TASKS.md` and do not treat this module's
+comments as an approved hardware baseline.
 
 | Function | Purpose |
 |----------|---------|
-| `bms_get_soc(void)` | State of charge (%) from BQ27441 gas gauge (via EPS) |
-| `bms_get_cell_temp(uint8_t idx)` | Per-cell temperature |
-| `bms_get_charge_current(void)` | Charge current/voltage |
-| threshold logic | Maps SoC to B_SCRIT / B_CRIT / B_COMMOK / B_OPOK |
+| `bms_init(void)` | Configure/bind the SPI2 master; this does not verify an EPS response |
+| `bms_spi_ready(void)` | Report whether the local SPI handle initialized, not whether EPS is alive |
+| `bms_get_status(void)` | Return cached status; initially invalid and conservative |
+| `bms_poll(void)` | Pinned, unimplemented EPS transaction seam; currently returns failure |
+| BMS policy helpers | Apply documented threshold rules to a status snapshot |
 
-The OBC uses these thresholds to drive state transitions (see
-`docs/arch/README.md` §Battery thresholds).
+The state machine periodically attempts a poll and copies status only on a
+successful result. Since the transaction currently returns failure, the
+snapshot remains invalid; do not interpret default numeric fields as live
+telemetry. Some state transitions consume BMS validity/SoC; the state-machine
+documentation records the exact gates and exceptions.
 
-> Status: integrated. `bms_init()` brings up the subsystem SPI master to the
-> EPS STM32L496 (SPI2, PB13/14/15, mode 0, 8-bit MSB-first, 2.5 MHz from the
-> 80 MHz PCLK1) and `bms_spi_ready()` reports the link state. The telemetry
-> transaction itself is still stubbed in `bms.c`
-> (`TODO: query EPS MCU over subsystem SPI for BQ76905 telemetry`), and the
-> EPS chip-select pin is not assigned in the tree yet — define
-> `BMS_EPS_CS_PORT` / `BMS_EPS_CS_PIN` once the SATPF pinout fixes it.
+> Status: partial. `bms_init()` configures the subsystem SPI master (SPI2,
+> PB13/PB14/PB15, mode 0, 8-bit MSB-first, 2.5 MHz) when initialization
+> succeeds. This is local peripheral readiness only. The EPS CS assignment,
+> request/reply format, and telemetry transaction remain unresolved; `bms_poll()`
+> returns `-1` and does not fabricate telemetry.

@@ -51,6 +51,15 @@ the resulting failures look like flight-code bugs. One version, from one place.
 | `test_state_machine.c` | `App/obsw/state_machine.c` | transitions via the public API (INIT/OFF rules, CRIT recovery SoC-gated, boot-CRC + parity confinement, LastStates-refusal, beacon cadence), plus the task boot sequence + autonomous loop through the captured entry point |
 | `test_temp.c` | `App/payloads/temp.c` | emulator + flight PB2 backend via the GPIO doubles, no-device triplet, mid-read reset loss, stuck-conversion timeout |
 | `test_comms.c` | `App/comms/comms.c` | validation gate, dispatch, RX accounting, plus `lora_send_chunked()` radio/timeout aborts (incl. mid-transfer) via the radio failure injection |
+| `test_comms_legacy.c`, `test_tec.c` | Comms / TEC contracts | Legacy framing and command registry behavior; TT&C frame cases are part of the current comms tests |
+| `test_spi_dma.c` | SPI DMA scheduler helpers | Chunk boundaries, timeout calculation, and completion/error behavior |
+| `test_watchdog.c` | `App/obsw/watchdog.c` | Host-side monitor policy; target task-suspend/Flash backends are not exercised |
+| `test_eps_fdir.c` | `App/bms/eps_fdir.c` | Pure FDIR decision logic with caller-supplied snapshots, not live EPS telemetry |
+| `test_aocs_contract.c` | AOCS data contract | Declared telemetry contract; no production AOCS SPI driver is tested |
+| `test_beacon.c` | Beacon buffer/encoding contracts | Host-side beacon behavior only |
+| `test_deploy_sense.c`, `test_thermal_guard.c` | Deployment and thermal guards | Helper behavior with host doubles; not hardware qualification |
+| `test_memory_faults.c` | Memory fault paths | Injected host failures; not target Flash/FRAM electrical behavior |
+| `test_boot_policy.c`, `test_boot_unstamped_bench.c` | Boot CRC policy | Host policy cases for flight and bench configurations |
 
 ## Coverage gate
 
@@ -66,23 +75,10 @@ so the command exits non-zero when coverage of the modules under test drops
 below those numbers. It needs `gcovr` on `PATH`; CI installs it explicitly and
 prints its version, because a missing gcovr silently degrades the gate.
 
-Current numbers (gcovr, all host-compilable modules — 179 tests green):
-
-```
-lines:     98.2% (928 / 945)
-functions: 100.0% (113 / 113)
-branches:  90.2% (433 / 480)
-```
-
-Per-file: `temp.c` 100%, `boot_crc.c` / `aocs.c` 100%, `comms.c` 97%
-(only the `break` after the noreturn `NVIC_SystemReset()` and the
-whitelist-unreachable `default` arm are uncovered — both by design),
-`state_machine.c` 97% (only the dead context-copy arm, one loop
-bookkeeping line and the bad-magic restore are uncovered).
-
-(`boot_crc.c`'s uncovered lines in the `test_boot_crc` executable are the
-`BOOT_CRC_BAD_REGION` block, which is covered by the separate
-`test_bad_region` executable — gcov reports the two executables separately.)
+Do not use a historical count or percentage as a current pass claim. The test
+inventory and coverage change with the tree; run the commands above and report
+the commit, actual result, tool versions, and measured coverage together. A
+previous snapshot in this document was stale and has been removed.
 
 Only host-compilable modules are on the Ceedling source path. `../Core/Src` is
 deliberately **not**: it is CubeMX-generated and would let `main.c` be fed to

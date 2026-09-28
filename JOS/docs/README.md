@@ -7,13 +7,15 @@ Welcome to the JOS (RedPill) On-Board Software documentation.
 | For... | Go to |
 |--------|-------|
 | Building the code | [docs/dev/building.md](dev/building.md) |
-| Verification simulation | [docs/dev/simulation.md](dev/simulation.md) |
+| ESP32 simulation vs HIL | [docs/dev/simulation.md](dev/simulation.md) |
+| Build/CI evidence and verification limits | [docs/dev/ci-and-verification.md](dev/ci-and-verification.md) |
 | Fault tolerance (boot CRC, watchdog) | [docs/dev/hardening.md](dev/hardening.md) |
 | SRAM2 parity / critical data | [docs/dev/sram2_parity.md](dev/sram2_parity.md) |
 | SEU mitigation / RAM scrubbing | [docs/dev/seu_mitigation.md](dev/seu_mitigation.md) |
-| Power modes / sleep-wakeup gap (T20) | [docs/dev/power_modes.md](dev/power_modes.md) |
-| Understanding modules | [docs/api/](api/) |
-| System design | [docs/arch/README.md](arch/README.md) |
+| Power modes / sleep-wakeup status | [docs/dev/power_modes.md](dev/power_modes.md) |
+| Module APIs | [docs/api/](api/) |
+| System design / runtime diagrams | [docs/arch/README.md](arch/README.md) |
+| Qualification snapshots | [docs/qual/](qual/) |
 | Operating the satellite | [docs/user/README.md](user/README.md) |
 
 ## Documentation Structure
@@ -26,13 +28,14 @@ docs/
 │   ├── bms.md          # Battery management (EPS interface)
 │   ├── comms.md        # LoRa TT&C (SX1268)
 │   ├── memory.md       # FRAM cyclic buffer, Flash write, LastStates
-│   ├── aocs.md         # Attitude control (B-dot, EKF)
+│   ├── aocs.md         # AOCS board/interface contract and implementation status
 │   └── payloads.md     # CRYSTALS, CLOUD, CLEAR
 ├── arch/               # Architecture & system design
 │   └── README.md
 ├── dev/                # Developer guides
-│   ├── building.md     # Build (NixOS container / local / CI / CubeIDE)
-│   ├── simulation.md   # ESP32 dual-board HIL verification
+│   ├── building.md     # ARM build, CRC stamping, flashing
+│   ├── ci-and-verification.md # CI graph, evidence scope, qualification limits
+│   ├── simulation.md   # ESP32 development aid vs hardware HIL
 │   ├── hardening.md    # Boot CRC32 integrity + task watchdog monitoring
 │   ├── sram2_parity.md # SRAM2 parity NMI for critical data (W2-3)
 │   ├── seu_mitigation.md # Periodic RAM scrubbing + SEU counters (W2-5)
@@ -63,10 +66,10 @@ docs/
 - **CLEAR:** optical measurements
 
 ### Support
-- **BMS:** battery status (EPS STM32L1 interface)
+- **BMS:** OBC-side battery telemetry plumbing; EPS transaction is not implemented
 - **Comms:** LoRa radio (SX1268)
 - **Memory:** FRAM + Flash storage
-- **AOCS:** attitude control (B-dot + EKF)
+- **AOCS:** separate subsystem board; OBC polling/task path is not integrated
 
 ## Support
 
