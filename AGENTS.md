@@ -73,7 +73,24 @@ make cppcheck-canary         # proves the cppcheck gate can still go red
 make cppcheck-includes       # no unresolved first-party #include
 make cppcheck-includes-proof # proves that include gate cannot be silenced
 make cppcheck-print          # print the fully expanded cppcheck command line
+
+# dual-ESP32 HIL (§5: development aid, never a substitute for the host suite).
+# The sim targets are the ONLY place OBC_PORT/SIM_PORT are used; they default
+# to COM3/COM4 and are overridden per invocation, never committed.
+make sim-build                                     # idf.py build, both boards
+make sim                       OBC_PORT=COM7 SIM_PORT=COM8   # build + flash both
+make sim-flash                 BOARD=obc                   # flash ONE board
+make sim-monitor               OBC_PORT=COM7 SIM_PORT=COM8   # two serial monitors
+make sim-clean                                          # rm both build/ dirs
 ```
+
+- `make sim*` needs ESP-IDF on `PATH` and **defaults to COM3/COM4**. The sim
+  targets are not covered by any CI job, so a green pipeline says nothing about
+  them.
+- `make sim-flash` takes **`BOARD=obc`** or **`BOARD=sim`** and errors without
+  it. Note its own error message says `OBC_PORT=COMx` / `SIM_PORT=COMy`, which
+  does not match the `BOARD=` it actually dispatches on — trust the body, and
+  pass `BOARD` plus the port override you need.
 
 - `-fanalyzer` (GCC static analyser, `APP_ANALYZER`) is applied to
   `$(BUILD_DIR)/App/%` and `$(BUILD_DIR)/Core/Src/%` only. It is **C-only**: the
@@ -206,12 +223,32 @@ proof-of-life that shows it can still fail — in the same PR.
   the Ceedling gem only.
 - Only host-compilable modules go on the Ceedling source path. `Core/Src` and
   `main.c` never do.
+- **`project.yml` path traps — read the comments before editing `:paths:` or
+  `:files:`.** Two directories are poisoned at the *directory* level and must
+  be listed as single files instead, because the sibling file pulls
+  `stm32l4xx_hal.h` into every test binary:
+  - `App/payloads` → list `temp.c` alone; `cloud/` `clear/` `crystals` are not
+    host-compilable.
+  - `App/bms` → list `eps_fdir.c` alone (pure detection/recovery, no HAL);
+    `bms.c` configures SPI2 through the real CubeMX struct layout and must stay
+    off the host build.
+  - `App/comms` is on `:source:` but the radio driver stays flight-only — the
+    host build gets `support/radiolib_stubs.c` instead.
+  - `fakes/` must precede `support/` on the include path: it shadows `main.h`,
+    `cmsis_os*.h`, `FreeRTOS.h`, `task.h`.
+  If a module ever becomes host-testable, add that one file under `:files:
+  :source:` — never put the parent directory back.
 - Coverage is an **enforced** gate (`:fail_under_line: 90`,
   `:fail_under_branch: 75`, `:exception_on_fail: TRUE`). Do not lower it, and do
   not add code that cannot be exercised to dodge it — if a line is genuinely
   unreachable, say why in the review or restructure.
 - HIL/ESP32 simulation is a development aid; it never substitutes for the
   Ceedling suite or for a pinned contract test.
+- **`graphify-out/` is git-ignored and not part of the build.** It is a
+  knowledge graph an agent can regenerate (`/graphify .`, `graphify update .`,
+  `graphify query "<question>"`) for orientation. It is a *navigation* aid
+  only: never cite it as evidence, and read the source file it points at
+  before acting. Its labels are derived, not curated.
 
 ---
 
