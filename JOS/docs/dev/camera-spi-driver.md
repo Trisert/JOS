@@ -99,10 +99,14 @@ interrupt-driven DMA and no blocking polling, so only the sequence ports:
   (preliminary specification, ~232 pp), SharePoint `CRYSTALS FILES/Schede
   tecniche/`, uploaded 2026-10-19. Authoritative register map for the sensor
   side of subtask `t_ed55cc67`.
-- **`ELE_april2026_orders/`** — `OBC_V2.0` and `GPIO_expander` gerbers + KiCad
-  BOMs (2026-04-08). Confirm the OBC part set (4 × FM24VN10-G FRAM, 4 × TMP1827,
-  J6 pogo connector `854-22-020-20-001101`) and the expander part
-  (`MCP23017T-E/SS`). **No schematic/netlist** — issue #54.
+- **`ELE_april2026_orders/BOMs from KiCad/OBC_V2.0.csv`** (2026-04-08): row 5
+  `IC10,IC13,IC12,IC11` = 4 × `FM24VN10-G` (FRAM); row 15
+  `TMP1,TMP3,TMP4,TMP2` = 4 × `TMP1827NGRT`; row 16 `J6` =
+  `854-22-020-20-001101` (pogo connector).
+- **`ELE_april2026_orders/BOMs from KiCad/GPIO_expander.csv`** (2026-04-08):
+  row 3 `IC1` = `MCP23017T-E_SS`; row 2 `J1` = `Conn_01x26`.
+- Gerbers/drill in `ELE_april2026_orders/PCBs (drill & gerber)/`. **No
+  schematic/netlist** — issue #54.
 - `ELE_DREP_Architecture_V01` — payload SPI, I2C_EXT, I2C_CAM, MCP23017.
 
 ## References
