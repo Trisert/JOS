@@ -8,8 +8,10 @@ register addresses, pin assignments, or bus peripherals (AGENTS.md §1).
 
 **Update 2026-11-10:** the OBC V2.0 manufacturing gerbers (`OBC_V2.0.zip`,
 `ELE_april2026_orders/PCBs (drill & gerber)/`, 2026-04-08) now fix the payload
-SPI peripheral, the I2C_EXT bus and the I2C_CAM bus. Only the MCP23017 I2C
-address remains open (see below).
+SPI peripheral (SPI2), the I2C_EXT bus (I2C4) and the I2C_CAM bus (I2C2).
+Two bus reconciliations remain open in addition to the MCP23017 I2C address:
+the CLOUD ADC bus mismatch and the BMS SPI-handle mismatch (see “Unresolved
+code/hardware reconciliation” below).
 
 ## Bus facts
 
@@ -32,20 +34,27 @@ only SPI1 and SPI2; do not assume SPI3 exists.
 ## Open questions that block implementation
 
 1. **MCP23017 I2C address.** Set by strap pins A0–A2; absent from the corpus
-   and from the simulation (which models only an 8-bit output snapshot). The
-   register map itself is public (Microchip MCP23017 datasheet, referenced in
-   `ELE_DREP`). The `GPIO_expander` board manufacturing outputs (gerbers + BOM,
-   2026-04-08, `ELE_april2026_orders/`) confirm the part is `MCP23017T-E/SS` on
-   a 26-pin header; the gerbers show A0/A1/A2 routed to header pins 22/21/20,
-   but only the **schematic/netlist** would show the strap wiring to GND/VCC —
-   and those are the files issue #54 reports missing. Need ELE. Until answered,
-   the driver must fail closed (no device found → log error, no image).
-2. ~~**Payload SPI peripheral.**~~ **RESOLVED 2026-11-10:** SPI2 (PB13/PB14/PB15),
-   confirmed by `OBC_V2.0-F_Cu.gbr` net names `SPI2_CLK_PAY`/`SPI2_MISO_PAY`/
-   `SPI2_MOSI_PAY` on MCU1 pins 52/53/54.
-3. ~~**I2C_EXT bus identity.**~~ **RESOLVED 2026-11-10:** I2C4 (PD12/PD13),
-   confirmed by `OBC_V2.0-F_Cu.gbr` (`MCU1 pin 59 PD12 → I2C4_SCL_EXT`, pin 60
-   PD13 → I2C4_SDA_EXT`) and pogo pins 6/7 (`OBC_V2.0-In1_Cu.gbr`).
+   and from the simulation (which models only an 8-bit output snapshot). Need
+   ELE. Until answered, the driver must fail closed (no device found → log error,
+   no image).
+2. **CLOUD ADC bus mismatch.** `cloud.c` (`cloud_adc_init`) binds the MAX11128
+   CLOUD ADC to `&hspi1`, but the OBC V2.0 gerbers place CLOUD electronics on
+   the payload SPI bus (`SPI2_PAY`). `ELE_DREP` defines the payload SPI as a
+   separate bus; clarify whether “separate” means separate from SPI2 or a third
+   bus. Until reconciled, `cloud_acquire()` cannot sample the CLOUD ADC on the
+   documented wiring.
+3. **BMS SPI-handle mismatch.** `bms_spi_init()` (`bms.c`) configures `hspi2`
+   (SPI2) and binds `bms_spi = &hspi2` for EPS traffic. With SPI2 now the
+   payload bus (camera CS pins PB13–PB15), any EPS transaction would target
+   payload wiring instead of the documented SPI1 subsystem pins. Track as an
+   open code/hardware reconciliation; correct the BMS binding in a separate,
+   verified flight-code change before enabling EPS transactions or the camera.
+
+~~4. **Payload SPI peripheral.**~~ **RESOLVED 2026-11-10 (bus wiring):** SPI2
+   (PB13/PB14/PB15), confirmed by `OBC_V2.0-F_Cu.gbr`.
+
+~~5. **I2C_EXT bus identity.**~~ **RESOLVED 2026-11-10 (bus wiring):** I2C4
+   (PD12/PD13), confirmed by `OBC_V2.0-F_Cu.gbr` and pogo pins 6/7.
 
 ## Resolved contradictions (2026-11-10)
 
@@ -58,6 +67,17 @@ only SPI1 and SPI2; do not assume SPI3 exists.
   the payload bus is SPI2. No CubeMX regeneration is required for the bus
   selection. (DMA channel assignment for SPI2 is still an implementation
   detail — see Decision 2.)
+
+## Unresolved code/hardware reconciliation
+
+- **CLOUD ADC:** `cloud.c` binds the MAX11128 to `hspi1`, but the gerbers place
+  CLOUD electronics on `SPI2_PAY`. Reconcile `cloud.c` vs the payload-bus wiring
+  before CLOUD reads.
+- **BMS/EPS:** `bms.c` binds EPS to `hspi2/SPI2` — the same pins as the camera
+  payload bus. Correct the BMS binding in a separate verified flight-code
+  change before enabling EPS transactions or the camera.
+- **MCP23017 I2C address** remains open (strap A0–A2, no schematic/netlist in
+  the corpus).
 
 ## Decision 1 — host-test split
 
