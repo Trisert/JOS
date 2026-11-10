@@ -13,9 +13,13 @@ extern "C" {
  *
  * Per RED_DES_ElectronicArchitecture_V1:
  *   - Subsystem SPI bus: OBC (master) ↔ AOCS (slave), EPS (slave), LoRa
+ *     (SPI1, `SPI1_BUS` per OBC_V2.0 gerbers)
  *   - Payload SPI bus:  OBC (master) ↔ CLOUD electronics, ArduCam camera
+ *     (SPI2, `SPI2_PAY` per OBC_V2.0 gerbers; pogo pins 10-12)
  *   - OBC I2C_EXT:       OBC ↔ MCP23017 GPIO expander (SPI CS control)
+ *     (I2C4, PD12/PD13 per OBC_V2.0 gerbers)
  *   - OBC I2C_CAM:       OBC ↔ ArduCam register config
+ *     (I2C2, J6 pin 8/9 per OBC_V2.0 gerbers)
  *   - AOCS I2C (local):  AOCS MCU ↔ ASM330LHH IMU, IIS2MDC MAG (x2 redundant)
  *   - EPS I2C (local):   EPS MCU ↔ BQ76905 battery monitor
  *   - USART:             Debug/telemetry via umbilical connector
