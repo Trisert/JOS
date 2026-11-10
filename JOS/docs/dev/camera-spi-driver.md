@@ -35,7 +35,10 @@ corresponds to the `SPI_PAY_*` pogo pins 10–12. `AGENTS.md` §"Hardware" — t
 2. **MCP23017 I2C address.** Set by strap pins A0–A2; absent from the corpus
    and from the simulation (which models only an 8-bit output snapshot). The
    register map itself is public (Microchip MCP23017 datasheet, referenced in
-   `ELE_DREP`). Need ELE to confirm the address.
+   `ELE_DREP`). The `GPIO_expander` board manufacturing outputs (gerbers + BOM,
+   2026-04-08, `ELE_april2026_orders/`) confirm the part is `MCP23017T-E/SS` on
+   a 26-pin header, but only the **schematic/netlist** would show the strap
+   wiring — and those are the files issue #54 reports missing. Need ELE.
 3. **I2C_EXT bus identity.** I2C4 (PD12/PD13) is the only enabled I2C bus not
    referenced by code, and the pogo-pin map puts `I2C_EXT` on pins 6/7. Treat
    I2C_EXT = I2C4 as the working hypothesis, to be confirmed by ELE.
@@ -89,6 +92,18 @@ interrupt-driven DMA and no blocking polling, so only the sequence ports:
 4. Read FIFO length (`0x42`/`0x43`/`0x44`).
 5. Burst-read the FIFO over SPI via DMA into a static buffer, then deassert CS.
 6. Sensor registers are configured over I2C_CAM (I2C2, PB10/PB11).
+
+## Authoritative corpus documents
+
+- **`OV5642_DS (camera).pdf`** — OmniVision OV5642 5 MP sensor datasheet
+  (preliminary specification, ~232 pp), SharePoint `CRYSTALS FILES/Schede
+  tecniche/`, uploaded 2026-10-19. Authoritative register map for the sensor
+  side of subtask `t_ed55cc67`.
+- **`ELE_april2026_orders/`** — `OBC_V2.0` and `GPIO_expander` gerbers + KiCad
+  BOMs (2026-04-08). Confirm the OBC part set (4 × FM24VN10-G FRAM, 4 × TMP1827,
+  J6 pogo connector `854-22-020-20-001101`) and the expander part
+  (`MCP23017T-E/SS`). **No schematic/netlist** — issue #54.
+- `ELE_DREP_Architecture_V01` — payload SPI, I2C_EXT, I2C_CAM, MCP23017.
 
 ## References
 
