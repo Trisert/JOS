@@ -39,13 +39,13 @@ a command, not recalled.
 | # | Finding | Evidence |
 |---|---|---|
 | A1 | **No image assets at all.** Zero `.svg`/`.png` in the repository. | `find JOS/docs -type f ! -name "*.md"` → empty |
-| A2 | **5 Mermaid diagrams total**, all in `arch/README.md` (3), `dev/ci-and-verification.md` (1), `dev/simulation.md` (1). 18 of 23 docs have no diagram. | `grep -c '```mermaid'` per file |
+| A2 | **5 Mermaid diagrams total**, all in `arch/README.md` (3), `dev/ci-and-verification.md` (1), `dev/simulation.md` (1). **20 of 23 docs have no diagram.** | `grep -c` on the fence marker, per file. Caution: this row itself contains the literal fence marker inside a code span, so a naive recursive grep over `docs/` over-counts by one; the 5/23 figures exclude this file. |
 | A3 | **`docs/README.md` index is incomplete** — 5 files exist but are not named: `api/drivers.md`, `api/ttc-frame.md`, `dev/camera-spi-driver.md`, `dev/scrub.md`, `qual/baseline.md`. | index-vs-tree diff |
 | A4 | **Non-English text against the English-only rule.** `dev/scrub.md` (whole document) and `qual/baseline.md` (whole document) are Italian; `api/obsw.md:55` carries one Italian sentence ("Vincolo: il periodo di kick …"). | high-signal marker grep, lines listed |
 | A5 | **`dev/scrub.md` documents deleted code.** It describes `App/obsw/scrub.{c,h}`, removed in T1.6; the file itself says "Stato: rimosso". | file body |
-| A6 | **`qual/baseline.md` is a stale snapshot.** It reports branch `docs/baseline`, commit `cbd60dd` (2026-09-07); `main` is `1a3eb35` (2026-11-10). Every number in it is two months old. | baseline.md header table |
+| A6 | **`qual/baseline.md` is a stale snapshot.** It reports branch `docs/baseline`, commit `cbd60dd` (**2026-08-24**), and asserts that `origin/main` is the same commit — it is not: `main` is `1a3eb35` (2026-11-10). Every number in it is over two months old, and its central claim of parity with `main` is false. | baseline.md header table; `git log -1 cbd60dd` |
 | A7 | **`TASKS.md` row 44 is duplicated** — one `review` row (line 83) and one `in-progress` row (line 87). The `in-progress` row refers to PR #108, which is **merged** since 2026-09-28. | `grep -n '^\| 44 '` |
-| A8 | **Uncommitted work on `main`** — `AGENTS.md`, `TASKS.md`, `.gitignore` were modified in the working tree and never committed. Recovered into this branch before starting (see §6). | `git status` on `main` |
+| A8 | **Uncommitted work on `main`** — `AGENTS.md`, `TASKS.md`, `.gitignore` were modified in the working tree and never committed. `AGENTS.md` and `.gitignore` were recovered into this branch (commit `0af32cc`). The `TASKS.md` hunk was **superseded** by `1a3eb35` (which already carries the newer row 47) and was deliberately not applied, so `TASKS.md` on this branch is byte-identical to `main` until C7 touches it. | `git status` on `main`; `git diff main..docs/full-rework` |
 | A9 | **`arch/README.md` self-reports an unreconciled divergence** — `TRIGGER_TASK_COMPLETE` exists in the type definitions but has no completion transition in `state_machine.c`, conflicting with the completed `TASKS.md` entry for PR #74. | arch/README.md, "Operational state model" |
 | A10 | **No external entry point.** `README.md` is a developer document; there is no system overview, no "start here", no contribution guide beyond a pointer to `AGENTS.md`. | README.md |
 | A11 | **Hardware figures cannot be completed.** The OBC schematic/netlist is absent from the corpus. What *is* recoverable are the gerber net names (OBC V2.0), which fixed the payload SPI, I2C_EXT and I2C_CAM wiring in `1a3eb35`. Only the MCP23017 I2C address remains open. | `1a3eb35` body; `AGENTS.md` |
@@ -150,14 +150,14 @@ All of these land in the same PR.
 
 | # | Correction |
 |---|---|
-| C1 | Rebuild `docs/README.md` as the complete index of both levels. |
+| C1 | Rebuild `docs/README.md` as the complete index of both levels. This spec is itself unindexed until this correction lands — include `dev/documentation-strategy.md`. |
 | C2 | Create `docs/overview/` (system overview + contributing guide). |
 | C3 | Rewrite `README.md` as the public entry point, with the system-context figure and a 5-minute build path. |
 | C4 | **Delete `dev/scrub.md`** (A5) — it documents code that no longer exists. Its history stays in git. |
 | C5 | **Replace `qual/baseline.md`.** Either re-measure it at the PR head in English, or delete it and let `qual/status.md` be the single qualification snapshot. If both would coexist, `baseline.md` keeps only what `status.md` does not cover. The chosen option is recorded in the PR body. |
 | C6 | Translate or rewrite every non-English passage in `docs/`: the whole of `dev/scrub.md` (removed by C4), the whole of `qual/baseline.md` (handled by C5), and `api/obsw.md:55`. |
 | C7 | Fix `TASKS.md` row 44: deduplicate and align the status with PR #108 (merged). Refresh the footer date in the same PR. |
-| C8 | Fold the recovered uncommitted changes (`AGENTS.md`, `.gitignore`, `TASKS.md`) into this PR and drop the stash. |
+| C8 | Fold the recovered uncommitted changes (`AGENTS.md`, `.gitignore`) into this PR and drop the stash. `TASKS.md` needs no recovery — its stashed hunk was superseded by `1a3eb35` (see A8). |
 | C9 | Reconcile A9 (`TRIGGER_TASK_COMPLETE`) — either correct the state-machine description or the `TASKS.md` entry, and record which. |
 | C10 | Add figures to the docs listed in §4.2, each with its source citation. |
 | C11 | Add a `docs/figures/README.md` explaining how to add a figure and run `make check`. |
@@ -206,7 +206,8 @@ the PR body must state their result — or state that they were not run.
 - [ ] Each figure's doc paragraph cites the source of truth it was drawn from.
 - [ ] Every figure that touches an unspecified interface carries the
       "not specified" / "open" marker required by §4.3.
-- [ ] No firmware, workflow or configuration file is modified.
+- [ ] No firmware, workflow or source file is modified. The only non-doc file
+      touched is `.gitignore`, recovered by C8.
 - [ ] `make release`, `make test`, `make coverage`, `make cppcheck` results are
       recorded in the PR body (or explicitly marked not run).
 - [ ] The PR body lists evidence, unverified items and open questions.
