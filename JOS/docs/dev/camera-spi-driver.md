@@ -45,7 +45,8 @@ only SPI1 and SPI2; do not assume SPI3 exists.
    documented wiring.
 3. **BMS SPI-handle mismatch.** `bms_spi_init()` (`bms.c`) configures `hspi2`
    (SPI2) and binds `bms_spi = &hspi2` for EPS traffic. With SPI2 now the
-   payload bus (camera CS pins PB13–PB15), any EPS transaction would target
+   payload bus (SPI2 clock/data pins PB13/PB14/PB15; camera CS asserted through
+   the MCP23017 GPIO expander over I2C_EXT), any EPS transaction would target
    payload wiring instead of the documented SPI1 subsystem pins. Track as an
    open code/hardware reconciliation; correct the BMS binding in a separate,
    verified flight-code change before enabling EPS transactions or the camera.
