@@ -2,9 +2,9 @@
 
 This guide describes what repository checks establish—and what they do not.
 It is based on `.github/workflows/build.yml`, `.github/workflows/codeql.yml`,
-`JOS/Makefile`, and `JOS/test/project.yml` at the reviewed source snapshot
-`7f0aabd` (2026-09-28). Check those files for later changes before relying on
-this snapshot as current policy.
+`.github/workflows/docs.yml`, `JOS/Makefile`, and `JOS/test/project.yml` at the
+reviewed source snapshot `1a3eb35` (2026-11-10). Check those files for later
+changes before relying on this snapshot as current policy.
 
 ## Continuous integration graph
 
@@ -14,6 +14,7 @@ flowchart TD
   TR --> B[Firmware build]
   TR --> C[Host unit tests + coverage]
   TR --> D[Workflow lint]
+  TR --> E[Documentation: Mermaid render]
   A --> A1[cppcheck canary]
   A1 --> A2[include-resolution check + proof canary]
   A2 --> A3[cppcheck 2.13.0]
@@ -24,6 +25,7 @@ flowchart TD
   C1 --> C2[gcov:all; >=90% lines, >=75% branches]
   C2 --> C3[upload test / coverage artifacts]
   D --> D1[actionlint 1.7.7 + regression canary]
+  E --> E1[mmdc 12.2.0: parse and render every fence]
   QT[CodeQL push to main / pull request] --> Q[Separate CodeQL workflow]
   Q --> Q1[manual ARM build + CodeQL analysis]
 ```
@@ -44,6 +46,7 @@ BIN from the build job; the BIN/HEX are CRC-stamped by the explicit CI step.
 | `ceedling test:all` | Host tests for configured host-compilable units, often with doubles/fakes | Target HAL behavior, all `Core/Src`, live EPS/AOCS links, or electrical behavior |
 | `ceedling gcov:all` | Coverage thresholds for modules in the Ceedling project | Requirements coverage across the full flight system |
 | `actionlint` and canary | Workflow syntax/action-input checks and proof the gate catches a known defect | Successful execution of the workflows on GitHub |
+| Mermaid render (pinned `mmdc`) | Every Mermaid fence under `JOS/docs/` parses and renders | Diagram semantic accuracy, link targets, or that the picture matches the code |
 | CodeQL | Static security analysis of configured workflow/source scope | HIL, protocol conformance, or complete safety verification |
 | ESP32 simulation | Development exercises for the simulation harness | Flight-target HIL or hardware qualification |
 | Target HIL / bench | Hardware-specific behavior, only where a defined test/evidence exists | Any untested hardware configurations or unresolved ICD requirements |
