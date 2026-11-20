@@ -67,22 +67,38 @@ reproducible on a fork or after a mistake.
 
 ## Project fields
 
-The **JOS** project (owner `Trisert`, type *project*) has four fields:
+The **JOS** project lives at <https://github.com/users/Trisert/projects/1>
+(public, like the repository) and has five fields:
 
 | Field | Type | Values |
 |---|---|---|
-| Status | built-in | Todo, In progress, In review, Blocked, Done |
+| Status | built-in single select | Todo, In progress, In review, Blocked, Done |
 | Area | single select | Firmware, COMMS, EPS, AOCS, Payloads, CI, Docs |
 | Priority | single select | P0, P1, P2 |
 | TASKS.md row | text | the row number, so the card can be traced back to the board |
 
-Status is a view of reality, not an input: it should follow the PR state
-(`In progress` while the branch is open, `In review` from PR open to merge,
-`Done` when the item closes).
+Status is a view of reality, not an input. `scripts/github/setup-project.sh`
+derives it, in this order:
+
+- item closed -> `Done`
+- open pull request -> `In review`
+- open issue whose number an open PR closes (`Closes #N`, `Fixes #N`,
+  `Resolves #N`) -> `In review`
+- `status/blocked` or `status/needs-sys-ele` label -> `Blocked`
+- otherwise -> `Todo`
+
+`Area` comes from `area/*` and `Priority` from `prio/*`; an item without those
+labels is left untouched rather than guessed at. `TASKS.md row` is the one field
+set by hand, because it cannot be derived from GitHub:
+
+```bash
+gh project item-edit --id <item-id> --project-id PVT_kwHOAi27Ks4Bsd8t \
+  --field-id <field-id> --text 49
+```
 
 GitHub's *auto-add* and *built-in* project workflows are configured in the web
-UI only. There is no API for them, so re-check them after creating a project by
-hand: auto-add issues from this repository, and keep closed items from
+UI only. There is no API for them, so re-check them after a project
+re-creation: auto-add issues from this repository, and keep closed items from
 re-entering `Todo`.
 
 ## Lifecycle
@@ -106,12 +122,22 @@ Issues and PRs are public. Never paste a credential, token, uplink
 comment or a log. Reference the vault entry or the environment variable by name
 instead.
 
-## Reproducing the label set
+## Reproducing the configuration
+
+Both scripts are idempotent and safe to re-run.
 
 ```bash
-./scripts/github/sync-labels.sh          # idempotent, needs the `repo` scope
+./scripts/github/sync-labels.sh     # 14 labels, `repo` scope
+./scripts/github/setup-project.sh   # project, fields, item import, `project` scope
 ```
+
+`setup-project.sh` creates the project only when the title is missing, adds the
+Status options that the built-in field does not ship with, creates the custom
+fields when absent, imports every open issue and pull request, and then sets
+Area / Priority / Status from labels. It never clears a cell it does not have a
+value for, so the hand-set `TASKS.md row` survives a re-run.
 
 Creating or editing project items needs the `project` scope
 (`gh auth refresh -s project`). The command is interactive by design: it prints
-a one-time code that has to be entered by the account owner.
+a one-time code that has to be entered by the account owner, and the token
+cannot be upgraded from a script.
