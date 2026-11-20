@@ -169,6 +169,11 @@ the mutation and restores it on the refreshed option ids afterwards, and refuses
 to reconcile a board bigger than the snapshot window (1000 items). T9 models
 exactly that: a closed card, new option ids, and a restored assignment.
 
+`T10` covers the oversized-board refusal (no mutation is sent) and `T11` a
+rejected restoration (nonzero exit, the card named).
+
 Mutation-checked: dropping the no-match guard on the closing-reference search
 turns the import tests red, swallowing `item-edit` failures turns the
-failure-reporting test red, and removing the restore loop turns T9 red.
+failure-reporting test red, removing the restore loop turns T9 red, removing the
+size guard turns T10 red, and making restoration failure non-fatal turns T11
+red.

@@ -200,6 +200,38 @@ check "snapshot precedes the mutation"   '[[ $(grep -n "project item-list" "$MOC
 check "restores on a new option id"      'grep -q -- "--id ITEM_CLOSED --project-id PID --field-id F_STATUS --single-select-option-id o2_blocked" "$MOCK_LOG"'
 rm -rf "$MOCK_DIR"
 
+# --- T10: an oversized board is refused, not truncated ----------------------
+echo "T10 board larger than the snapshot window refuses to reconcile"
+new_mock
+cat > "$MOCK_DIR/fields.json" <<'JSON'
+{"fields":[{"id":"F_STATUS","name":"Status","type":"ProjectV2SingleSelectField","options":[
+  {"id":"o_todo","name":"Todo"},{"id":"o_blocked","name":"Blocked"},{"id":"o_done","name":"Done"}]}]}
+JSON
+echo '{"items":[],"totalCount":1001}' > "$MOCK_DIR/items.json"
+run_script
+check "exits nonzero"                '[[ $RC -ne 0 ]]'
+check "says why"                     'grep -q "refusing to reconcile" <<<"$OUT"'
+check "sends no mutation"            '! grep -q "api graphql" "$MOCK_LOG"'
+rm -rf "$MOCK_DIR"
+
+# --- T11: a rejected restoration is reported, not swallowed -----------------
+echo "T11 rejected restoration exits nonzero and names the card"
+new_mock
+cat > "$MOCK_DIR/fields.json" <<'JSON'
+{"fields":[{"id":"F_STATUS","name":"Status","type":"ProjectV2SingleSelectField","options":[
+  {"id":"o_todo","name":"Todo"},{"id":"o_blocked","name":"Blocked"},{"id":"o_done","name":"Done"}]}]}
+JSON
+cp "$HERE/fields-after-replaced.json" "$MOCK_DIR/fields-after.json"
+cat > "$MOCK_DIR/items.json" <<'JSON'
+{"items":[{"id":"ITEM_CLOSED","content":{"number":1,"url":"https://github.com/Trisert/JOS/issues/1"},"status":"Blocked"}]}
+JSON
+: > "$MOCK_DIR/fail-edits"
+run_script
+check "exits nonzero"                '[[ $RC -ne 0 ]]'
+check "names the card"               'grep -q "could not restore Status .Blocked. on item ITEM_CLOSED" <<<"$OUT"'
+check "says how many"                'grep -q "Status assignment(s) could not be restored" <<<"$OUT"'
+rm -rf "$MOCK_DIR"
+
 echo
 echo "passed: $pass  failed: $fail"
 (( fail == 0 ))
