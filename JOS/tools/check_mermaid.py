@@ -29,50 +29,99 @@ import sys
 import tempfile
 from pathlib import Path
 
-FENCE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+FENCE = re.compile(r"^(?P<indent> *)(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+LIST_ITEM = re.compile(
+    r"^(?P<indent> *)(?P<marker>[-+*]|\d+[.)])(?P<space> +)(?P<rest>.*)$"
+)
 
 
 def _fence(line: str):
-    """Return (character, length, info) for a Markdown fence line, or None."""
+    """Return (character, length, info, indent) for a fence line, or None."""
     match = FENCE.match(line)
     if match is None:
         return None
     fence = match.group("fence")
-    return fence[0], len(fence), match.group("info").strip()
+    info = match.group("info").strip()
+    # CommonMark forbids backticks in the info string of a backtick fence.
+    # Without this guard, a standalone ```example``` inline span looks like an
+    # opening fence and the skip loop swallows the next real diagram.
+    if fence[0] == "`" and "`" in info:
+        return None
+    return fence[0], len(fence), info, len(match.group("indent"))
 
 
-def _is_closing(line: str, character: str, minimum: int) -> bool:
+def _is_closing(line: str, character: str, minimum: int, max_indent: int) -> bool:
     parsed = _fence(line)
     if parsed is None:
         return False
-    candidate, length, info = parsed
-    return candidate == character and length >= minimum and not info
+    candidate, length, info, indent = parsed
+    return (
+        candidate == character
+        and length >= minimum
+        and not info
+        and indent <= max_indent
+    )
+
+
+def _list_indent(line: str) -> int | None:
+    match = LIST_ITEM.match(line)
+    if match is None:
+        return None
+    marker_indent = len(match.group("indent"))
+    spaces = len(match.group("space"))
+    # CommonMark: 1-4 spaces after the marker set the content indent; five or
+    # more means one space and the rest is content.
+    return marker_indent + len(match.group("marker")) + (spaces if spaces <= 4 else 1)
 
 
 def mermaid_blocks(text: str):
     """Yield (block_number, source) for each fenced Mermaid block.
 
-    Markdown allows backtick or tilde fences and any opening length >= 3.
-    A Mermaid-looking line inside another code fence (for example an example
-    in a guide) is not a diagram and must not be rendered as one.
+    Markdown allows backtick or tilde fences and any opening length >= 3. A
+    fence may also be indented inside a list item; a plain four-space indented
+    code block is not a diagram. A Mermaid-looking line inside another code
+    fence (for example an example in a guide) is not a diagram either.
     """
     lines = text.splitlines()
     index = 0
     block_number = 0
+    list_indents: list[int] = []
     while index < len(lines):
-        opening = _fence(lines[index])
+        line = lines[index]
+        if line.strip():
+            indent = len(line) - len(line.lstrip(" "))
+            item_indent = _list_indent(line)
+            if item_indent is not None:
+                while list_indents and indent < list_indents[-1]:
+                    list_indents.pop()
+                list_indents.append(item_indent)
+            else:
+                while list_indents and indent < list_indents[-1]:
+                    list_indents.pop()
+
+        opening = _fence(line)
         if opening is None:
             index += 1
             continue
 
-        character, length, info = opening
+        character, length, info, indent = opening
+        # A fence indented four spaces in ordinary text is an indented code
+        # block, not a diagram. Inside a list item it is valid relative to the
+        # item's content indent.
+        if indent > 3 and not any(
+            content <= indent <= content + 3 for content in list_indents
+        ):
+            index += 1
+            continue
+
+        max_indent = max(3, indent + 3)
         if info.lower() != "mermaid":
             # Skip the whole non-Mermaid fence so an example inside it is not
             # mistaken for a real diagram. An unterminated non-Mermaid fence
             # consumes the rest of the document, matching Markdown rendering.
             end = index + 1
             while end < len(lines) and not _is_closing(
-                lines[end], character, length
+                lines[end], character, length, max_indent
             ):
                 end += 1
             index = end + 1
@@ -82,7 +131,7 @@ def mermaid_blocks(text: str):
         start = index + 1
         end = start
         while end < len(lines) and not _is_closing(
-            lines[end], character, length
+            lines[end], character, length, max_indent
         ):
             end += 1
         if end == len(lines):

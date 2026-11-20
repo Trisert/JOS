@@ -47,6 +47,22 @@ class MermaidBlockTests(unittest.TestCase):
         text = "````markdown\n```mermaid\nthis is invalid\n```\n````\n"
         self.assertEqual(list(check_mermaid.mermaid_blocks(text)), [])
 
+    def test_list_nested_fence_is_extracted(self):
+        text = "- Diagram:\n\n    ```mermaid\n    flowchart LR\n      A --> B\n    ```\n"
+        blocks = list(check_mermaid.mermaid_blocks(text))
+        self.assertEqual(len(blocks), 1)
+        self.assertIn("flowchart LR", blocks[0][1])
+
+    def test_four_space_indented_code_is_not_a_diagram(self):
+        text = "    ```mermaid\n    flowchart LR\n      A --> B\n    ```\n"
+        self.assertEqual(list(check_mermaid.mermaid_blocks(text)), [])
+
+    def test_inline_code_span_does_not_hide_next_diagram(self):
+        text = "```example```\n\n" + TRIPLE
+        blocks = list(check_mermaid.mermaid_blocks(text))
+        self.assertEqual(len(blocks), 1)
+        self.assertIn("flowchart LR", blocks[0][1])
+
     def test_empty_block_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "empty Mermaid block"):
             list(check_mermaid.mermaid_blocks("```mermaid\n\n```\n"))
@@ -107,6 +123,18 @@ class CheckerMainTests(unittest.TestCase):
         with mock.patch.object(check_mermaid.subprocess, "run") as renderer:
             self.assertEqual(self._run(root), 1)
             renderer.assert_not_called()
+
+    def test_list_nested_diagram_reaches_the_renderer(self):
+        root = self._root(
+            "- Diagram:\n\n    ```mermaid\n    flowchart LR\n      A -->\n    ```\n"
+        )
+        with mock.patch.object(
+            check_mermaid.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "parse error"),
+        ) as renderer:
+            self.assertEqual(self._run(root), 1)
+            renderer.assert_called_once()
 
     def test_missing_docs_directory(self):
         root = self._root()
