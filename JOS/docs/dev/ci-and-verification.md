@@ -46,7 +46,7 @@ BIN from the build job; the BIN/HEX are CRC-stamped by the explicit CI step.
 | `ceedling test:all` | Host tests for configured host-compilable units, often with doubles/fakes | Target HAL behavior, all `Core/Src`, live EPS/AOCS links, or electrical behavior |
 | `ceedling gcov:all` | Coverage thresholds for modules in the Ceedling project | Requirements coverage across the full flight system |
 | `actionlint` and canary | Workflow syntax/action-input checks and proof the gate catches a known defect | Successful execution of the workflows on GitHub |
-| Mermaid render (pinned `mmdc`) | Every Mermaid fence under `JOS/docs/` parses and renders | Diagram semantic accuracy, link targets, or that the picture matches the code |
+| Mermaid render (pinned `mmdc`) + extractor tests | Every Mermaid fence under `JOS/docs/` parses and renders; the fence extractor has host tests for backtick, tilde, nested, empty and unterminated cases | Diagram semantic accuracy, link targets, or that the picture matches the code |
 | CodeQL | Static security analysis of configured workflow/source scope | HIL, protocol conformance, or complete safety verification |
 | ESP32 simulation | Development exercises for the simulation harness | Flight-target HIL or hardware qualification |
 | Target HIL / bench | Hardware-specific behavior, only where a defined test/evidence exists | Any untested hardware configurations or unresolved ICD requirements |

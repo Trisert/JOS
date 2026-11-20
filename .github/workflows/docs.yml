@@ -12,12 +12,14 @@ on:
     paths:
       - 'JOS/docs/**'
       - 'JOS/tools/check_mermaid.py'
+      - 'JOS/tools/test_check_mermaid.py'
       - 'JOS/tools/mermaid-puppeteer.json'
       - '.github/workflows/docs.yml'
   pull_request:
     paths:
       - 'JOS/docs/**'
       - 'JOS/tools/check_mermaid.py'
+      - 'JOS/tools/test_check_mermaid.py'
       - 'JOS/tools/mermaid-puppeteer.json'
       - '.github/workflows/docs.yml'
 
@@ -54,6 +56,9 @@ jobs:
           # browser explicitly so mmdc cannot fall back to a missing Chrome.
           npx --yes puppeteer@25.18.1 browsers install chrome
           mmdc --version
+
+      - name: Test the Mermaid extractor
+        run: python3 -m unittest discover -s JOS/tools -p 'test_check_mermaid.py' -v
 
       - name: Validate every Mermaid fence
         run: python3 JOS/tools/check_mermaid.py

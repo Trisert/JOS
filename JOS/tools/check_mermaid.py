@@ -29,23 +29,61 @@ import sys
 import tempfile
 from pathlib import Path
 
-FENCE_START = re.compile(r"^\s*```mermaid\s*$")
-FENCE_END = re.compile(r"^\s*```\s*$")
+FENCE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+
+
+def _fence(line: str):
+    """Return (character, length, info) for a Markdown fence line, or None."""
+    match = FENCE.match(line)
+    if match is None:
+        return None
+    fence = match.group("fence")
+    return fence[0], len(fence), match.group("info").strip()
+
+
+def _is_closing(line: str, character: str, minimum: int) -> bool:
+    parsed = _fence(line)
+    if parsed is None:
+        return False
+    candidate, length, info = parsed
+    return candidate == character and length >= minimum and not info
 
 
 def mermaid_blocks(text: str):
-    """Yield (block_number, source) for each fenced Mermaid block."""
+    """Yield (block_number, source) for each fenced Mermaid block.
+
+    Markdown allows backtick or tilde fences and any opening length >= 3.
+    A Mermaid-looking line inside another code fence (for example an example
+    in a guide) is not a diagram and must not be rendered as one.
+    """
     lines = text.splitlines()
     index = 0
     block_number = 0
     while index < len(lines):
-        if not FENCE_START.match(lines[index]):
+        opening = _fence(lines[index])
+        if opening is None:
             index += 1
             continue
+
+        character, length, info = opening
+        if info.lower() != "mermaid":
+            # Skip the whole non-Mermaid fence so an example inside it is not
+            # mistaken for a real diagram. An unterminated non-Mermaid fence
+            # consumes the rest of the document, matching Markdown rendering.
+            end = index + 1
+            while end < len(lines) and not _is_closing(
+                lines[end], character, length
+            ):
+                end += 1
+            index = end + 1
+            continue
+
         block_number += 1
         start = index + 1
         end = start
-        while end < len(lines) and not FENCE_END.match(lines[end]):
+        while end < len(lines) and not _is_closing(
+            lines[end], character, length
+        ):
             end += 1
         if end == len(lines):
             raise ValueError(
