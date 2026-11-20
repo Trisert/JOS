@@ -169,11 +169,15 @@ the mutation and restores it on the refreshed option ids afterwards, and refuses
 to reconcile a board bigger than the snapshot window (1000 items). T9 models
 exactly that: a closed card, new option ids, and a restored assignment.
 
-`T10` covers the oversized-board refusal (no mutation is sent) and `T11` a
-rejected restoration (nonzero exit, the card named).
+`T10` covers the oversized-board refusal (no mutation is sent), `T11` a rejected
+restoration (nonzero exit, the card named), `T12` an unreadable label list (no
+card, no field writes), `T13` a repository larger than the listing window (abort
+before any import), and `T14`-`T16` the label taxonomy (dry run, apply, malformed
+table rejected before any API call).
 
 Mutation-checked: dropping the no-match guard on the closing-reference search
 turns the import tests red, swallowing `item-edit` failures turns the
 failure-reporting test red, removing the restore loop turns T9 red, removing the
 size guard turns T10 red, and making restoration failure non-fatal turns T11
-red.
+red, dropping the label-read guard turns T12 red, removing the listing ceiling
+turns T13 red, and a duplicate label in the table aborts before any API call.

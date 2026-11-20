@@ -140,10 +140,22 @@ set_field() {
 }
 
 echo "== import open items"
-items="$("$GH" project item-list "$project" --owner "$OWNER" --format json --limit 200)"
-prs="$("$GH" pr list --repo "$REPO" --state open --limit 100 --json number,body)"
-urls="$("$GH" pr list --repo "$REPO" --state open --limit 100 --json url --jq '.[].url'
-        "$GH" issue list --repo "$REPO" --state open --limit 100 --json url --jq '.[].url')"
+# Every listing is bounded. Refuse to run on a repository bigger than the
+# window instead of silently importing a subset.
+LIMIT=1000
+open_total="$("$GH" api "repos/${REPO}" --jq '.open_issues_count')"
+if [[ ! "$open_total" =~ ^[0-9]+$ ]]; then
+  echo "   ! cannot read the open-item count of ${REPO}; refusing to run" >&2
+  exit 1
+fi
+if (( open_total > LIMIT )); then
+  echo "   ! ${open_total} open issues and PRs exceed the ${LIMIT}-item window; raise LIMIT" >&2
+  exit 1
+fi
+items="$("$GH" project item-list "$project" --owner "$OWNER" --format json --limit 1000)"
+prs="$("$GH" pr list --repo "$REPO" --state open --limit "$LIMIT" --json number,body)"
+urls="$("$GH" pr list --repo "$REPO" --state open --limit "$LIMIT" --json url --jq '.[].url'
+        "$GH" issue list --repo "$REPO" --state open --limit "$LIMIT" --json url --jq '.[].url')"
 
 # Issues an open PR closes are in review, not todo: `Closes #N` is the contract.
 # The search legitimately finds nothing when there are no PRs or no references;
@@ -154,13 +166,13 @@ in_review="$( { jq -r '.[].body // ""' <<<"$prs" \
 
 for url in $urls; do
   n="$(basename "$url")"
-  item="$(jq -r --arg u "$url" '.items[] | select(.content.url==$u) | .id' <<<"$items" | head -1)"
-  if [[ -z "$item" ]]; then
-    item="$("$GH" project item-add "$project" --owner "$OWNER" --url "$url" --format json | jq -r .id)"
-    echo "   + $url"
-  fi
 
-  labels="$("$GH" api "repos/${REPO}/issues/${n}/labels" --jq '.[].name' 2>/dev/null || true)"
+  # Read labels and state BEFORE touching the board: a card created from a
+  # failed read would carry a default status that contradicts the issue.
+  if ! labels="$("$GH" api "repos/${REPO}/issues/${n}/labels" --jq '.[].name' 2>&1)"; then
+    echo "   ! cannot read the labels of #${n} (${labels//$'\n'/ }); card left untouched" >&2
+    continue
+  fi
   meta="$("$GH" api "repos/${REPO}/issues/${n}" \
     --jq '[.state, (has("pull_request")|tostring)] | join(" ")' 2>/dev/null || true)"
   # An unreadable item is not a Todo: leave the card alone and say so.
@@ -169,6 +181,12 @@ for url in $urls; do
     continue
   fi
   state="${meta%% *}"; is_pr="${meta##* }"
+
+  item="$(jq -r --arg u "$url" '.items[] | select(.content.url==$u) | .id' <<<"$items" | head -1)"
+  if [[ -z "$item" ]]; then
+    item="$("$GH" project item-add "$project" --owner "$OWNER" --url "$url" --format json | jq -r .id)"
+    echo "   + $url"
+  fi
 
   area=""; prio=""; status="Todo"
   for l in $labels; do

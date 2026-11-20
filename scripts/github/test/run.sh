@@ -35,6 +35,7 @@ JSON
 ]}
 JSON
   echo '{"items":[]}' > "$MOCK_DIR/items.json"
+  echo '{"open_issues_count":0}' > "$MOCK_DIR/repo.json"
   echo '[]' > "$MOCK_DIR/prs.json"
   echo '[]' > "$MOCK_DIR/issues.json"
   echo '{}' > "$MOCK_DIR/meta.json"
@@ -231,6 +232,64 @@ check "exits nonzero"                '[[ $RC -ne 0 ]]'
 check "names the card"               'grep -q "could not restore Status .Blocked. on item ITEM_CLOSED" <<<"$OUT"'
 check "says how many"                'grep -q "Status assignment(s) could not be restored" <<<"$OUT"'
 rm -rf "$MOCK_DIR"
+
+rm -rf "$MOCK_DIR"
+
+# --- T12: unreadable labels must not become a default status ----------------
+echo "T12 unreadable labels leave the card untouched"
+new_mock
+echo '[{"number":7,"url":"https://github.com/Trisert/JOS/issues/7"}]' > "$MOCK_DIR/issues.json"
+issue 7 open false area/firmware status/blocked
+: > "$MOCK_DIR/fail-labels"
+run_script
+check "exits 0"                  '[[ $RC -eq 0 ]]'
+check "warns about the item"     'grep -q "cannot read the labels of #7" <<<"$OUT"'
+check "creates no card"          '! grep -q "item-add" "$MOCK_LOG"'
+check "writes no field"          '! grep -q "item-edit" "$MOCK_LOG"'
+rm -rf "$MOCK_DIR"
+
+# --- T13: a repository bigger than the window is refused --------------------
+echo "T13 more open items than the window aborts before any import"
+new_mock
+echo '{"open_issues_count":1001}' > "$MOCK_DIR/repo.json"
+echo '[{"number":7,"url":"https://github.com/Trisert/JOS/issues/7"}]' > "$MOCK_DIR/issues.json"
+issue 7 open false area/firmware
+run_script
+check "exits nonzero"            '[[ $RC -ne 0 ]]'
+check "names the window"         'grep -q "exceed the 1000-item window" <<<"$OUT"'
+check "imports nothing"          '! grep -q "item-add" "$MOCK_LOG"'
+check "edits nothing"            '! grep -q "item-edit" "$MOCK_LOG"'
+rm -rf "$MOCK_DIR"
+
+# --- T14: the label table is printed, not applied, in dry-run ---------------
+echo "T14 label taxonomy dry run is complete and unique"
+PLAN="$(DRY_RUN=1 "$HERE/../sync-labels.sh" 2>/dev/null)"; PRC=$?
+check "exits 0"                  '[[ $PRC -eq 0 ]]'
+check "15 labels"                '[[ $(grep -c . <<<"$PLAN") -eq 15 ]]'
+check "area/docs 0052cc"         'grep -qP "^area/docs\t0052cc\t" <<<"$PLAN"'
+check "names unique"             '[[ $(cut -f1 <<<"$PLAN" | sort -u | grep -c .) -eq 15 ]]'
+check "colours are 6 hex"        '! cut -f2 <<<"$PLAN" | grep -qvE "^[0-9a-f]{6}$"'
+rm -rf "$MOCK_DIR"
+
+# --- T15: applying the taxonomy calls gh once per label with --force --------
+echo "T15 applying the taxonomy creates every label idempotently"
+new_mock
+GH="$FAKE" MOCK_DIR="$MOCK_DIR" MOCK_LOG="$MOCK_LOG" "$HERE/../sync-labels.sh" Trisert/JOS >/dev/null 2>&1; SRC=$?
+check "exits 0"                  '[[ $SRC -eq 0 ]]'
+check "15 label create calls"    '[[ $(grep -c "label create" "$MOCK_LOG") -eq 15 ]]'
+check "all use --force"          '[[ $(grep -c -- "--force" "$MOCK_LOG") -eq 15 ]]'
+rm -rf "$MOCK_DIR"
+
+# --- T16: a malformed table is rejected before any API call -----------------
+echo "T16 a duplicate label is rejected before touching GitHub"
+new_mock
+bad="$(mktemp)"; printf 'task|0e8a16|one\ntask|0e8a16|two\n' > "$bad"
+GH="$FAKE" MOCK_DIR="$MOCK_DIR" MOCK_LOG="$MOCK_LOG" LABELS_FILE="$bad" \
+  "$HERE/../sync-labels.sh" Trisert/JOS >/dev/null 2>"$MOCK_DIR/err"; BRC=$?
+check "exits nonzero"            '[[ $BRC -ne 0 ]]'
+check "names the duplicate"      'grep -q "duplicate label task" "$MOCK_DIR/err"'
+check "sends nothing"            '[[ ! -s "$MOCK_LOG" ]]'
+rm -f "$bad"; rm -rf "$MOCK_DIR"
 
 echo
 echo "passed: $pass  failed: $fail"

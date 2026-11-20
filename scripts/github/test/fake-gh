@@ -36,13 +36,21 @@ case "$1 ${2:-}" in
     if [[ "$*" == *"--jq"* ]]; then jq -r '.[].url' "$dir/prs.json"
     else cat "$dir/prs.json"; fi ;;
   "issue list")        jq -r '.[].url' "$dir/issues.json" ;;
+  "label create")      : ;;
   "api graphql")
     cat > "$dir/graphql-input.json"
     : > "$dir/graphql-done" ;;
   "api "*)
     path="$2"
     n="${path##*/issues/}"; n="${n%%/*}"
-    if [[ "$path" == */labels ]]; then
+    if [[ "$path" =~ ^repos/[^/]+/[^/]+$ ]]; then
+      if [[ "$*" == *"--jq"* ]]; then
+        if [[ -f "$dir/repo.json" ]]; then jq -r '.open_issues_count' "$dir/repo.json"; else echo 0; fi
+      else
+        if [[ -f "$dir/repo.json" ]]; then cat "$dir/repo.json"; else echo '{"open_issues_count":0}'; fi
+      fi
+    elif [[ "$path" == */labels ]]; then
+      [[ -f "$dir/fail-labels" ]] && { echo "mock: labels unreadable" >&2; exit 1; }
       jq -r --arg n "$n" '.[$n].labels[]?' "$dir/meta.json"
     else
       jq -r --arg n "$n" '.[$n] | "\(.state) \(if .is_pr then "true" else "false" end)"' "$dir/meta.json"
