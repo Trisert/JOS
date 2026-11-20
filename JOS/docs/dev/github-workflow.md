@@ -36,6 +36,11 @@ Blank issues are disabled. `.github/ISSUE_TEMPLATE/` carries three forms:
 delivered documents disagree. The open EPS and AOCS interfaces are tracked this
 way, not as ad-hoc notes.
 
+`.github/pull_request_template.md` closes the loop on the other side: TASKS.md
+row, the gates with their actual command and result, evidence, an explicit
+"not done" section, and the rule that an unresolved item appears in three places
+(module doc, `TASKS.md` open-decisions list, PR body).
+
 ## Labels
 
 Labels are the only taxonomy the project reads. Prefixes are flat, because
