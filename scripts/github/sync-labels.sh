@@ -27,6 +27,7 @@ label "area/eps"      "b60205" "EPS interface: BMS, SoC gates, SPI slave link"
 label "area/aocs"     "006b75" "AOCS interface and telemetry contract"
 label "area/payloads" "a2eeef" "CRYSTALS / CLOUD / CLEAR payload paths and scheduler"
 label "area/ci"       "6e7781" "Workflows, toolchains and gates"
+label "area/docs"     "0052cc" "Documentation-only work with no single subsystem"
 
 # Priority
 label "prio/P0" "b60205" "Wrong flight behaviour, or a silently dead gate"

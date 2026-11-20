@@ -29,6 +29,7 @@ body:
         - aocs
         - payloads
         - ci
+        - docs
     validations:
       required: true
   - type: dropdown

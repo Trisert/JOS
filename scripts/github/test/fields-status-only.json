@@ -1,0 +1,6 @@
+{"fields":[
+ {"id":"F_STATUS","name":"Status","type":"ProjectV2SingleSelectField","options":[
+   {"id":"o_todo","name":"Todo"},{"id":"o_progress","name":"In progress"},
+   {"id":"o_inreview","name":"In review"},{"id":"o_blocked","name":"Blocked"},
+   {"id":"o_done","name":"Done"}]}
+]}

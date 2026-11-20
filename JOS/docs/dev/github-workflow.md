@@ -57,6 +57,7 @@ GitHub has no label hierarchy.
 | `area/aocs` | AOCS interface and telemetry contract |
 | `area/payloads` | CRYSTALS / CLOUD / CLEAR payload paths and scheduler |
 | `area/ci` | workflows, toolchains, gates |
+| `area/docs` | documentation-only work with no single subsystem |
 | `prio/P0` | wrong flight behaviour, or a silently dead gate |
 | `prio/P1` | wrong result in a non-flight path, or a blocker for qualification |
 | `prio/P2` | opportunistic, docs polish |
@@ -132,7 +133,7 @@ instead.
 Both scripts are idempotent and safe to re-run.
 
 ```bash
-./scripts/github/sync-labels.sh     # 14 labels, `repo` scope
+./scripts/github/sync-labels.sh     # 15 labels, `repo` scope
 ./scripts/github/setup-project.sh   # project, fields, item import, `project` scope
 ```
 
@@ -146,3 +147,21 @@ Creating or editing project items needs the `project` scope
 (`gh auth refresh -s project`). The command is interactive by design: it prints
 a one-time code that has to be entered by the account owner, and the token
 cannot be upgraded from a script.
+
+## Tests
+
+`setup-project.sh` is behavioural code, so it ships with host tests:
+
+```bash
+./scripts/github/test/run.sh
+```
+
+The suite drives the script against `scripts/github/test/fake-gh`, a `gh` double
+that keeps its state in a temporary directory: no network, no credentials, no
+side effect on the real board. It covers the normal path, a rejected field
+update, a partially configured Status field, an unreadable item, idempotency and
+project creation. `GH=<path>` is the seam that makes the double possible.
+
+Mutation-checked: dropping the no-match guard on the closing-reference search
+turns the import tests red, and swallowing `item-edit` failures turns the
+failure-reporting test red.
