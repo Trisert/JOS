@@ -1,0 +1,3 @@
+# Python dependencies for the documentation gate.
+# Pinned so a parser release cannot silently change what the gate accepts.
+markdown-it-py==4.3.0

@@ -1,0 +1,73 @@
+name: Docs
+
+# The firmware gates in build.yml compile and test code. This workflow is the
+# equivalent gate for the diagrams: a Mermaid fence that does not parse is a
+# documentation defect that no C compiler or cppcheck can see. It runs only
+# when docs or the checker change, so it does not add time to firmware-only
+# pull requests.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'JOS/docs/**'
+      - 'JOS/tools/check_mermaid.py'
+      - 'JOS/tools/test_check_mermaid.py'
+      - 'JOS/tools/requirements-docs.txt'
+      - 'JOS/tools/mermaid-puppeteer.json'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'JOS/docs/**'
+      - 'JOS/tools/check_mermaid.py'
+      - 'JOS/tools/test_check_mermaid.py'
+      - 'JOS/tools/requirements-docs.txt'
+      - 'JOS/tools/mermaid-puppeteer.json'
+      - '.github/workflows/docs.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mermaid:
+    name: Mermaid diagrams
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pinned Mermaid CLI
+        run: |
+          set -euo pipefail
+          # PINNED UPSTREAM VERSION. A mmdc bump can change the parser and
+          # therefore what this gate accepts; to move it, change the version
+          # here and the version quoted in docs/dev/ci-and-verification.md in
+          # the same PR.
+          npm install --global @mermaid-js/mermaid-cli@12.2.0
+          # npm 11 can defer Puppeteer's postinstall script; install the
+          # browser explicitly so mmdc cannot fall back to a missing Chrome.
+          npx --yes puppeteer@25.18.1 browsers install chrome
+          mmdc --version
+
+      - name: Install pinned Python dependencies
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv-docs
+          .venv-docs/bin/pip install --disable-pip-version-check -r JOS/tools/requirements-docs.txt
+          .venv-docs/bin/python -c 'import markdown_it; print(markdown_it.__version__)'
+
+      - name: Test the Mermaid extractor
+        run: .venv-docs/bin/python -m unittest discover -s JOS/tools -p 'test_check_mermaid.py' -v
+
+      - name: Validate every Mermaid fence
+        run: .venv-docs/bin/python JOS/tools/check_mermaid.py
