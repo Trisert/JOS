@@ -3,8 +3,14 @@
 
 A Mermaid block is code: an unclosed brace, a bad state note or a duplicated
 subgraph id can make GitHub render an error box while the Markdown itself
-looks fine. This checker extracts each fenced block, asks the pinned Mermaid
-CLI to render it, and reports the source file and block number on failure.
+looks fine. This checker parses the Markdown with ``markdown-it-py`` (the same
+CommonMark rules GitHub uses), extracts each Mermaid fence and asks the pinned
+Mermaid CLI to render it. It reports the source file and block number on
+failure.
+
+Using a Markdown parser instead of a fence regex matters for list-nested
+diagrams, four-space indented code examples and inline code spans: those are
+easy to confuse with a fence by hand.
 
 It intentionally checks *syntax and rendering*, not whether the diagram
 matches the code. The architecture review remains a human responsibility.
@@ -14,135 +20,49 @@ Usage (from the JOS directory)::
     python3 tools/check_mermaid.py
     python3 tools/check_mermaid.py --mmdc /path/to/mmdc
 
-The CI job installs ``mmdc`` and a headless Chrome; locally, install
-``@mermaid-js/mermaid-cli`` or pass ``--mmdc``. Requires only Python 3
-standard library plus the Mermaid CLI.
+Requires Python 3, ``markdown-it-py`` (``tools/requirements-docs.txt``) and
+the Mermaid CLI plus a headless Chrome. The CI job installs both.
 """
 
 from __future__ import annotations
 
 import argparse
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-FENCE = re.compile(r"^(?P<indent> *)(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
-LIST_ITEM = re.compile(
-    r"^(?P<indent> *)(?P<marker>[-+*]|\d+[.)])(?P<space> +)(?P<rest>.*)$"
-)
+
+def _load_parser():
+    try:
+        from markdown_it import MarkdownIt
+    except ImportError as exc:  # pragma: no cover - exercised only without deps
+        raise RuntimeError(
+            "markdown-it-py is required: "
+            "pip install -r tools/requirements-docs.txt"
+        ) from exc
+    return MarkdownIt("commonmark")
 
 
-def _fence(line: str):
-    """Return (character, length, info, indent) for a fence line, or None."""
-    match = FENCE.match(line)
-    if match is None:
-        return None
-    fence = match.group("fence")
-    info = match.group("info").strip()
-    # CommonMark forbids backticks in the info string of a backtick fence.
-    # Without this guard, a standalone ```example``` inline span looks like an
-    # opening fence and the skip loop swallows the next real diagram.
-    if fence[0] == "`" and "`" in info:
-        return None
-    return fence[0], len(fence), info, len(match.group("indent"))
+def mermaid_blocks(text: str, parser=None):
+    """Yield (block_number, source) for each CommonMark Mermaid fence."""
+    if parser is None:
+        parser = _load_parser()
 
-
-def _is_closing(line: str, character: str, minimum: int, max_indent: int) -> bool:
-    parsed = _fence(line)
-    if parsed is None:
-        return False
-    candidate, length, info, indent = parsed
-    return (
-        candidate == character
-        and length >= minimum
-        and not info
-        and indent <= max_indent
-    )
-
-
-def _list_indent(line: str) -> int | None:
-    match = LIST_ITEM.match(line)
-    if match is None:
-        return None
-    marker_indent = len(match.group("indent"))
-    spaces = len(match.group("space"))
-    # CommonMark: 1-4 spaces after the marker set the content indent; five or
-    # more means one space and the rest is content.
-    return marker_indent + len(match.group("marker")) + (spaces if spaces <= 4 else 1)
-
-
-def mermaid_blocks(text: str):
-    """Yield (block_number, source) for each fenced Mermaid block.
-
-    Markdown allows backtick or tilde fences and any opening length >= 3. A
-    fence may also be indented inside a list item; a plain four-space indented
-    code block is not a diagram. A Mermaid-looking line inside another code
-    fence (for example an example in a guide) is not a diagram either.
-    """
-    lines = text.splitlines()
-    index = 0
     block_number = 0
-    list_indents: list[int] = []
-    while index < len(lines):
-        line = lines[index]
-        if line.strip():
-            indent = len(line) - len(line.lstrip(" "))
-            item_indent = _list_indent(line)
-            if item_indent is not None:
-                while list_indents and indent < list_indents[-1]:
-                    list_indents.pop()
-                list_indents.append(item_indent)
-            else:
-                while list_indents and indent < list_indents[-1]:
-                    list_indents.pop()
-
-        opening = _fence(line)
-        if opening is None:
-            index += 1
+    for token in parser.parse(text):
+        if token.type != "fence":
             continue
-
-        character, length, info, indent = opening
-        # A fence indented four spaces in ordinary text is an indented code
-        # block, not a diagram. Inside a list item it is valid relative to the
-        # item's content indent.
-        if indent > 3 and not any(
-            content <= indent <= content + 3 for content in list_indents
-        ):
-            index += 1
+        info = (token.info or "").strip().split()
+        if not info or info[0].lower() != "mermaid":
             continue
-
-        max_indent = max(3, indent + 3)
-        if info.lower() != "mermaid":
-            # Skip the whole non-Mermaid fence so an example inside it is not
-            # mistaken for a real diagram. An unterminated non-Mermaid fence
-            # consumes the rest of the document, matching Markdown rendering.
-            end = index + 1
-            while end < len(lines) and not _is_closing(
-                lines[end], character, length, max_indent
-            ):
-                end += 1
-            index = end + 1
-            continue
-
         block_number += 1
-        start = index + 1
-        end = start
-        while end < len(lines) and not _is_closing(
-            lines[end], character, length, max_indent
-        ):
-            end += 1
-        if end == len(lines):
-            raise ValueError(
-                f"unterminated Mermaid fence starting at line {index + 1}"
-            )
-        body = "\n".join(lines[start:end]).strip()
+        body = token.content.strip()
         if not body:
-            raise ValueError(f"empty Mermaid block at line {index + 1}")
+            line = (token.map[0] + 1) if token.map else "?"
+            raise ValueError(f"empty Mermaid block at line {line}")
         yield block_number, body + "\n"
-        index = end + 1
 
 
 def main() -> int:
@@ -191,6 +111,12 @@ def main() -> int:
         )
         return 2
 
+    try:
+        markdown_parser = _load_parser()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     markdown_files = sorted(docs.rglob("*.md"))
     failures: list[tuple[Path, int, str]] = []
     total_blocks = 0
@@ -199,7 +125,11 @@ def main() -> int:
         tmp_dir = Path(tmp)
         for markdown in markdown_files:
             try:
-                blocks = list(mermaid_blocks(markdown.read_text(encoding="utf-8")))
+                blocks = list(
+                    mermaid_blocks(
+                        markdown.read_text(encoding="utf-8"), markdown_parser
+                    )
+                )
             except ValueError as exc:
                 failures.append((markdown, 0, str(exc)))
                 continue

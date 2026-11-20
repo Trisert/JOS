@@ -51,6 +51,12 @@ BIN from the build job; the BIN/HEX are CRC-stamped by the explicit CI step.
 | ESP32 simulation | Development exercises for the simulation harness | Flight-target HIL or hardware qualification |
 | Target HIL / bench | Hardware-specific behavior, only where a defined test/evidence exists | Any untested hardware configurations or unresolved ICD requirements |
 
+The documentation gate uses `markdown-it-py` 4.3.0 (pinned in
+`JOS/tools/requirements-docs.txt`) to parse CommonMark fences, then `mmdc`
+12.2.0 to render each Mermaid block. A regex-only extractor is not used because
+list-nested diagrams, four-space indented code examples and inline code spans
+are easy to confuse with fences by hand.
+
 Ceedling intentionally excludes `Core/Src` and uses test doubles for target-only
 interfaces; inspect `JOS/test/project.yml` for exact source paths. Tests are
 useful evidence for their compiled units and contracts, not proof of full-system

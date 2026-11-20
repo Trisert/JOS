@@ -13,6 +13,7 @@ on:
       - 'JOS/docs/**'
       - 'JOS/tools/check_mermaid.py'
       - 'JOS/tools/test_check_mermaid.py'
+      - 'JOS/tools/requirements-docs.txt'
       - 'JOS/tools/mermaid-puppeteer.json'
       - '.github/workflows/docs.yml'
   pull_request:
@@ -20,6 +21,7 @@ on:
       - 'JOS/docs/**'
       - 'JOS/tools/check_mermaid.py'
       - 'JOS/tools/test_check_mermaid.py'
+      - 'JOS/tools/requirements-docs.txt'
       - 'JOS/tools/mermaid-puppeteer.json'
       - '.github/workflows/docs.yml'
 
@@ -57,8 +59,15 @@ jobs:
           npx --yes puppeteer@25.18.1 browsers install chrome
           mmdc --version
 
+      - name: Install pinned Python dependencies
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv-docs
+          .venv-docs/bin/pip install --disable-pip-version-check -r JOS/tools/requirements-docs.txt
+          .venv-docs/bin/python -c 'import markdown_it; print(markdown_it.__version__)'
+
       - name: Test the Mermaid extractor
-        run: python3 -m unittest discover -s JOS/tools -p 'test_check_mermaid.py' -v
+        run: .venv-docs/bin/python -m unittest discover -s JOS/tools -p 'test_check_mermaid.py' -v
 
       - name: Validate every Mermaid fence
-        run: python3 JOS/tools/check_mermaid.py
+        run: .venv-docs/bin/python JOS/tools/check_mermaid.py

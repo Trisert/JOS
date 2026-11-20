@@ -63,13 +63,25 @@ class MermaidBlockTests(unittest.TestCase):
         self.assertEqual(len(blocks), 1)
         self.assertIn("flowchart LR", blocks[0][1])
 
+    def test_top_level_fence_after_list_is_extracted(self):
+        text = "- item\n\n" + TRIPLE
+        blocks = list(check_mermaid.mermaid_blocks(text))
+        self.assertEqual(len(blocks), 1)
+        self.assertIn("flowchart LR", blocks[0][1])
+
+    def test_indented_code_after_list_is_not_a_diagram(self):
+        text = "- item\n\nparagraph\n\n    ```mermaid\n    invalid\n    ```\n"
+        self.assertEqual(list(check_mermaid.mermaid_blocks(text)), [])
+
     def test_empty_block_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "empty Mermaid block"):
             list(check_mermaid.mermaid_blocks("```mermaid\n\n```\n"))
 
-    def test_unterminated_block_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "unterminated Mermaid fence"):
-            list(check_mermaid.mermaid_blocks("```mermaid\nflowchart LR\n"))
+    def test_unterminated_fence_is_still_a_block(self):
+        # CommonMark treats an unclosed fence as a block through EOF; the
+        # renderer decides whether the content is valid Mermaid.
+        blocks = list(check_mermaid.mermaid_blocks("```mermaid\nflowchart LR\n"))
+        self.assertEqual(len(blocks), 1)
 
 
 class CheckerMainTests(unittest.TestCase):
@@ -119,7 +131,7 @@ class CheckerMainTests(unittest.TestCase):
             self.assertEqual(self._run(root), 1)
 
     def test_extraction_failure_is_a_gate_failure(self):
-        root = self._root("```mermaid\nflowchart LR\n")
+        root = self._root("```mermaid\n\n```\n")
         with mock.patch.object(check_mermaid.subprocess, "run") as renderer:
             self.assertEqual(self._run(root), 1)
             renderer.assert_not_called()
