@@ -173,6 +173,33 @@ check "creates Priority"           'grep -q "field-create 1 --owner Trisert --na
 check "creates TASKS.md row"       'grep -q "field-create 1 --owner Trisert --name TASKS.md row" "$MOCK_LOG"'
 rm -rf "$MOCK_DIR"
 
+# --- T9: option replacement must not lose card assignments ------------------
+echo "T9 Status reconciliation restores assignments it cleared"
+new_mock
+cat > "$MOCK_DIR/fields.json" <<'JSON'
+{"fields":[
+ {"id":"F_STATUS","name":"Status","type":"ProjectV2SingleSelectField","options":[
+   {"id":"o_todo","name":"Todo"},{"id":"o_blocked","name":"Blocked"},{"id":"o_done","name":"Done"}]},
+ {"id":"F_AREA","name":"Area","type":"ProjectV2SingleSelectField","options":[
+   {"id":"a_firmware","name":"Firmware"},{"id":"a_comms","name":"COMMS"},{"id":"a_eps","name":"EPS"},
+   {"id":"a_aocs","name":"AOCS"},{"id":"a_payloads","name":"Payloads"},{"id":"a_ci","name":"CI"},
+   {"id":"a_docs","name":"Docs"}]},
+ {"id":"F_PRIO","name":"Priority","type":"ProjectV2SingleSelectField","options":[
+   {"id":"p_p0","name":"P0"},{"id":"p_p1","name":"P1"},{"id":"p_p2","name":"P2"}]},
+ {"id":"F_ROW","name":"TASKS.md row","type":"ProjectV2Field","options":[]}
+]}
+JSON
+cp "$HERE/fields-after-replaced.json" "$MOCK_DIR/fields-after.json"
+# A closed card, not reachable from the open-item import loop.
+cat > "$MOCK_DIR/items.json" <<'JSON'
+{"items":[{"id":"ITEM_CLOSED","content":{"number":1,"url":"https://github.com/Trisert/JOS/issues/1"},"status":"Blocked"}]}
+JSON
+run_script
+check "exits 0"                          '[[ $RC -eq 0 ]]'
+check "snapshot precedes the mutation"   '[[ $(grep -n "project item-list" "$MOCK_LOG" | head -1 | cut -d: -f1) -lt $(grep -n "api graphql" "$MOCK_LOG" | head -1 | cut -d: -f1) ]]'
+check "restores on a new option id"      'grep -q -- "--id ITEM_CLOSED --project-id PID --field-id F_STATUS --single-select-option-id o2_blocked" "$MOCK_LOG"'
+rm -rf "$MOCK_DIR"
+
 echo
 echo "passed: $pass  failed: $fail"
 (( fail == 0 ))

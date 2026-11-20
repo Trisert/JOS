@@ -62,6 +62,16 @@ missing="$("$GH" project field-list "$project" --owner "$OWNER" --format json \
       | $req[] | select(.name as $n | ($have | index($n)) | not) | .name')"
 if [[ -n "$missing" ]]; then
   echo "   adding Status options: $(tr '\n' ' ' <<<"$missing")"
+  # Replacing the option list recreates every option's identity and clears the
+  # Status of every card, including closed items, drafts and cards from other
+  # repositories. Snapshot first, restore after: the import loop only knows
+  # about open items in this repository.
+  snapshot="$("$GH" project item-list "$project" --owner "$OWNER" --format json --limit 1000)"
+  snapshot_total="$(jq -r '.totalCount // (.items | length)' <<<"$snapshot")"
+  if (( snapshot_total > 1000 )); then
+    echo "   ! ${snapshot_total} items on the board: the snapshot would be incomplete, refusing to reconcile" >&2
+    exit 1
+  fi
   options="$("$GH" project field-list "$project" --owner "$OWNER" --format json \
     | jq -c --argjson req "$REQUIRED_STATUS_JSON" '
         [.fields[] | select(.name=="Status") | .options[]? | {name, color:"GRAY", description:""}] as $cur
@@ -71,6 +81,21 @@ if [[ -n "$missing" ]]; then
       variables: {fieldId: $fid, options: $opts}}' \
     | "$GH" api graphql --input - >/dev/null
   fields="$("$GH" project field-list "$project" --owner "$OWNER" --format json)"
+
+  restore_failed=0
+  while IFS=$'\t' read -r item saved; do
+    [[ -z "$item" || -z "$saved" ]] && continue
+    new_oid="$(oid Status "$saved")"
+    if [[ -z "$new_oid" ]] || ! "$GH" project item-edit --id "$item" --project-id "$pid" \
+          --field-id "$status_field" --single-select-option-id "$new_oid" >/dev/null 2>&1; then
+      echo "   ! could not restore Status '${saved}' on item ${item}" >&2
+      restore_failed=$((restore_failed + 1))
+    fi
+  done < <(jq -r '.items[] | select(.status != null and .status != "") | [.id, .status] | @tsv' <<<"$snapshot")
+  if (( restore_failed > 0 )); then
+    echo "   ! ${restore_failed} Status assignment(s) could not be restored; re-set them by hand" >&2
+    exit 1
+  fi
 fi
 
 have Area || { echo "   creating Area"; "$GH" project field-create "$project" --owner "$OWNER" --name Area \

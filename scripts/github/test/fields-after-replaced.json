@@ -1,0 +1,13 @@
+{"fields":[
+ {"id":"F_STATUS","name":"Status","type":"ProjectV2SingleSelectField","options":[
+   {"id":"o2_todo","name":"Todo"},{"id":"o2_progress","name":"In progress"},
+   {"id":"o2_inreview","name":"In review"},{"id":"o2_blocked","name":"Blocked"},
+   {"id":"o2_done","name":"Done"}]},
+ {"id":"F_AREA","name":"Area","type":"ProjectV2SingleSelectField","options":[
+   {"id":"a_firmware","name":"Firmware"},{"id":"a_comms","name":"COMMS"},
+   {"id":"a_eps","name":"EPS"},{"id":"a_aocs","name":"AOCS"},
+   {"id":"a_payloads","name":"Payloads"},{"id":"a_ci","name":"CI"},{"id":"a_docs","name":"Docs"}]},
+ {"id":"F_PRIO","name":"Priority","type":"ProjectV2SingleSelectField","options":[
+   {"id":"p_p0","name":"P0"},{"id":"p_p1","name":"P1"},{"id":"p_p2","name":"P2"}]},
+ {"id":"F_ROW","name":"TASKS.md row","type":"ProjectV2Field","options":[]}
+]}

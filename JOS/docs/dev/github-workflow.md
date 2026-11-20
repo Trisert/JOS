@@ -162,6 +162,13 @@ side effect on the real board. It covers the normal path, a rejected field
 update, a partially configured Status field, an unreadable item, idempotency and
 project creation. `GH=<path>` is the seam that makes the double possible.
 
+Replacing a single-select field's option list recreates every option and clears
+the Status of every card — including closed items, drafts and cards from other
+repositories. The script therefore snapshots each card's Status by name before
+the mutation and restores it on the refreshed option ids afterwards, and refuses
+to reconcile a board bigger than the snapshot window (1000 items). T9 models
+exactly that: a closed card, new option ids, and a restored assignment.
+
 Mutation-checked: dropping the no-match guard on the closing-reference search
-turns the import tests red, and swallowing `item-edit` failures turns the
-failure-reporting test red.
+turns the import tests red, swallowing `item-edit` failures turns the
+failure-reporting test red, and removing the restore loop turns T9 red.
