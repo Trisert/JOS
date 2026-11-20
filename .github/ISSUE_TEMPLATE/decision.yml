@@ -1,0 +1,63 @@
+name: Decision / specification contradiction
+description: A question the repository cannot answer on its own - conflicting documents, or an interface the corpus does not define.
+labels: ["decision", "question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `AGENTS.md` §1: the SharePoint corpus taken as a whole is the authority.
+        When two delivered documents disagree, or the interface is not defined,
+        the rule is **annotate and ask** - never pick a side and never invent a
+        protocol, register map, frame layout, pin or endianness.
+
+        This form tracks the question, the evidence on both sides and what stays
+        blocked until it is answered.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: One question, answerable by a person, not by more code reading.
+      placeholder: Is the EPS MCU an STM32L496 or an STM32L1, and is the gas gauge a BQ76905 or a BQ27441?
+    validations:
+      required: true
+  - type: dropdown
+    id: owner
+    attributes:
+      label: Who can answer
+      options:
+        - SYS subteam
+        - ELE subteam
+        - Ground segment
+        - JOS team (internal decision)
+    validations:
+      required: true
+  - type: textarea
+    id: sources
+    attributes:
+      label: Conflicting sources
+      description: One line per source. Document name plus section, row or designator - a folder name is not a citation.
+      placeholder: |
+        SPF v3 Tab. 3.9: EPS/PDU | STM32L496VGT3
+        SW_DREP_Architecture_V01: ... on the EPS STM32L1
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact if unanswered
+      description: Which code path, interface or gate stays blocked, and what would have to be invented to unblock it today.
+    validations:
+      required: true
+  - type: textarea
+    id: unblocks
+    attributes:
+      label: What the answer unblocks
+      description: Issues, PRs, TASKS.md rows and open-decision numbers.
+      placeholder: "#94, TASKS.md open decision 5 and 6, EPS<->OBC frame"
+  - type: textarea
+    id: interim
+    attributes:
+      label: Interim behaviour in flight code
+      description: How the current build fails closed while this is open. A nominal-looking default is not acceptable.
+    validations:
+      required: true

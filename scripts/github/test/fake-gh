@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Deterministic `gh` double for scripts/github/test/run.sh.
+#
+# State lives in $MOCK_DIR:
+#   projects.json  projects.json response     {"projects":[{number,title,id}]}
+#   fields.json    project field-list         {"fields":[...]}
+#   fields-after.json  field-list after a Status mutation (optional)
+#   items.json     project item-list          {"items":[{id,content:{url,number}}]}
+#   prs.json       open PRs                   [{number,url,body}]
+#   issues.json    open issues                [{number,url}]
+#   meta.json      per-number issue state     {"7":{"state":"open","is_pr":false,"labels":[]}}
+#   fail-edits     present -> every item-edit is rejected
+# Every invocation is appended to $MOCK_LOG.
+set -uo pipefail
+
+log="${MOCK_LOG:?MOCK_LOG is required}"
+dir="${MOCK_DIR:?MOCK_DIR is required}"
+echo "$*" >> "$log"
+
+case "$1 ${2:-}" in
+  "project list")      cat "$dir/projects.json" ;;
+  "project create")    echo '{"number":1,"id":"PID","title":"JOS"}' ;;
+  "project field-list")
+    if [[ -f "$dir/fields-after.json" && -f "$dir/graphql-done" ]]; then cat "$dir/fields-after.json"
+    else cat "$dir/fields.json"; fi ;;
+  "project field-create") echo '{"id":"NEW_FIELD","name":"created"}' ;;
+  "project item-list") cat "$dir/items.json" ;;
+  "project item-add")  echo "{\"id\":\"ITEM_$(grep -c . "$log")\"}" ;;
+  "project item-edit")
+    if [[ -f "$dir/fail-edits" ]]; then
+      echo "mock: field update rejected by the API" >&2
+      exit 1
+    fi
+    ;;
+  "pr list")
+    if [[ "$*" == *"--jq"* ]]; then jq -r '.[].url' "$dir/prs.json"
+    else cat "$dir/prs.json"; fi ;;
+  "issue list")        jq -r '.[].url' "$dir/issues.json" ;;
+  "label create")      : ;;
+  "api graphql")
+    cat > "$dir/graphql-input.json"
+    : > "$dir/graphql-done" ;;
+  "api "*)
+    path="$2"
+    n="${path##*/issues/}"; n="${n%%/*}"
+    if [[ "$path" =~ ^repos/[^/]+/[^/]+$ ]]; then
+      if [[ "$*" == *"--jq"* ]]; then
+        if [[ -f "$dir/repo.json" ]]; then jq -r '.open_issues_count' "$dir/repo.json"; else echo 0; fi
+      else
+        if [[ -f "$dir/repo.json" ]]; then cat "$dir/repo.json"; else echo '{"open_issues_count":0}'; fi
+      fi
+    elif [[ "$path" == */labels ]]; then
+      [[ -f "$dir/fail-labels" ]] && { echo "mock: labels unreadable" >&2; exit 1; }
+      jq -r --arg n "$n" '.[$n].labels[]?' "$dir/meta.json"
+    else
+      jq -r --arg n "$n" '.[$n] | "\(.state) \(if .is_pr then "true" else "false" end)"' "$dir/meta.json"
+    fi ;;
+  *)
+    echo "fake-gh: unhandled invocation: $*" >&2
+    exit 64 ;;
+esac

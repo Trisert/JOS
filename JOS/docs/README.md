@@ -13,6 +13,7 @@ Welcome to the JOS (RedPill) On-Board Software documentation.
 | SRAM2 parity / critical data | [docs/dev/sram2_parity.md](dev/sram2_parity.md) |
 | SEU mitigation / RAM scrubbing | [docs/dev/seu_mitigation.md](dev/seu_mitigation.md) |
 | Power modes / sleep-wakeup status | [docs/dev/power_modes.md](dev/power_modes.md) |
+| Issues, labels and project board | [docs/dev/github-workflow.md](dev/github-workflow.md) |
 | Module APIs | [docs/api/](api/) |
 | System design / runtime diagrams | [docs/arch/README.md](arch/README.md) |
 | Qualification snapshots | [docs/qual/](qual/) |

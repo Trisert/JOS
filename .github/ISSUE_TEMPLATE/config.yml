@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "Task board (TASKS.md)"
+    url: "https://github.com/Trisert/JOS/blob/main/TASKS.md"
+    about: "Human-readable source of truth for JOS work - task rows, open decisions, blockers."
+  - name: "Agent working rules (AGENTS.md)"
+    url: "https://github.com/Trisert/JOS/blob/main/AGENTS.md"
+    about: "Order of authority, gates with exact commands, review workflow, definition of done."
+  - name: "Review contract (REVIEWS.md)"
+    url: "https://github.com/Trisert/JOS/blob/main/REVIEWS.md"
+    about: "What a JOS review must check before a merge is allowed."
+  - name: "Issues and project workflow"
+    url: "https://github.com/Trisert/JOS/blob/main/JOS/docs/dev/github-workflow.md"
+    about: "Label taxonomy, project fields, and how an issue maps to a TASKS.md row and a PR."

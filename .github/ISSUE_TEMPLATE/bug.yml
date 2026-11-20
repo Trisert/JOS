@@ -1,0 +1,76 @@
+name: Bug report
+description: A defect in firmware, tests, CI or documentation. Evidence first.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        JOS flies. A defect report without a reproduction or a citation is not
+        actionable - say which gate found it and paste its output.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What is wrong
+      description: One paragraph. Name the symptom, not the suspected fix.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - firmware
+        - comms
+        - eps
+        - aocs
+        - payloads
+        - ci
+        - docs
+    validations:
+      required: true
+  - type: input
+    id: location
+    attributes:
+      label: Location
+      description: file:line on `main`, plus the commit you observed.
+      placeholder: "App/comms/radiolib_driver.cpp:60 @ eee1fdc"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour, and what fixes it
+      description: Cite the document that fixes the value (document + section/row/table). If no document fixes it, say so - that is a decision issue, not a bug.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction and evidence
+      description: Exact command and output.
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: P0 = wrong flight behaviour or a silently dead gate, P1 = wrong result in a non-flight path, P2 = cosmetic.
+      options:
+        - P0
+        - P1
+        - P2
+    validations:
+      required: true
+  - type: dropdown
+    id: found-by
+    attributes:
+      label: Found by
+      options:
+        - CI
+        - Host test suite
+        - Static analysis
+        - Code review
+        - HIL
+        - Document comparison
+        - Other
