@@ -1,0 +1,94 @@
+name: JOS task
+description: A unit of work tracked in TASKS.md - one worktree, one branch, one PR.
+labels: ["task"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read `TASKS.md`, `AGENTS.md` and `REVIEWS.md` before opening this.
+
+        One task = one worktree + one branch + one PR. The issue carries the
+        **intent**; `TASKS.md` stays the human-readable source of truth and must
+        gain a row in the same PR that lands the work.
+  - type: input
+    id: tasks-row
+    attributes:
+      label: TASKS.md row
+      description: The row number this task is tracked under. Never reuse a number.
+      placeholder: "49"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - firmware
+        - comms
+        - eps
+        - aocs
+        - payloads
+        - ci
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: P0 blocks flight or qualification, P2 is opportunistic.
+      options:
+        - P0
+        - P1
+        - P2
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and intent
+      description: What changes, in which files, and why. Cite the document that fixes the behaviour (document + section/row), not the code alone.
+      placeholder: |
+        SPF v3 §3.6.4.2 fixes ...
+        Files: App/comms/..., JOS/docs/api/...
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Observable statements that make this closable. "Looks right" is not one.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+  - type: checkboxes
+    id: gates
+    attributes:
+      label: Gates that apply
+      description: Unchecked gates must be justified in the PR body.
+      options:
+        - label: Host unit tests (Ceedling)
+        - label: Coverage gate (90% line / 75% branch on the App path)
+        - label: Static analysis (cppcheck 2.13.0, zero findings)
+        - label: Arm build (14.3.Rel1, `make release`)
+        - label: Docs / Mermaid render
+        - label: CI workflow lint (actionlint 1.7.7)
+        - label: HIL (hardware in the loop)
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Commands and their output, not prose. Attach logs or screenshots for hardware results.
+      render: shell
+  - type: input
+    id: blocked-by
+    attributes:
+      label: Blocked by
+      description: Issue/PR numbers, a missing document, or a decision. Leave empty if unblocked.
+      placeholder: "#94 (EPS identity), OBC schematic"
+  - type: textarea
+    id: traceability
+    attributes:
+      label: Documents and open items
+      description: Corpus documents this depends on, plus any unresolved item that must also appear in the module doc, the TASKS.md open-decisions list and the PR body.
