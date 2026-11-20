@@ -169,6 +169,11 @@ the mutation and restores it on the refreshed option ids afterwards, and refuses
 to reconcile a board bigger than the snapshot window (1000 items). T9 models
 exactly that: a closed card, new option ids, and a restored assignment.
 
+`T17` pins the label table's portability: the validator avoids awk interval
+expressions, because `mawk` 1.3.4 (20200120) does not implement `{n}` and would
+reject every valid colour. The test runs the dry-run under
+`mawk -W traditional`, which reproduces that behaviour.
+
 `T10` covers the oversized-board refusal (no mutation is sent), `T11` a rejected
 restoration (nonzero exit, the card named), `T12` an unreadable label list (no
 card, no field writes), `T13` a repository larger than the listing window (abort

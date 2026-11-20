@@ -14,6 +14,8 @@
 set -euo pipefail
 
 GH="${GH:-gh}"
+# awk implementation, overridable so the tests can pin old-mawk behaviour.
+AWK_CMD="${AWK_CMD:-awk}"
 REPO="${1:-${REPO:-Trisert/JOS}}"
 DRY_RUN="${DRY_RUN:-0}"
 LABELS_FILE="${LABELS_FILE:-}"
@@ -41,12 +43,14 @@ TABLE
 [[ -n "$LABELS_FILE" ]] && TABLE="$(cat "$LABELS_FILE")"
 
 validate() {
-  awk -F'|' '
+  $AWK_CMD -F'|' '
     /^[[:space:]]*$/ { next }
     {
       if (NF != 3) { printf "line %d: expected name|color|description\n", NR > "/dev/stderr"; bad = 1; next }
       if ($1 !~ /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/) { printf "line %d: bad name %s\n", NR, $1 > "/dev/stderr"; bad = 1 }
-      if ($2 !~ /^[0-9a-f]{6}$/) { printf "line %d: bad colour %s (want 6 lowercase hex)\n", NR, $2 > "/dev/stderr"; bad = 1 }
+      # No interval expression: mawk 1.3.4 (20200120, still Debian bookworm default)
+      # does not implement {n}, so /^[0-9a-f]{6}$/ silently matches nothing there.
+      if (length($2) != 6 || $2 !~ /^[0-9a-f]+$/) { printf "line %d: bad colour %s (want 6 lowercase hex)\n", NR, $2 > "/dev/stderr"; bad = 1 }
       if (length($3) == 0 || length($3) > 100) { printf "line %d: description must be 1-100 characters\n", NR > "/dev/stderr"; bad = 1 }
       if (seen[$1]++) { printf "line %d: duplicate label %s\n", NR, $1 > "/dev/stderr"; bad = 1 }
       total++

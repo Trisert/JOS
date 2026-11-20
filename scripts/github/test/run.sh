@@ -291,6 +291,16 @@ check "names the duplicate"      'grep -q "duplicate label task" "$MOCK_DIR/err"
 check "sends nothing"            '[[ ! -s "$MOCK_LOG" ]]'
 rm -f "$bad"; rm -rf "$MOCK_DIR"
 
+# --- T17: the table validates under old-mawk semantics ----------------------
+echo "T17 the label table validates where awk has no {n} intervals"
+if command -v mawk >/dev/null; then
+  PLAN_OLD="$(DRY_RUN=1 AWK_CMD="mawk -W traditional" "$HERE/../sync-labels.sh" 2>/dev/null)"; MRC=$?
+  check "exits 0"                  '[[ $MRC -eq 0 ]]'
+  check "15 labels under old mawk"  '[[ $(grep -c . <<<"$PLAN_OLD") -eq 15 ]]'
+else
+  echo "  skip: mawk not installed"
+fi
+
 echo
 echo "passed: $pass  failed: $fail"
 (( fail == 0 ))
