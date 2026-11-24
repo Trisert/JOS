@@ -35,8 +35,11 @@ only SPI1 and SPI2; do not assume SPI3 exists.
 
 1. **MCP23017 I2C address.** Set by strap pins A0–A2; absent from the corpus
    and from the simulation (which models only an 8-bit output snapshot). Need
-   ELE. Until answered, the driver must fail closed (no device found → log error,
-   no image).
+   ELE. The register-level driver now exists
+   (`App/payloads/mcp23017.c`, `docs/api/mcp23017.md`) but takes the address
+   as a caller argument and refuses to run without a validated one, so no
+   device is probed with a guessed address. Until ELE answers, the driver
+   must stay unused (no device found → log error, no image).
 2. **CLOUD ADC bus mismatch.** `cloud.c` (`cloud_adc_init`) binds the MAX11128
    CLOUD ADC to `&hspi1`, but the OBC V2.0 gerbers place CLOUD electronics on
    the payload SPI bus (`SPI2_PAY`). `ELE_DREP` defines the payload SPI as a

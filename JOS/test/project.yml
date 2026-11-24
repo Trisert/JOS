@@ -91,9 +91,9 @@
   :support:
     - support
 
-# temp.c is the only host-compilable file in App/payloads (the rest pulls
-# stm32l4xx_hal.h), so it is listed as a single file here — the directory
-# itself must never go on :paths: :source:.
+# temp.c and mcp23017.c are the host-compilable files in App/payloads (the
+# rest pulls stm32l4xx_hal.h), so they are listed as single files here —
+# the directory itself must never go on :paths: :source:.
 #
 # eps_fdir.c (FDIR-EPS-EL-03/-05/-04, RED_FDIR_V2.xlsx sheet 'EPS') is listed
 # for the same reason: it is the one host-compilable translation unit in
@@ -105,6 +105,7 @@
 :files:
   :source:
     - ../App/payloads/temp.c
+    - ../App/payloads/mcp23017.c
     - ../App/bms/eps_fdir.c
 
 :defines:
