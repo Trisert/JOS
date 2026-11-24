@@ -83,21 +83,32 @@ void test_init_probes_iocon_and_accepts_bank_zero(void)
 {
     TEST_ASSERT_EQUAL_INT(0, mcp23017_init(0x27u));
     TEST_ASSERT_EQUAL_INT(1, reads);
-    TEST_ASSERT_EQUAL_UINT8(MCP23017_REG_IOCON, last_read_reg);
+    TEST_ASSERT_EQUAL_UINT8(MCP23017_REG_IOCON_BANK1, last_read_reg);
     TEST_ASSERT_EQUAL_UINT8(0x27u, last_addr);
 }
 
 void test_init_refuses_bank_one_layout(void)
 {
-    regs[MCP23017_REG_IOCON] = MCP23017_IOCON_BANK;
+    /* Bank 1: IOCON is at 0x05 with BANK set, and 0x0A is OLATA (clear).
+     * Reading only 0x0A would wrongly accept this device. */
+    regs[MCP23017_REG_IOCON_BANK1] = MCP23017_IOCON_BANK;
+    regs[MCP23017_REG_IOCON] = 0u;
     TEST_ASSERT_EQUAL_INT(-1, mcp23017_init(ADDR));
     TEST_ASSERT_EQUAL_INT(-1, mcp23017_write_output(0u));
     TEST_ASSERT_EQUAL_INT(0, writes);
 }
 
+void test_init_refuses_set_bit_at_bank_one_iocon_alias(void)
+{
+    /* 0x05 is GPINTENB in bank 0. Only its BANK-bit meaning in bank 1
+     * makes it a discriminator, so a set bit here must refuse. */
+    regs[MCP23017_REG_IOCON_BANK1] = MCP23017_IOCON_BANK;
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_init(ADDR));
+}
+
 void test_init_refuses_missing_device(void)
 {
-    fail_read_reg = MCP23017_REG_IOCON;
+    fail_read_reg = MCP23017_REG_IOCON_BANK1;
     TEST_ASSERT_EQUAL_INT(-1, mcp23017_init(ADDR));
     TEST_ASSERT_EQUAL_INT(-1, mcp23017_set_direction(0xFFFFu));
 }

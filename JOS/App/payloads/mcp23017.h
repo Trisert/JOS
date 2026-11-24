@@ -27,6 +27,11 @@
 #define MCP23017_REG_OLATA  0x14u
 #define MCP23017_REG_OLATB  0x15u
 #define MCP23017_REG_IOCON  0x0Au
+/* BANK=1 moves IOCON to 0x05/0x15 (MCP23017 datasheet, register map).
+ * Reading 0x05 is a read-only way to tell the two maps apart: it is IOCON
+ * with BANK=1, and GPINTENB (zero at power-on) with BANK=0. Reading 0x0A
+ * cannot distinguish them because it is OLATA in bank 1. */
+#define MCP23017_REG_IOCON_BANK1 0x05u
 
 #define MCP23017_PIN_COUNT 16u
 

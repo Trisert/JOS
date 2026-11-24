@@ -91,10 +91,13 @@ int mcp23017_init(uint8_t addr)
     if ((addr < MCP23017_ADDR_MIN) || (addr > MCP23017_ADDR_MAX)) {
         return -1;
     }
-    if (g_ops->read(addr, MCP23017_REG_IOCON, &iocon) != 0) {
+    /* Bank 1 moves every register; this driver implements bank 0 only.
+     * IOCON sits at 0x05 in bank 1, while 0x0A is OLATA there and cannot
+     * reveal the bank bit. 0x05 is GPINTENB in bank 0 and is zero at
+     * power-on, so a set BANK bit there means a bank-1 device. */
+    if (g_ops->read(addr, MCP23017_REG_IOCON_BANK1, &iocon) != 0) {
         return -1;
     }
-    /* Bank 1 moves every register; this driver only implements bank 0. */
     if ((iocon & MCP23017_IOCON_BANK) != 0u) {
         return -1;
     }
