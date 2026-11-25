@@ -161,6 +161,9 @@ int mcp23017_write_output(uint16_t value)
     }
     if (g_ops->write(s_addr, MCP23017_REG_OLATA,
                      (uint8_t)(value & 0xFFu)) != 0) {
+        /* HAL can report an error after the byte reached the expander, so a
+         * failed first transfer also leaves the cache unknown. */
+        s_latch_valid = 0;
         return -1;
     }
     if (g_ops->write(s_addr, MCP23017_REG_OLATB,

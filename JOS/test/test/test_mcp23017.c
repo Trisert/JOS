@@ -13,6 +13,7 @@
 static uint8_t regs[256];
 static uint8_t fail_read_reg;
 static uint8_t fail_write_reg;
+static uint8_t land_then_fail_reg;
 static uint8_t last_addr;
 static uint8_t last_read_reg;
 static uint8_t first_read_reg;
@@ -23,6 +24,10 @@ static int fake_write(uint8_t addr, uint8_t reg, uint8_t value)
 {
     last_addr = addr;
     writes++;
+    if (reg == land_then_fail_reg) {
+        regs[reg] = value;   /* the byte lands, the transfer still reports an error */
+        return -1;
+    }
     if (reg == fail_write_reg) {
         return -1;
     }
@@ -55,6 +60,7 @@ void setUp(void)
     memset(regs, 0, sizeof(regs));
     fail_read_reg = 0xFFu;
     fail_write_reg = 0xFFu;
+    land_then_fail_reg = 0xFFu;
     last_addr = 0u;
     last_read_reg = 0u;
     first_read_reg = 0u;
@@ -325,6 +331,25 @@ void test_partial_output_write_invalidates_latch_cache(void)
     TEST_ASSERT_EQUAL_INT(0, mcp23017_write_output(0x0000u));
     TEST_ASSERT_EQUAL_INT(0, mcp23017_set_pin(0u, 1));
     TEST_ASSERT_EQUAL_UINT8(0x01u, regs[MCP23017_REG_OLATA]);
+}
+
+void test_first_byte_lands_then_reports_failure_invalidates_cache(void)
+{
+    /* Devin review: HAL can fail after the byte reached the expander. */
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_init(ADDR));
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_write_output(0x1234u));
+
+    land_then_fail_reg = MCP23017_REG_OLATA;
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_write_output(0x00FFu));
+    land_then_fail_reg = 0xFFu;
+
+    TEST_ASSERT_EQUAL_UINT8(0xFFu, regs[MCP23017_REG_OLATA]);
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_set_pin(3u, 1));
+    TEST_ASSERT_EQUAL_UINT8(0xFFu, regs[MCP23017_REG_OLATA]);
+
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_write_output(0x0000u));
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_set_pin(3u, 1));
+    TEST_ASSERT_EQUAL_UINT8(0x08u, regs[MCP23017_REG_OLATA]);
 }
 
 void test_pin_arguments_are_not_truncated(void)
