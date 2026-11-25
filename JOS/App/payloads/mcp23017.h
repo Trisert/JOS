@@ -15,9 +15,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* 7-bit I2C address range selected by straps A0-A2 (MCP23017 datasheet). */
+/* 7-bit I2C address range selected by straps A0-A2 (DS20001952 Rev D, 3.1). */
 #define MCP23017_ADDR_MIN 0x20u
 #define MCP23017_ADDR_MAX 0x27u
+
+/* GPA7 and GPB7 are output-only on the MCP23017 (DS20001952 Rev D, Table 2-1
+ * and 3.5.1); IO7 must stay an output. Reading them as inputs can corrupt SDA. */
+#define MCP23017_INPUT_MASK 0x7F7Fu
 
 /* Bank 0 register addresses, power-on default (MCP23017 datasheet). */
 #define MCP23017_REG_IODIRA 0x00u
@@ -49,27 +53,34 @@ typedef struct {
     mcp23017_read_fn read;
 } mcp23017_bus_ops_t;
 
-/* Probe the device and latch its address. Refuses an out-of-range address,
- * a missing device, a bank-1 device or a failed read. */
-int mcp23017_init(uint8_t addr);
+/* Probe the device, seed the output cache from OLAT, and latch its address.
+ * Refuses an out-of-range address (no truncation), a missing device, a bank-1
+ * device or an unreadable OLAT. A failed init leaves the driver deconfigured:
+ * earlier address and cache are dropped before any probe runs. */
+int mcp23017_init(unsigned int addr);
 
-/* Forget the address. Every operation refuses until init succeeds again. */
+/* Forget the address and the cached latch. Every operation refuses until init
+ * succeeds again. */
 void mcp23017_close(void);
 
-/* 1 = input, 0 = output, bit n = pin n. */
+/* 1 = input, 0 = output, bit n = pin n. Refuses an input request on GPA7/GPB7,
+ * which are output-only. */
 int mcp23017_set_direction(uint16_t mask);
 
-/* Write both output latches (bit n = pin n). */
+/* Write both output latches (bit n = pin n). A failed second byte marks the
+ * cache unknown, so set_pin refuses until a full write succeeds. */
 int mcp23017_write_output(uint16_t value);
 
-/* Read both GPIO ports (bit n = pin n). */
+/* Read both GPIO ports (bit n = pin n). Bits 7 and 15 are output-only and read
+ * as 0. */
 int mcp23017_read_input(uint16_t *value);
 
-/* Modify one output pin without disturbing the other latch byte. */
-int mcp23017_set_pin(uint8_t pin, int high);
+/* Modify one output pin without disturbing the other latch byte. Refuses when
+ * the cache is unknown (a previous partial write). */
+int mcp23017_set_pin(int pin, int high);
 
-/* Read one input pin; *high is written only on success. */
-int mcp23017_get_pin(uint8_t pin, int *high);
+/* Read one input pin; *high is written only on success. Refuses GPA7/GPB7. */
+int mcp23017_get_pin(int pin, int *high);
 
 #ifdef HOST_UNIT_TEST
 /* Replace the I2C4 HAL backend with a scripted bus model. */

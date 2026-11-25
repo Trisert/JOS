@@ -15,6 +15,7 @@ static uint8_t fail_read_reg;
 static uint8_t fail_write_reg;
 static uint8_t last_addr;
 static uint8_t last_read_reg;
+static uint8_t first_read_reg;
 static int reads;
 static int writes;
 
@@ -33,6 +34,9 @@ static int fake_read(uint8_t addr, uint8_t reg, uint8_t *value)
 {
     last_addr = addr;
     last_read_reg = reg;
+    if (reads == 0) {
+        first_read_reg = reg;
+    }
     reads++;
     if (reg == fail_read_reg) {
         return -1;
@@ -53,6 +57,7 @@ void setUp(void)
     fail_write_reg = 0xFFu;
     last_addr = 0u;
     last_read_reg = 0u;
+    first_read_reg = 0u;
     reads = 0;
     writes = 0;
     mcp23017_close();
@@ -82,9 +87,48 @@ void test_init_rejects_addresses_outside_strap_range(void)
 void test_init_probes_iocon_and_accepts_bank_zero(void)
 {
     TEST_ASSERT_EQUAL_INT(0, mcp23017_init(0x27u));
-    TEST_ASSERT_EQUAL_INT(1, reads);
-    TEST_ASSERT_EQUAL_UINT8(MCP23017_REG_IOCON_BANK1, last_read_reg);
+    TEST_ASSERT_EQUAL_INT(3, reads);                  /* bank probe + OLATA + OLATB */
+    TEST_ASSERT_EQUAL_UINT8(MCP23017_REG_IOCON_BANK1, first_read_reg);
+    TEST_ASSERT_EQUAL_UINT8(MCP23017_REG_OLATB, last_read_reg);
     TEST_ASSERT_EQUAL_UINT8(0x27u, last_addr);
+}
+
+void test_init_seeds_latch_from_hardware(void)
+{
+    /* Warm reset: the expander keeps its output latches, the MCU does not. */
+    regs[MCP23017_REG_OLATA] = 0xFFu;
+    regs[MCP23017_REG_OLATB] = 0xFFu;
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_init(ADDR));
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_set_pin(0u, 0));
+    TEST_ASSERT_EQUAL_UINT8(0xFEu, regs[MCP23017_REG_OLATA]);
+    TEST_ASSERT_EQUAL_UINT8(0xFFu, regs[MCP23017_REG_OLATB]);
+}
+
+void test_init_fails_when_olat_is_unreadable(void)
+{
+    fail_read_reg = MCP23017_REG_OLATA;
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_init(ADDR));
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_write_output(0u));
+    TEST_ASSERT_EQUAL_INT(0, writes);
+}
+
+void test_failed_reinit_releases_previous_device(void)
+{
+    init_ok();
+    fail_read_reg = MCP23017_REG_IOCON_BANK1;
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_init(0x21u));
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_write_output(0x00FFu));
+    TEST_ASSERT_EQUAL_INT(0, writes);
+    fail_read_reg = 0xFFu;
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_init(0x21u));
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_write_output(0x0000u));
+    TEST_ASSERT_EQUAL_INT(2, writes);
+}
+
+void test_init_rejects_runtime_address_above_uint8(void)
+{
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_init(0x120u));
+    TEST_ASSERT_EQUAL_INT(0, reads);
 }
 
 void test_init_refuses_bank_one_layout(void)
@@ -131,9 +175,9 @@ void test_operations_refuse_before_init(void)
 void test_direction_writes_both_ports_in_little_endian_order(void)
 {
     init_ok();
-    TEST_ASSERT_EQUAL_INT(0, mcp23017_set_direction(0xA5C3u));
-    TEST_ASSERT_EQUAL_UINT8(0xC3u, regs[MCP23017_REG_IODIRA]);
-    TEST_ASSERT_EQUAL_UINT8(0xA5u, regs[MCP23017_REG_IODIRB]);
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_set_direction(0x2543u));
+    TEST_ASSERT_EQUAL_UINT8(0x43u, regs[MCP23017_REG_IODIRA]);
+    TEST_ASSERT_EQUAL_UINT8(0x25u, regs[MCP23017_REG_IODIRB]);
     TEST_ASSERT_EQUAL_UINT8(ADDR, last_addr);
 }
 
@@ -141,8 +185,8 @@ void test_direction_propagates_write_failure(void)
 {
     init_ok();
     fail_write_reg = MCP23017_REG_IODIRB;
-    TEST_ASSERT_EQUAL_INT(-1, mcp23017_set_direction(0xA5C3u));
-    TEST_ASSERT_EQUAL_UINT8(0xC3u, regs[MCP23017_REG_IODIRA]);
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_set_direction(0x2543u));
+    TEST_ASSERT_EQUAL_UINT8(0x43u, regs[MCP23017_REG_IODIRA]);
 }
 
 void test_output_latches_and_input_merge_ports(void)
@@ -201,16 +245,23 @@ void test_set_pin_rejects_out_of_range_pin(void)
     TEST_ASSERT_EQUAL_INT(2, writes);
 }
 
-void test_set_pin_failure_does_not_change_cached_latch(void)
+void test_set_pin_failure_invalidates_cached_latch(void)
 {
     init_ok();
     TEST_ASSERT_EQUAL_INT(0, mcp23017_write_output(0x1234u));
     fail_write_reg = MCP23017_REG_OLATA;
-    TEST_ASSERT_EQUAL_INT(-1, mcp23017_set_pin(4u, 1));
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_set_pin(3u, 1));
 
+    /* The byte may have landed: the cache is unknown, so a later pin write
+     * refuses instead of clobbering outputs. */
     fail_write_reg = 0xFFu;
-    TEST_ASSERT_EQUAL_INT(0, mcp23017_set_pin(5u, 1));
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_set_pin(3u, 1));
     TEST_ASSERT_EQUAL_UINT8(0x34u, regs[MCP23017_REG_OLATA]);
+
+    /* A full write re-establishes a known state. */
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_write_output(0x1234u));
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_set_pin(3u, 1));
+    TEST_ASSERT_EQUAL_UINT8(0x3Cu, regs[MCP23017_REG_OLATA]);
 }
 
 void test_get_pin_reads_correct_port_and_bit(void)
@@ -219,13 +270,72 @@ void test_get_pin_reads_correct_port_and_bit(void)
 
     init_ok();
     regs[MCP23017_REG_GPIOA] = 0x08u;
-    regs[MCP23017_REG_GPIOB] = 0x80u;
+    regs[MCP23017_REG_GPIOB] = 0x40u;
     TEST_ASSERT_EQUAL_INT(0, mcp23017_get_pin(3u, &high));
     TEST_ASSERT_EQUAL_INT(1, high);
     TEST_ASSERT_EQUAL_INT(0, mcp23017_get_pin(2u, &high));
     TEST_ASSERT_EQUAL_INT(0, high);
-    TEST_ASSERT_EQUAL_INT(0, mcp23017_get_pin(15u, &high));
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_get_pin(14u, &high));
     TEST_ASSERT_EQUAL_INT(1, high);
+}
+
+void test_input_only_pins_reject_gpa7_gpb7(void)
+{
+    int high = 7;
+
+    init_ok();
+    /* DS20001952 Rev D: GPA7/GPB7 are output-only on the MCP23017. */
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_set_direction(0x0080u));
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_set_direction(0x8000u));
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_get_pin(7, &high));
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_get_pin(15, &high));
+    TEST_ASSERT_EQUAL_INT(7, high);
+    TEST_ASSERT_EQUAL_INT(0, writes);
+
+    /* Driving them as outputs stays legal. */
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_set_pin(7, 1));
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_set_pin(15, 1));
+}
+
+void test_read_input_masks_output_only_pins(void)
+{
+    uint16_t value = 0u;
+
+    init_ok();
+    regs[MCP23017_REG_GPIOA] = 0xFFu;
+    regs[MCP23017_REG_GPIOB] = 0xFFu;
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_read_input(&value));
+    TEST_ASSERT_EQUAL_HEX16(MCP23017_INPUT_MASK, value);
+}
+
+void test_partial_output_write_invalidates_latch_cache(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_init(ADDR));
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_write_output(0x1234u));
+
+    fail_write_reg = MCP23017_REG_OLATB;
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_write_output(0x00FFu));
+    fail_write_reg = 0xFFu;
+
+    /* OLATA now holds 0xFF while the cache says 0x34: the cache is unknown. */
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_set_pin(0u, 1));
+    TEST_ASSERT_EQUAL_UINT8(0xFFu, regs[MCP23017_REG_OLATA]);
+
+    /* A full write re-establishes a known state. */
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_write_output(0x0000u));
+    TEST_ASSERT_EQUAL_INT(0, mcp23017_set_pin(0u, 1));
+    TEST_ASSERT_EQUAL_UINT8(0x01u, regs[MCP23017_REG_OLATA]);
+}
+
+void test_pin_arguments_are_not_truncated(void)
+{
+    int high = 7;
+
+    init_ok();
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_set_pin(256, 1));
+    TEST_ASSERT_EQUAL_INT(-1, mcp23017_get_pin(256, &high));
+    TEST_ASSERT_EQUAL_INT(7, high);
+    TEST_ASSERT_EQUAL_INT(0, writes);
 }
 
 void test_get_pin_refuses_bad_arguments_and_bus_error(void)
