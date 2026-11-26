@@ -15,8 +15,9 @@
 #include "main.h"
 #include "stm32l4xx_hal.h"
 
-/* Bounded I2C transfer. HAL_I2C_Mem_* is interrupt-driven; the task still
- * blocks on completion, as the FRAM driver already does on hi2c1. */
+/* Bounded I2C transfer. HAL_I2C_Mem_Write and HAL_I2C_Mem_Read poll I2C
+ * status flags with a 100 ms timeout, as the FRAM driver does on hi2c1. No
+ * flight task calls this backend yet; task use requires I2C4 IRQ or DMA. */
 #define MCP23017_I2C_TIMEOUT_MS 100u
 
 static int flight_write(uint8_t addr, uint8_t reg, uint8_t value)

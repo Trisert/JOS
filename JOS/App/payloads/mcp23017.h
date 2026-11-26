@@ -67,8 +67,8 @@ void mcp23017_close(void);
  * which are output-only. */
 int mcp23017_set_direction(uint16_t mask);
 
-/* Write both output latches (bit n = pin n). A failed second byte marks the
- * cache unknown, so set_pin refuses until a full write succeeds. */
+/* Write both output latches (bit n = pin n). A failed byte marks the cache
+ * unknown, so set_pin refuses until a full write or init succeeds. */
 int mcp23017_write_output(uint16_t value);
 
 /* Read both GPIO ports (bit n = pin n). Bits 7 and 15 are output-only and read
@@ -76,7 +76,7 @@ int mcp23017_write_output(uint16_t value);
 int mcp23017_read_input(uint16_t *value);
 
 /* Modify one output pin without disturbing the other latch byte. Refuses when
- * the cache is unknown (a previous partial write). */
+ * the cache is unknown (a previous failed write). */
 int mcp23017_set_pin(int pin, int high);
 
 /* Read one input pin; *high is written only on success. Refuses GPA7/GPB7. */
