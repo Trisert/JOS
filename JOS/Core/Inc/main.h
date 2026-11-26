@@ -57,6 +57,7 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+extern I2C_HandleTypeDef hi2c4;  /* I2C_EXT: MCP23017 CS expander (PD12/PD13) */
 
 /* USER CODE END EFP */
 
